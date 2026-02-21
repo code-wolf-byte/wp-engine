@@ -26,6 +26,9 @@ serde_json = "1"
 # Image loading (thumbnails + wallpaper pixels)
 image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
 
+# Video decoding (requires system FFmpeg: pacman -S ffmpeg / apt install ffmpeg)
+ffmpeg-next = "8"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

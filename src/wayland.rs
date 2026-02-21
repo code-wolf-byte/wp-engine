@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use calloop::LoopSignal;
 use calloop_wayland_source::WaylandSource;
-use image::RgbaImage;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     shell::WaylandSurface,
@@ -14,23 +13,18 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::path::Path;
 use std::sync::mpsc::SyncSender;
 use std::thread;
+use std::time::Duration;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
-// ── Public API ────────────────────────────────────────────────────────────────
+use crate::renderer::FrameSource;
 
-/// Load an image from disk and convert to RGBA.
-pub fn load_image(path: &Path) -> Result<RgbaImage> {
-    let img = image::open(path)
-        .map_err(|e| anyhow!("failed to load image {}: {}", path.display(), e))?;
-    Ok(img.into_rgba8())
-}
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Handle to a running wallpaper renderer. Drop or call `stop()` to remove the wallpaper.
 pub struct WallpaperHandle {
@@ -51,13 +45,16 @@ impl WallpaperHandle {
     }
 }
 
-/// Spawn a background thread that keeps `image` displayed on all Wayland outputs.
-/// The image remains visible as long as the returned `WallpaperHandle` is alive.
-pub fn spawn_wallpaper(image: RgbaImage) -> Result<WallpaperHandle> {
+/// Spawn a background thread that keeps `frame_source` displayed on all Wayland outputs.
+///
+/// For animated sources a calloop timer fires at the source's native FPS,
+/// advancing the frame and redrawing every output. The wallpaper remains
+/// visible as long as the returned `WallpaperHandle` is alive.
+pub fn spawn_wallpaper(frame_source: FrameSource) -> Result<WallpaperHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
     let thread = thread::spawn(move || {
-        if let Err(e) = wallpaper_loop(image, signal_tx) {
+        if let Err(e) = wallpaper_loop(frame_source, signal_tx) {
             eprintln!("wallpaper thread error: {e}");
         }
     });
@@ -84,18 +81,26 @@ struct WallpaperState {
     shm: Shm,
     layer_shell: LayerShell,
     surfaces: Vec<WallpaperSurface>,
-    image: RgbaImage,
+    /// Live frame source — replaces the old static `image: RgbaImage`.
+    frame_source: FrameSource,
 }
 
 impl WallpaperState {
-    /// Draw the wallpaper onto the surface at `surfaces[idx]`.
-    /// All parameters come from `&self` so there are no borrow conflicts.
+    /// Draw the current frame onto the surface at `surfaces[idx]`.
+    ///
+    /// Takes `&self` (not `&mut self`) so the calloop timer callback can call
+    /// this after releasing the `&mut` borrow from `frame_source.try_advance()`.
+    /// The frame is obtained via `Arc::clone` — a cheap atomic refcount bump,
+    /// no pixel data is copied at this point.
     fn draw_at(&self, idx: usize) {
         let width = self.surfaces[idx].width;
         let height = self.surfaces[idx].height;
         if width == 0 || height == 0 {
             return;
         }
+
+        // Cheap Arc clone — no image data is duplicated.
+        let frame = std::sync::Arc::clone(self.frame_source.current_frame());
 
         let stride = width * 4;
         let mut pool = match SlotPool::new((width * height * 4) as usize, &self.shm) {
@@ -106,24 +111,28 @@ impl WallpaperState {
             }
         };
 
-        let (buffer, canvas) =
-            match pool.create_buffer(width as i32, height as i32, stride as i32, wl_shm::Format::Argb8888) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("wallpaper: failed to create buffer: {e}");
-                    return;
-                }
-            };
+        let (buffer, canvas) = match pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("wallpaper: failed to create buffer: {e}");
+                return;
+            }
+        };
 
-        // Scale image to match the output resolution
+        // Scale image to match the output resolution.
         let scaled = image::imageops::resize(
-            &self.image,
+            frame.as_ref(),
             width,
             height,
             image::imageops::FilterType::Lanczos3,
         );
 
-        // RGBA → ARGB8888 (little-endian in memory: B G R A)
+        // Convert RGBA → ARGB8888 (little-endian in memory: B G R A).
         for (dst, src) in canvas.chunks_exact_mut(4).zip(scaled.chunks_exact(4)) {
             dst[0] = src[2]; // B
             dst[1] = src[1]; // G
@@ -138,7 +147,7 @@ impl WallpaperState {
     }
 }
 
-fn wallpaper_loop(image: RgbaImage, signal_tx: SyncSender<LoopSignal>) -> Result<()> {
+fn wallpaper_loop(frame_source: FrameSource, signal_tx: SyncSender<LoopSignal>) -> Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("cannot connect to Wayland display: {e}"))?;
 
@@ -164,20 +173,20 @@ fn wallpaper_loop(image: RgbaImage, signal_tx: SyncSender<LoopSignal>) -> Result
         shm,
         layer_shell,
         surfaces: Vec::new(),
-        image,
+        frame_source,
     };
 
-    // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces
+    // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces.
     event_queue
         .roundtrip(&mut state)
         .map_err(|e| anyhow!("initial Wayland roundtrip failed: {e}"))?;
 
-    // Second roundtrip: compositor sends configure events for our layer surfaces
+    // Second roundtrip: compositor sends configure events for our layer surfaces.
     event_queue
         .roundtrip(&mut state)
         .map_err(|e| anyhow!("second Wayland roundtrip failed: {e}"))?;
 
-    // Hand the queue to calloop
+    // Hand the queue to calloop.
     let mut event_loop: calloop::EventLoop<WallpaperState> =
         calloop::EventLoop::try_new().map_err(|e| anyhow!("calloop init failed: {e}"))?;
 
@@ -185,10 +194,47 @@ fn wallpaper_loop(image: RgbaImage, signal_tx: SyncSender<LoopSignal>) -> Result
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
 
-    // Give the loop signal to the spawning thread before blocking
+    // ── Animated wallpapers: high-frequency poll, render only on new frames ────
+    //
+    // The decoder thread paces itself using the frame's PTS timestamps, so
+    // frames arrive at the video's native rate. We poll at 120 Hz (every 8 ms)
+    // to keep display latency low without tying render calls to a fixed-fps
+    // timer that might not match the video's actual frame rate.
+    //
+    // On each tick:
+    //   1. `try_advance()` takes at most ONE frame from the channel (&mut,
+    //      released before step 2).
+    //   2. Only if a new frame arrived, `draw_at` redraws every output
+    //      (&self borrow, no conflict with step 1).
+    //   3. Return `ToDuration` to reschedule.
+    if state.frame_source.is_animated() {
+        const POLL_INTERVAL: Duration = Duration::from_millis(8); // ~120 Hz
+
+        event_loop
+            .handle()
+            .insert_source(
+                calloop::timer::Timer::from_duration(POLL_INTERVAL),
+                |_deadline, _metadata, state: &mut WallpaperState| {
+                    // Step 1: try to pull the next frame (&mut, released here).
+                    if state.frame_source.try_advance() {
+                        // Step 2: new frame available — redraw all outputs.
+                        let n = state.surfaces.len();
+                        for idx in 0..n {
+                            state.draw_at(idx);
+                        }
+                    }
+
+                    // Step 3: reschedule.
+                    calloop::timer::TimeoutAction::ToDuration(POLL_INTERVAL)
+                },
+            )
+            .map_err(|e| anyhow!("timer source insert failed: {e}"))?;
+    }
+
+    // Give the loop signal to the spawning thread before blocking.
     let _ = signal_tx.send(event_loop.get_signal());
 
-    // Run until stop_signal.stop() is called from the UI thread
+    // Run until stop_signal.stop() is called from the UI thread.
     event_loop
         .run(None, &mut state, |_| {})
         .map_err(|e| anyhow!("event loop error: {e}"))?;
@@ -233,7 +279,6 @@ impl OutputHandler for WallpaperState {
             Some(&output),
         );
 
-        // Stretch to cover the entire output
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
         layer.set_size(0, 0);
@@ -262,7 +307,6 @@ impl LayerShellHandler for WallpaperState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        // Find by index to avoid borrow conflicts when calling draw_at(&self, idx)
         let idx = self.surfaces.iter().position(|s| s.layer == *layer);
         if let Some(idx) = idx {
             self.surfaces[idx].width = configure.new_size.0;

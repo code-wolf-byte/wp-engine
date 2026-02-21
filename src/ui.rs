@@ -1,3 +1,4 @@
+use crate::renderer::{FrameSource, WallpaperContent};
 use crate::wayland::{self, WallpaperHandle};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{
@@ -189,15 +190,38 @@ impl WpApp {
     // ── Wallpaper application ─────────────────────────────────────────────────
 
     fn apply_path(&mut self, path: PathBuf, display_title: String) {
-        match wayland::load_image(&path) {
+        match WallpaperContent::from_path(&path) {
+            Err(e) => self.status = StatusMsg::err(format!("Load failed: {e}")),
+            Ok(content) => self.apply_content(content, display_title),
+        }
+    }
+
+    fn apply_selected(&mut self) {
+        let Some(idx) = self.selected else { return };
+
+        let title = self.wallpapers[idx].title().to_string();
+        // `from_wallpaper` borrows wallpapers[idx] and returns an owned Result —
+        // the borrow ends here, so self is free to mutate below.
+        let content = WallpaperContent::from_wallpaper(&self.wallpapers[idx]);
+
+        match content {
+            Err(e) => self.status = StatusMsg::err(e.to_string()),
+            Ok(content) => self.apply_content(content, title),
+        }
+    }
+
+    /// Create a `FrameSource` from parsed content and hand it to the Wayland renderer.
+    /// Stops any currently running wallpaper before starting the new one.
+    fn apply_content(&mut self, content: WallpaperContent, display_title: String) {
+        match FrameSource::from_content(content) {
             Err(e) => {
-                self.status = StatusMsg::err(format!("Load failed: {e}"));
+                self.status = StatusMsg::err(format!("Renderer init failed: {e}"));
             }
-            Ok(img) => {
+            Ok(frame_source) => {
                 if let Some(old) = self.renderer.take() {
                     old.stop();
                 }
-                match wayland::spawn_wallpaper(img) {
+                match wayland::spawn_wallpaper(frame_source) {
                     Ok(handle) => {
                         self.renderer = Some(handle);
                         self.active_title = Some(display_title.clone());
@@ -207,41 +231,6 @@ impl WpApp {
                         self.status = StatusMsg::err(format!("Renderer error: {e}"));
                     }
                 }
-            }
-        }
-    }
-
-    fn apply_selected(&mut self) {
-        let Some(idx) = self.selected else { return };
-
-        // Collect all data we need before releasing the borrow
-        let title = self.wallpapers[idx].title().to_string();
-        let wtype = self.wallpapers[idx].wallpaper_type().clone();
-        let file = self.wallpapers[idx].wallpaper_file();
-
-        match wtype {
-            WallpaperType::Scene => {
-                self.status = StatusMsg::err("Scene (.pkg) wallpapers require Wallpaper Engine");
-                return;
-            }
-            WallpaperType::Web => {
-                self.status = StatusMsg::err("Web wallpapers are not yet supported");
-                return;
-            }
-            WallpaperType::Application => {
-                self.status = StatusMsg::err("Application wallpapers are Windows-only");
-                return;
-            }
-            _ => {}
-        }
-
-        match file {
-            Some(p) if p.exists() => self.apply_path(p, title),
-            Some(p) => {
-                self.status = StatusMsg::err(format!("File missing: {}", p.display()));
-            }
-            None => {
-                self.status = StatusMsg::err("Wallpaper has no file field in project.json");
             }
         }
     }

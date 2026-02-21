@@ -1,11 +1,13 @@
+mod renderer;
 mod ui;
 mod wayland;
 mod workshop;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use renderer::{FrameSource, WallpaperContent};
 use std::path::PathBuf;
-use workshop::{WallpaperType, Wallpaper};
+use workshop::Wallpaper;
 
 #[derive(Parser)]
 #[command(
@@ -134,20 +136,15 @@ fn cmd_set(id: &str) -> Result<()> {
     let w = workshop::find_by_id(id)
         .ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
-    check_type_support(w.wallpaper_type())?;
+    // Type support is checked inside from_wallpaper; unsupported types return Err.
+    let content = WallpaperContent::from_wallpaper(&w)?;
 
-    let path = w
-        .wallpaper_file()
-        .ok_or_else(|| anyhow!("wallpaper has no file defined"))?;
-
-    if !path.exists() {
-        return Err(anyhow!("file not found: {}", path.display()));
-    }
-
+    let path = w.wallpaper_file().unwrap_or_default();
     println!("Loading: {}", path.display());
-    let image = wayland::load_image(&path)?;
+
+    let frame_source = FrameSource::from_content(content)?;
     println!("Applying \"{}\" to all outputs...", w.title());
-    let handle = wayland::spawn_wallpaper(image)?;
+    let handle = wayland::spawn_wallpaper(frame_source)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())
@@ -158,21 +155,11 @@ fn cmd_set_file(path: &PathBuf) -> Result<()> {
         return Err(anyhow!("file not found: {}", path.display()));
     }
     println!("Loading: {}", path.display());
-    let image = wayland::load_image(path)?;
+    let content = WallpaperContent::from_path(path)?;
     println!("Applying to all outputs…");
-    let handle = wayland::spawn_wallpaper(image)?;
+    let frame_source = FrameSource::from_content(content)?;
+    let handle = wayland::spawn_wallpaper(frame_source)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())
-}
-
-fn check_type_support(t: &WallpaperType) -> Result<()> {
-    match t {
-        WallpaperType::Scene => Err(anyhow!(
-            "scene wallpapers require the proprietary Wallpaper Engine renderer"
-        )),
-        WallpaperType::Web => Err(anyhow!("web wallpapers are not yet supported")),
-        WallpaperType::Application => Err(anyhow!("application wallpapers are Windows-only")),
-        _ => Ok(()),
-    }
 }
