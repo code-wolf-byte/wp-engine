@@ -1,7 +1,44 @@
 pub mod device;
 pub mod gpu;
+pub mod scaler;
 
 pub use device::GpuDevice;
+pub use scaler::GpuScaler;
+
+// ── Render quality ────────────────────────────────────────────────────────────
+
+/// Controls GPU render quality / source down-sample factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderQuality {
+    Ultra,
+    High,
+    Medium,
+    Low,
+}
+
+impl RenderQuality {
+    /// Fraction of the source image dimensions to keep before uploading to GPU.
+    /// Lower values reduce GPU memory bandwidth at the cost of quality.
+    pub fn source_scale(self) -> f32 {
+        match self {
+            Self::Ultra  => 1.0,
+            Self::High   => 0.75,
+            Self::Medium => 0.5,
+            Self::Low    => 0.25,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ultra  => "Ultra",
+            Self::High   => "High",
+            Self::Medium => "Medium",
+            Self::Low    => "Low",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [Self::Ultra, Self::High, Self::Medium, Self::Low];
+}
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 

@@ -6,8 +6,9 @@ mod workshop;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use render::{FrameSource, WallpaperContent};
+use render::{FrameSource, RenderSettings, WallpaperContent};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use workshop::Wallpaper;
 
 #[derive(Parser)]
@@ -148,7 +149,8 @@ fn cmd_set(id: &str) -> Result<()> {
 
     let frame_source = FrameSource::from_content(content)?;
     println!("Applying \"{}\" to all outputs...", w.title());
-    let handle = wayland::spawn_wallpaper(frame_source)?;
+    let settings = Arc::new(Mutex::new(RenderSettings::default()));
+    let handle = wayland::spawn_wallpaper(frame_source, settings)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())
@@ -192,7 +194,8 @@ fn cmd_set_file(path: &PathBuf) -> Result<()> {
     let content = WallpaperContent::from_path(path)?;
     println!("Applying to all outputs…");
     let frame_source = FrameSource::from_content(content)?;
-    let handle = wayland::spawn_wallpaper(frame_source)?;
+    let settings = Arc::new(Mutex::new(RenderSettings::default()));
+    let handle = wayland::spawn_wallpaper(frame_source, settings)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())

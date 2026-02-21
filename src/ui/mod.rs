@@ -1,4 +1,5 @@
-use crate::render::{FrameSource, WallpaperContent};
+use crate::platform::RenderQuality;
+use crate::render::{FrameSource, RenderSettings, WallpaperContent};
 use crate::wayland::{self, WallpaperHandle};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{
@@ -6,6 +7,7 @@ use egui::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -45,6 +47,7 @@ pub struct WpApp {
     status: StatusMsg,
 
     file_input: String,
+    settings: Arc<Mutex<RenderSettings>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -124,6 +127,7 @@ impl WpApp {
             active_title: None,
             status,
             file_input: String::new(),
+            settings: Arc::new(Mutex::new(RenderSettings::default())),
         }
     }
 
@@ -221,7 +225,7 @@ impl WpApp {
                 if let Some(old) = self.renderer.take() {
                     old.stop();
                 }
-                match wayland::spawn_wallpaper(frame_source) {
+                match wayland::spawn_wallpaper(frame_source, Arc::clone(&self.settings)) {
                     Ok(handle) => {
                         self.renderer = Some(handle);
                         self.active_title = Some(display_title.clone());
@@ -469,7 +473,7 @@ impl WpApp {
         ui.add_space(12.0);
         ui.separator();
 
-        // Apply button — pinned to bottom
+        // Apply button + settings panel — pinned to bottom
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             ui.add_space(6.0);
 
@@ -500,6 +504,31 @@ impl WpApp {
                     .corner_radius(CornerRadius::same(6)),
                 );
             }
+
+            // ── Render Settings ───────────────────────────────────────────────
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Audio playback coming soon")
+                    .color(TEXT_MUTED)
+                    .small(),
+            );
+            {
+                let mut s = self.settings.lock().unwrap();
+                ui.add(
+                    egui::Slider::new(&mut s.volume, 0.0..=1.0)
+                        .text("Volume")
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                );
+                egui::ComboBox::from_label("Quality")
+                    .selected_text(s.quality.label())
+                    .show_ui(ui, |ui| {
+                        for q in RenderQuality::ALL {
+                            ui.selectable_value(&mut s.quality, q, q.label());
+                        }
+                    });
+            }
+            ui.label(egui::RichText::new("Render Settings").color(TEXT_MUTED).size(12.0));
+            ui.separator();
         });
     }
 

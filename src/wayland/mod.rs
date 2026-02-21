@@ -13,7 +13,7 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex, mpsc::SyncSender};
 use std::thread;
 use std::time::Duration;
 use wayland_client::{
@@ -22,14 +22,16 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::render::FrameSource;
+use crate::{platform, render::{FrameSource, RenderSettings}};
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Handle to a running wallpaper renderer. Drop or call `stop()` to remove the wallpaper.
 pub struct WallpaperHandle {
     stop_signal: LoopSignal,
-    thread: thread::JoinHandle<()>,
+    thread:      thread::JoinHandle<()>,
+    /// Live render settings shared with the wallpaper thread. The UI reads and writes this.
+    pub settings: Arc<Mutex<RenderSettings>>,
 }
 
 impl WallpaperHandle {
@@ -50,11 +52,15 @@ impl WallpaperHandle {
 /// For animated sources a calloop timer fires at the source's native FPS,
 /// advancing the frame and redrawing every output. The wallpaper remains
 /// visible as long as the returned `WallpaperHandle` is alive.
-pub fn spawn_wallpaper(frame_source: FrameSource) -> Result<WallpaperHandle> {
+pub fn spawn_wallpaper(
+    frame_source: FrameSource,
+    settings: Arc<Mutex<RenderSettings>>,
+) -> Result<WallpaperHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
+    let settings_thread = Arc::clone(&settings);
     let thread = thread::spawn(move || {
-        if let Err(e) = wallpaper_loop(frame_source, signal_tx) {
+        if let Err(e) = wallpaper_loop(frame_source, settings_thread, signal_tx) {
             eprintln!("wallpaper thread error: {e}");
         }
     });
@@ -63,7 +69,7 @@ pub fn spawn_wallpaper(frame_source: FrameSource) -> Result<WallpaperHandle> {
         .recv()
         .map_err(|_| anyhow!("wallpaper thread exited before sending the loop signal"))?;
 
-    Ok(WallpaperHandle { stop_signal, thread })
+    Ok(WallpaperHandle { stop_signal, thread, settings })
 }
 
 // ── Internal renderer ─────────────────────────────────────────────────────────
@@ -75,14 +81,18 @@ struct WallpaperSurface {
 }
 
 struct WallpaperState {
-    registry_state: RegistryState,
-    output_state: OutputState,
-    compositor_state: CompositorState,
-    shm: Shm,
-    layer_shell: LayerShell,
-    surfaces: Vec<WallpaperSurface>,
+    registry_state:    RegistryState,
+    output_state:      OutputState,
+    compositor_state:  CompositorState,
+    shm:               Shm,
+    layer_shell:       LayerShell,
+    surfaces:          Vec<WallpaperSurface>,
     /// Live frame source — replaces the old static `image: RgbaImage`.
-    frame_source: FrameSource,
+    frame_source:      FrameSource,
+    /// GPU-accelerated scaler (falls back to CPU on error).
+    gpu_scaler:        platform::GpuScaler,
+    /// Render settings shared with the UI thread.
+    settings:          Arc<Mutex<RenderSettings>>,
 }
 
 impl WallpaperState {
@@ -124,21 +134,10 @@ impl WallpaperState {
             }
         };
 
-        // Scale image to match the output resolution.
-        let scaled = image::imageops::resize(
-            frame.as_ref(),
-            width,
-            height,
-            image::imageops::FilterType::Lanczos3,
-        );
-
-        // Convert RGBA → ARGB8888 (little-endian in memory: B G R A).
-        for (dst, src) in canvas.chunks_exact_mut(4).zip(scaled.chunks_exact(4)) {
-            dst[0] = src[2]; // B
-            dst[1] = src[1]; // G
-            dst[2] = src[0]; // R
-            dst[3] = src[3]; // A
-        }
+        // Scale frame to output resolution via GPU (falls back to CPU on error).
+        let quality = self.settings.lock().unwrap().quality;
+        let pixels = self.gpu_scaler.scale(frame.as_ref(), width, height, quality);
+        canvas.copy_from_slice(&pixels);
 
         let wl_surf = self.surfaces[idx].layer.wl_surface();
         wl_surf.attach(Some(buffer.wl_buffer()), 0, 0);
@@ -147,7 +146,18 @@ impl WallpaperState {
     }
 }
 
-fn wallpaper_loop(frame_source: FrameSource, signal_tx: SyncSender<LoopSignal>) -> Result<()> {
+fn wallpaper_loop(
+    frame_source: FrameSource,
+    settings: Arc<Mutex<RenderSettings>>,
+    signal_tx: SyncSender<LoopSignal>,
+) -> Result<()> {
+    // Open GPU device (prefer iGPU for background tasks; fall back to best).
+    let gpu = platform::GpuDevice::open_low_power()
+        .or_else(|_| platform::GpuDevice::open_best())
+        .map_err(|e| anyhow!("no GPU device available: {e}"))?;
+    let gpu_scaler = platform::GpuScaler::from_device(gpu)
+        .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
+
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("cannot connect to Wayland display: {e}"))?;
 
@@ -174,6 +184,8 @@ fn wallpaper_loop(frame_source: FrameSource, signal_tx: SyncSender<LoopSignal>) 
         layer_shell,
         surfaces: Vec::new(),
         frame_source,
+        gpu_scaler,
+        settings,
     };
 
     // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces.
