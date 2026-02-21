@@ -1,4 +1,4 @@
-use crate::renderer::{FrameSource, WallpaperContent};
+use crate::render::{FrameSource, WallpaperContent};
 use crate::wayland::{self, WallpaperHandle};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{

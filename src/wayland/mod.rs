@@ -22,7 +22,7 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::renderer::FrameSource;
+use crate::render::FrameSource;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
