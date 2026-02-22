@@ -32,6 +32,10 @@ ffmpeg-next = "8"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Platform Abstraction Layer – GPU enumeration + device creation
+wgpu     = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
+pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
+
 # Utilities
 anyhow = "1"
 dirs   = "5"

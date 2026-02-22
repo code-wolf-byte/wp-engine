@@ -1,12 +1,14 @@
-mod renderer;
+mod platform;
+mod render;
 mod ui;
 mod wayland;
 mod workshop;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use renderer::{FrameSource, WallpaperContent};
+use render::{FrameSource, RenderSettings, WallpaperContent};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use workshop::Wallpaper;
 
 #[derive(Parser)]
@@ -40,6 +42,8 @@ enum Command {
     Info {
         id: String,
     },
+    /// List available GPU adapters (PAL probe)
+    Probe,
 }
 
 fn main() {
@@ -52,6 +56,7 @@ fn main() {
         Some(Command::Set { id }) => cmd_set(&id),
         Some(Command::SetFile { path }) => cmd_set_file(&path),
         Some(Command::Info { id }) => cmd_info(&id),
+        Some(Command::Probe)       => cmd_probe(),
     };
 
     if let Err(e) = result {
@@ -144,9 +149,40 @@ fn cmd_set(id: &str) -> Result<()> {
 
     let frame_source = FrameSource::from_content(content)?;
     println!("Applying \"{}\" to all outputs...", w.title());
-    let handle = wayland::spawn_wallpaper(frame_source)?;
+    let settings = Arc::new(Mutex::new(RenderSettings::default()));
+    let handle = wayland::spawn_wallpaper(frame_source, settings)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
+    Ok(())
+}
+
+fn cmd_probe() -> Result<()> {
+    // ── 1. List all visible adapters ─────────────────────────────────────────
+    let adapters = platform::probe_adapters();
+    if adapters.is_empty() {
+        println!("No GPU adapters found.");
+        return Ok(());
+    }
+    println!("{:<40} {:<10} {:<12} {}", "Name", "Backend", "Type", "PCI IDs");
+    println!("{}", "─".repeat(74));
+    for a in &adapters {
+        println!(
+            "{:<40} {:<10} {:<12} {:04x}:{:04x}",
+            a.name, a.backend, a.device_type, a.vendor_id, a.device_id
+        );
+    }
+    println!("\n{} adapter(s) found\n", adapters.len());
+
+    // ── 2. Open the best device to confirm driver access works ───────────────
+    print!("Opening best device... ");
+    match platform::open_device() {
+        Ok(dev) => println!(
+            "OK  →  {} ({}, {})",
+            dev.info.name, dev.info.backend, dev.info.device_type
+        ),
+        Err(e) => println!("FAILED: {e}"),
+    }
+
     Ok(())
 }
 
@@ -158,7 +194,8 @@ fn cmd_set_file(path: &PathBuf) -> Result<()> {
     let content = WallpaperContent::from_path(path)?;
     println!("Applying to all outputs…");
     let frame_source = FrameSource::from_content(content)?;
-    let handle = wayland::spawn_wallpaper(frame_source)?;
+    let settings = Arc::new(Mutex::new(RenderSettings::default()));
+    let handle = wayland::spawn_wallpaper(frame_source, settings)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())
