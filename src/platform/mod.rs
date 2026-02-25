@@ -1,8 +1,11 @@
 pub mod device;
+pub mod display;
 pub mod gpu;
 pub mod scaler;
+pub mod wayland;
 
 pub use device::GpuDevice;
+pub use display::{detect_platform, WallpaperHandle};
 pub use scaler::GpuScaler;
 
 // ── Render quality ────────────────────────────────────────────────────────────

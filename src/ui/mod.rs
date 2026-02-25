@@ -1,6 +1,6 @@
 use crate::platform::RenderQuality;
 use crate::render::{FrameSource, RenderSettings, WallpaperContent};
-use crate::wayland::{self, WallpaperHandle};
+use crate::platform::{WallpaperHandle, display::detect_platform};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{
     pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, Rect, Sense,
@@ -225,7 +225,7 @@ impl WpApp {
                 if let Some(old) = self.renderer.take() {
                     old.stop();
                 }
-                match wayland::spawn_wallpaper(frame_source, Arc::clone(&self.settings)) {
+                match detect_platform().spawn_wallpaper(frame_source, Arc::clone(&self.settings)) {
                     Ok(handle) => {
                         self.renderer = Some(handle);
                         self.active_title = Some(display_title.clone());
