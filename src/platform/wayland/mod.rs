@@ -23,39 +23,45 @@ use wayland_client::{
 };
 
 use crate::{platform, render::{FrameSource, RenderSettings}};
+use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Platform implementation ───────────────────────────────────────────────────
 
-/// Handle to a running wallpaper renderer. Drop or call `stop()` to remove the wallpaper.
-pub struct WallpaperHandle {
-    stop_signal: LoopSignal,
-    thread:      thread::JoinHandle<()>,
-    /// Live render settings shared with the wallpaper thread. The UI reads and writes this.
-    pub settings: Arc<Mutex<RenderSettings>>,
+pub(super) struct WaylandPlatform;
+
+impl DisplayPlatform for WaylandPlatform {
+    fn spawn_wallpaper(
+        &self,
+        frame_source: FrameSource,
+        settings: Arc<Mutex<RenderSettings>>,
+    ) -> Result<WallpaperHandle> {
+        let wayland_handle = spawn_wayland_wallpaper(frame_source, Arc::clone(&settings))?;
+        Ok(WallpaperHandle::new(Box::new(wayland_handle), settings))
+    }
 }
 
-impl WallpaperHandle {
-    /// Stop the renderer and wait for its thread to exit.
-    pub fn stop(self) {
+// ── Internal handle ───────────────────────────────────────────────────────────
+
+struct WaylandHandle {
+    stop_signal: LoopSignal,
+    thread:      thread::JoinHandle<()>,
+}
+
+impl WallpaperHandleInner for WaylandHandle {
+    fn stop(self: Box<Self>) {
         self.stop_signal.stop();
         let _ = self.thread.join();
     }
 
-    /// Block the calling thread until the renderer exits (e.g. on Ctrl-C).
-    pub fn wait(self) {
+    fn wait(self: Box<Self>) {
         let _ = self.thread.join();
     }
 }
 
-/// Spawn a background thread that keeps `frame_source` displayed on all Wayland outputs.
-///
-/// For animated sources a calloop timer fires at the source's native FPS,
-/// advancing the frame and redrawing every output. The wallpaper remains
-/// visible as long as the returned `WallpaperHandle` is alive.
-pub fn spawn_wallpaper(
+fn spawn_wayland_wallpaper(
     frame_source: FrameSource,
     settings: Arc<Mutex<RenderSettings>>,
-) -> Result<WallpaperHandle> {
+) -> Result<WaylandHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
     let settings_thread = Arc::clone(&settings);
@@ -69,7 +75,7 @@ pub fn spawn_wallpaper(
         .recv()
         .map_err(|_| anyhow!("wallpaper thread exited before sending the loop signal"))?;
 
-    Ok(WallpaperHandle { stop_signal, thread, settings })
+    Ok(WaylandHandle { stop_signal, thread })
 }
 
 // ── Internal renderer ─────────────────────────────────────────────────────────

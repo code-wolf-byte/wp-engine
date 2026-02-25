@@ -1,10 +1,10 @@
+mod engine;
 mod platform;
 mod render;
 mod ui;
-mod wayland;
 mod workshop;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use render::{FrameSource, RenderSettings, WallpaperContent};
 use std::path::PathBuf;
@@ -44,6 +44,13 @@ enum Command {
     },
     /// List available GPU adapters (PAL probe)
     Probe,
+    /// Inspect (and optionally extract) a Wallpaper Engine PKG archive
+    PkgInfo {
+        path: PathBuf,
+        /// Dump all contained files to this directory
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -57,6 +64,7 @@ fn main() {
         Some(Command::SetFile { path }) => cmd_set_file(&path),
         Some(Command::Info { id }) => cmd_info(&id),
         Some(Command::Probe)       => cmd_probe(),
+        Some(Command::PkgInfo { path, dump }) => cmd_pkg_info(&path, dump.as_deref()),
     };
 
     if let Err(e) = result {
@@ -150,7 +158,7 @@ fn cmd_set(id: &str) -> Result<()> {
     let frame_source = FrameSource::from_content(content)?;
     println!("Applying \"{}\" to all outputs...", w.title());
     let settings = Arc::new(Mutex::new(RenderSettings::default()));
-    let handle = wayland::spawn_wallpaper(frame_source, settings)?;
+    let handle = platform::detect_platform().spawn_wallpaper(frame_source, settings)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())
@@ -195,8 +203,47 @@ fn cmd_set_file(path: &PathBuf) -> Result<()> {
     println!("Applying to all outputs…");
     let frame_source = FrameSource::from_content(content)?;
     let settings = Arc::new(Mutex::new(RenderSettings::default()));
-    let handle = wayland::spawn_wallpaper(frame_source, settings)?;
+    let handle = platform::detect_platform().spawn_wallpaper(frame_source, settings)?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
+    Ok(())
+}
+
+fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Result<()> {
+    let pkg = engine::Package::from_file(path)?;
+
+    println!("Files   : {}", pkg.len());
+    println!();
+
+    // Collect and sort paths for a stable, readable table.
+    let mut paths: Vec<&str> = pkg.paths().collect();
+    paths.sort_unstable();
+
+    for p in &paths {
+        let size_kb = pkg.get(p).map(|b| b.len()).unwrap_or(0) / 1024;
+        println!("{size_kb:>6} KB  {p}");
+    }
+
+    if let Some(dump_dir) = dump {
+        std::fs::create_dir_all(dump_dir)
+            .with_context(|| format!("failed to create dump directory: {}", dump_dir.display()))?;
+
+        let mut count = 0usize;
+        for p in &paths {
+            if let Some(bytes) = pkg.get(p) {
+                let dest = dump_dir.join(p);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create directory: {}", parent.display())
+                    })?;
+                }
+                std::fs::write(&dest, bytes)
+                    .with_context(|| format!("failed to write: {}", dest.display()))?;
+                count += 1;
+            }
+        }
+        println!("\nExtracted {count} files to {}", dump_dir.display());
+    }
+
     Ok(())
 }
