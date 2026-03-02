@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "hook"]
+
 [package]
 name = "wp-engine"
 version = "0.1.0"
@@ -23,18 +26,11 @@ egui   = "0.33"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Image loading (thumbnails + wallpaper pixels)
+# Image loading (thumbnails only)
 image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
-
-# Video decoding (requires system FFmpeg: pacman -S ffmpeg / apt install ffmpeg)
-ffmpeg-next = "8"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
-
-# Platform Abstraction Layer – GPU enumeration + device creation
-wgpu     = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
-pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
 
 # Utilities
 anyhow = "1"

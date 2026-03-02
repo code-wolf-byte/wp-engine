@@ -22,7 +22,7 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::{platform, render::{FrameSource, RenderSettings}};
+use crate::render::{FrameSource, RenderSettings};
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 
 // ── Platform implementation ───────────────────────────────────────────────────
@@ -87,27 +87,20 @@ struct WallpaperSurface {
 }
 
 struct WallpaperState {
-    registry_state:    RegistryState,
-    output_state:      OutputState,
-    compositor_state:  CompositorState,
-    shm:               Shm,
-    layer_shell:       LayerShell,
-    surfaces:          Vec<WallpaperSurface>,
-    /// Live frame source — replaces the old static `image: RgbaImage`.
-    frame_source:      FrameSource,
-    /// GPU-accelerated scaler (falls back to CPU on error).
-    gpu_scaler:        platform::GpuScaler,
+    registry_state:   RegistryState,
+    output_state:     OutputState,
+    compositor_state: CompositorState,
+    shm:              Shm,
+    layer_shell:      LayerShell,
+    surfaces:         Vec<WallpaperSurface>,
+    /// Live frame source receiving RGBA frames from the IPC thread.
+    frame_source:     FrameSource,
     /// Render settings shared with the UI thread.
-    settings:          Arc<Mutex<RenderSettings>>,
+    settings:         Arc<Mutex<RenderSettings>>,
 }
 
 impl WallpaperState {
     /// Draw the current frame onto the surface at `surfaces[idx]`.
-    ///
-    /// Takes `&self` (not `&mut self`) so the calloop timer callback can call
-    /// this after releasing the `&mut` borrow from `frame_source.try_advance()`.
-    /// The frame is obtained via `Arc::clone` — a cheap atomic refcount bump,
-    /// no pixel data is copied at this point.
     fn draw_at(&self, idx: usize) {
         let width = self.surfaces[idx].width;
         let height = self.surfaces[idx].height;
@@ -115,8 +108,15 @@ impl WallpaperState {
             return;
         }
 
-        // Cheap Arc clone — no image data is duplicated.
-        let frame = std::sync::Arc::clone(self.frame_source.current_frame());
+        let frame = Arc::clone(self.frame_source.current_frame());
+
+        // Verify the frame dimensions match the surface.
+        // WE is launched at the exact monitor size, so they should always match.
+        let frame_w = frame.width();
+        let frame_h = frame.height();
+        if frame_w == 0 || frame_h == 0 {
+            return;
+        }
 
         let stride = width * 4;
         let mut pool = match SlotPool::new((width * height * 4) as usize, &self.shm) {
@@ -140,10 +140,29 @@ impl WallpaperState {
             }
         };
 
-        // Scale frame to output resolution via GPU (falls back to CPU on error).
-        let quality = self.settings.lock().unwrap().quality;
-        let pixels = self.gpu_scaler.scale(frame.as_ref(), width, height, quality);
-        canvas.copy_from_slice(&pixels);
+        // Frame pixels are RGBA (from the IPC receiver which swaps B↔R).
+        // Wayland ARGB8888 on little-endian stores pixels as [B, G, R, A] in memory.
+        // We need to swap R↔B when writing to the canvas.
+        if frame_w == width && frame_h == height {
+            let src = frame.as_raw();
+            for (dst_pixel, src_pixel) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                // src_pixel = [R, G, B, A] (RGBA)
+                // dst_pixel = [B, G, R, A] (ARGB8888 LE)
+                dst_pixel[0] = src_pixel[2]; // B
+                dst_pixel[1] = src_pixel[1]; // G
+                dst_pixel[2] = src_pixel[0]; // R
+                dst_pixel[3] = src_pixel[3]; // A
+            }
+        } else {
+            // Dimensions mismatch — fill with black
+            for b in canvas.iter_mut() {
+                *b = 0;
+            }
+            // Set alpha to fully opaque
+            for pixel in canvas.chunks_exact_mut(4) {
+                pixel[3] = 0xFF;
+            }
+        }
 
         let wl_surf = self.surfaces[idx].layer.wl_surface();
         wl_surf.attach(Some(buffer.wl_buffer()), 0, 0);
@@ -157,13 +176,6 @@ fn wallpaper_loop(
     settings: Arc<Mutex<RenderSettings>>,
     signal_tx: SyncSender<LoopSignal>,
 ) -> Result<()> {
-    // Open GPU device (prefer iGPU for background tasks; fall back to best).
-    let gpu = platform::GpuDevice::open_low_power()
-        .or_else(|_| platform::GpuDevice::open_best())
-        .map_err(|e| anyhow!("no GPU device available: {e}"))?;
-    let gpu_scaler = platform::GpuScaler::from_device(gpu)
-        .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
-
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("cannot connect to Wayland display: {e}"))?;
 
@@ -190,21 +202,19 @@ fn wallpaper_loop(
         layer_shell,
         surfaces: Vec::new(),
         frame_source,
-        gpu_scaler,
         settings,
     };
 
-    // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces.
+    // First roundtrip: discover outputs → create surfaces
     event_queue
         .roundtrip(&mut state)
         .map_err(|e| anyhow!("initial Wayland roundtrip failed: {e}"))?;
 
-    // Second roundtrip: compositor sends configure events for our layer surfaces.
+    // Second roundtrip: compositor sends configure events for our layer surfaces
     event_queue
         .roundtrip(&mut state)
         .map_err(|e| anyhow!("second Wayland roundtrip failed: {e}"))?;
 
-    // Hand the queue to calloop.
     let mut event_loop: calloop::EventLoop<WallpaperState> =
         calloop::EventLoop::try_new().map_err(|e| anyhow!("calloop init failed: {e}"))?;
 
@@ -212,47 +222,29 @@ fn wallpaper_loop(
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
 
-    // ── Animated wallpapers: high-frequency poll, render only on new frames ────
-    //
-    // The decoder thread paces itself using the frame's PTS timestamps, so
-    // frames arrive at the video's native rate. We poll at 120 Hz (every 8 ms)
-    // to keep display latency low without tying render calls to a fixed-fps
-    // timer that might not match the video's actual frame rate.
-    //
-    // On each tick:
-    //   1. `try_advance()` takes at most ONE frame from the channel (&mut,
-    //      released before step 2).
-    //   2. Only if a new frame arrived, `draw_at` redraws every output
-    //      (&self borrow, no conflict with step 1).
-    //   3. Return `ToDuration` to reschedule.
+    // Poll at ~120 Hz for animated (IPC) frame sources.
     if state.frame_source.is_animated() {
-        const POLL_INTERVAL: Duration = Duration::from_millis(8); // ~120 Hz
+        const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
         event_loop
             .handle()
             .insert_source(
                 calloop::timer::Timer::from_duration(POLL_INTERVAL),
                 |_deadline, _metadata, state: &mut WallpaperState| {
-                    // Step 1: try to pull the next frame (&mut, released here).
                     if state.frame_source.try_advance() {
-                        // Step 2: new frame available — redraw all outputs.
                         let n = state.surfaces.len();
                         for idx in 0..n {
                             state.draw_at(idx);
                         }
                     }
-
-                    // Step 3: reschedule.
                     calloop::timer::TimeoutAction::ToDuration(POLL_INTERVAL)
                 },
             )
             .map_err(|e| anyhow!("timer source insert failed: {e}"))?;
     }
 
-    // Give the loop signal to the spawning thread before blocking.
     let _ = signal_tx.send(event_loop.get_signal());
 
-    // Run until stop_signal.stop() is called from the UI thread.
     event_loop
         .run(None, &mut state, |_| {})
         .map_err(|e| anyhow!("event loop error: {e}"))?;

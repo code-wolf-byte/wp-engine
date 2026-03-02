@@ -1,16 +1,12 @@
-pub mod device;
 pub mod display;
 pub mod gpu;
-pub mod scaler;
 pub mod wayland;
 
-pub use device::GpuDevice;
 pub use display::{detect_platform, WallpaperHandle};
-pub use scaler::GpuScaler;
 
 // ── Render quality ────────────────────────────────────────────────────────────
 
-/// Controls GPU render quality / source down-sample factor.
+/// Controls render quality hint passed to Wallpaper Engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderQuality {
     Ultra,
@@ -20,17 +16,6 @@ pub enum RenderQuality {
 }
 
 impl RenderQuality {
-    /// Fraction of the source image dimensions to keep before uploading to GPU.
-    /// Lower values reduce GPU memory bandwidth at the cost of quality.
-    pub fn source_scale(self) -> f32 {
-        match self {
-            Self::Ultra  => 1.0,
-            Self::High   => 0.75,
-            Self::Medium => 0.5,
-            Self::Low    => 0.25,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Ultra  => "Ultra",
@@ -72,13 +57,9 @@ impl std::fmt::Display for BackendType {
 /// Physical category of a GPU adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuDeviceType {
-    /// Dedicated GPU (discrete card, highest performance).
     Discrete,
-    /// GPU share system memory with the CPU.
     Integrated,
-    /// Virtualised / paravirtualised GPU.
     Virtual,
-    /// Pure software rasteriser (LLVMpipe, SwiftShader, …).
     Software,
     Unknown,
 }
@@ -98,41 +79,18 @@ impl std::fmt::Display for GpuDeviceType {
 // ── Adapter info ──────────────────────────────────────────────────────────────
 
 /// Information about a GPU adapter visible to the process.
-///
-/// One entry is returned per (physical-device, backend) combination — on
-/// Linux a single card can appear as both Vulkan and OpenGL.
 #[derive(Debug, Clone)]
 pub struct GpuAdapter {
     pub name: String,
     pub backend: BackendType,
     pub device_type: GpuDeviceType,
-    /// PCI device ID (0 if unavailable).
     pub device_id: u32,
-    /// PCI vendor ID (0 if unavailable).
     pub vendor_id: u32,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Enumerate every GPU adapter available on this system.
-///
-/// Fast and non-blocking — only queries driver metadata, no device is
-/// created and no GPU work is performed.
+/// Enumerate every GPU adapter available on this system (for the probe command).
 pub fn probe_adapters() -> Vec<GpuAdapter> {
     gpu::enumerate_adapters()
-}
-
-/// Open the highest-performance GPU device available.
-///
-/// Prefers a discrete GPU; falls back to integrated, then software.
-pub fn open_device() -> anyhow::Result<GpuDevice> {
-    GpuDevice::open_best()
-}
-
-/// Open the lowest-power GPU device available.
-///
-/// Prefer this for background tasks that should not compete with foreground
-/// 3-D applications for the discrete GPU.
-pub fn open_low_power_device() -> anyhow::Result<GpuDevice> {
-    GpuDevice::open_low_power()
 }

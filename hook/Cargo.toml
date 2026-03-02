@@ -1,0 +1,17 @@
+[package]
+name = "hook"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "version"          # DLL is named version.dll — injection vector
+
+[dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_Networking_WinSock",
+    "Win32_UI_WindowsAndMessaging",
+] }

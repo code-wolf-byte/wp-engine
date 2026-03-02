@@ -1,5 +1,5 @@
 use crate::platform::RenderQuality;
-use crate::render::{FrameSource, RenderSettings, WallpaperContent};
+use crate::render::{FrameSource, RenderSettings};
 use crate::platform::{WallpaperHandle, display::detect_platform};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{
@@ -31,9 +31,12 @@ const ACCENT_GREEN: Color32 = Color32::from_rgb(100, 200, 120);
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
+/// Result sent back from the background launch thread.
+type LaunchResult = Result<(FrameSource, String), String>;
+
 pub struct WpApp {
     wallpapers: Vec<Wallpaper>,
-    filtered: Vec<usize>, // indices into wallpapers matching current search/filter
+    filtered: Vec<usize>,
 
     search: String,
     type_filter: TypeFilter,
@@ -43,10 +46,13 @@ pub struct WpApp {
     thumb_queue: Vec<usize>,
 
     renderer: Option<WallpaperHandle>,
+    /// Keeps the WE child process alive for as long as the wallpaper is active.
+    _we_process: Option<crate::wine::process::WineProcess>,
+    /// Background thread sends (FrameSource, title) once the first frame arrives.
+    pending: Option<std::sync::mpsc::Receiver<LaunchResult>>,
     active_title: Option<String>,
     status: StatusMsg,
 
-    file_input: String,
     settings: Arc<Mutex<RenderSettings>>,
 }
 
@@ -124,9 +130,10 @@ impl WpApp {
             thumbnails: HashMap::new(),
             thumb_queue: Vec::new(),
             renderer: None,
+            _we_process: None,
+            pending: None,
             active_title: None,
             status,
-            file_input: String::new(),
             settings: Arc::new(Mutex::new(RenderSettings::default())),
         }
     }
@@ -157,7 +164,6 @@ impl WpApp {
     }
 
     fn flush_thumb_queue(&mut self, ctx: &egui::Context) {
-        // Load at most 4 thumbnails per frame to keep frame times smooth
         let batch: Vec<usize> = self.thumb_queue.drain(..self.thumb_queue.len().min(4)).collect();
         for idx in batch {
             self.load_thumb(idx, ctx);
@@ -171,7 +177,6 @@ impl WpApp {
             return;
         }
 
-        // Try preview file first, then look for any image in the directory
         let path = w.preview_file().or_else(|| {
             std::fs::read_dir(&w.path).ok()?.find_map(|e| {
                 let p = e.ok()?.path();
@@ -193,48 +198,127 @@ impl WpApp {
 
     // ── Wallpaper application ─────────────────────────────────────────────────
 
-    fn apply_path(&mut self, path: PathBuf, display_title: String) {
-        match WallpaperContent::from_path(&path) {
-            Err(e) => self.status = StatusMsg::err(format!("Load failed: {e}")),
-            Ok(content) => self.apply_content(content, display_title),
-        }
-    }
-
+    /// Apply a Workshop wallpaper via Wallpaper Engine + hook DLL IPC.
     fn apply_selected(&mut self) {
         let Some(idx) = self.selected else { return };
 
         let title = self.wallpapers[idx].title().to_string();
-        // `from_wallpaper` borrows wallpapers[idx] and returns an owned Result —
-        // the borrow ends here, so self is free to mutate below.
-        let content = WallpaperContent::from_wallpaper(&self.wallpapers[idx]);
+        // Pass the wallpaper directory — WE finds scene.pkg / index.html internally.
+        let wallpaper_path = self.wallpapers[idx].path.clone();
 
-        match content {
-            Err(e) => self.status = StatusMsg::err(e.to_string()),
-            Ok(content) => self.apply_content(content, title),
-        }
+        self.launch_via_wine(wallpaper_path, title);
     }
 
-    /// Create a `FrameSource` from parsed content and hand it to the Wayland renderer.
-    /// Stops any currently running wallpaper before starting the new one.
-    fn apply_content(&mut self, content: WallpaperContent, display_title: String) {
-        match FrameSource::from_content(content) {
-            Err(e) => {
-                self.status = StatusMsg::err(format!("Renderer init failed: {e}"));
+    /// Launch Wallpaper Engine with the given wallpaper file and connect to IPC.
+    ///
+    /// Non-blocking: spawns a background thread that waits for the first frame,
+    /// then sends the ready `FrameSource` back through `self.pending`.
+    fn launch_via_wine(&mut self, wallpaper_path: PathBuf, display_title: String) {
+        use crate::wine::{ipc::IpcServer, process::WineProcess, WineEnv};
+
+        let we_exe = match workshop::find_wallpaper_engine_exe() {
+            Some(p) => p,
+            None => {
+                self.status = StatusMsg::err(
+                    "wallpaper_engine.exe not found — install Wallpaper Engine via Steam",
+                );
+                return;
             }
-            Ok(frame_source) => {
-                if let Some(old) = self.renderer.take() {
-                    old.stop();
+        };
+
+        let env = match WineEnv::detect() {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = StatusMsg::err(format!("Wine not found: {e}"));
+                return;
+            }
+        };
+
+        let ipc_server = match IpcServer::bind() {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = StatusMsg::err(format!("IPC server error: {e}"));
+                return;
+            }
+        };
+        let socket_path = ipc_server.socket_path.clone();
+
+        let we_process = match WineProcess::launch_wallpaper_engine(
+            &env,
+            &we_exe,
+            &wallpaper_path,
+            &socket_path,
+            1920,
+            1080,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = StatusMsg::err(format!("Failed to launch Wallpaper Engine: {e}"));
+                return;
+            }
+        };
+
+        // Stop the old renderer before starting a new one.
+        if let Some(old) = self.renderer.take() {
+            old.stop();
+        }
+        // Store the new process (drops + kills any previous WE process).
+        self._we_process = Some(we_process);
+
+        // Start the IPC frame receiver. The sender goes to the background thread.
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::sync_channel(2);
+        crate::wine::ipc::start_frame_receiver(ipc_server, ipc_tx);
+
+        // Spawn a background thread that waits for the first frame, then
+        // packages the FrameSource and sends it back to the UI thread.
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel::<LaunchResult>(1);
+        std::thread::spawn(move || {
+            let result = match ipc_rx.recv() {
+                Ok(first) => Ok((FrameSource::from_ipc(first, ipc_rx), display_title)),
+                Err(_) => Err("Hook DLL sent no frames — is version.dll next to the binary?".to_string()),
+            };
+            let _ = pending_tx.send(result);
+        });
+
+        self.pending = Some(pending_rx);
+        self.status = StatusMsg::ok("Launching Wallpaper Engine…".to_string());
+    }
+
+    /// Poll the pending launch result (called every frame from `update`).
+    /// When the background thread delivers its result, start the Wayland renderer.
+    fn poll_pending(&mut self, ctx: &egui::Context) {
+        let result = match &self.pending {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => r,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still waiting — keep repainting so we poll again soon.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    return;
                 }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("Launch thread exited unexpectedly".to_string())
+                }
+            },
+            None => return,
+        };
+
+        self.pending = None;
+
+        match result {
+            Ok((frame_source, title)) => {
                 match detect_platform().spawn_wallpaper(frame_source, Arc::clone(&self.settings)) {
                     Ok(handle) => {
                         self.renderer = Some(handle);
-                        self.active_title = Some(display_title.clone());
-                        self.status = StatusMsg::ok(format!("Applied \"{display_title}\""));
+                        self.active_title = Some(title.clone());
+                        self.status = StatusMsg::ok(format!("Applied \"{title}\""));
                     }
                     Err(e) => {
                         self.status = StatusMsg::err(format!("Renderer error: {e}"));
                     }
                 }
+            }
+            Err(e) => {
+                self.status = StatusMsg::err(e);
             }
         }
     }
@@ -244,6 +328,7 @@ impl WpApp {
 
 impl eframe::App for WpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_pending(ctx);
         self.flush_thumb_queue(ctx);
         self.render_toolbar(ctx);
         self.render_sidebar(ctx);
@@ -265,7 +350,7 @@ impl WpApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("🖼 wp-engine")
+                        egui::RichText::new("wp-engine")
                             .size(16.0)
                             .color(TEXT_PRIMARY)
                             .strong(),
@@ -352,9 +437,7 @@ impl WpApp {
             });
     }
 
-    // Details panel — collects all data first to avoid borrow conflicts
     fn render_details(&mut self, ui: &mut egui::Ui, idx: usize) {
-        // ── Collect data from the wallpaper (end borrows before any mutation) ──
         let title = self.wallpapers[idx].title().to_string();
         let wtype = self.wallpapers[idx].wallpaper_type().clone();
         let tags = self.wallpapers[idx].project.tags.clone().unwrap_or_default();
@@ -366,13 +449,15 @@ impl WpApp {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let can_apply = matches!(wtype, WallpaperType::Video | WallpaperType::Unknown)
-            && file_exists;
+
+        // Any wallpaper can be applied via WE as long as WE is installed.
+        let we_available = workshop::find_wallpaper_engine_exe().is_some();
+        let can_apply = we_available && self.wallpapers[idx].path.exists();
+
         let thumb = self.thumbnails.get(&workshop_id).cloned();
 
         // ── Render ────────────────────────────────────────────────────────────
 
-        // Preview (full width, 16:9)
         let pw = ui.available_width();
         let ph = pw * 9.0 / 16.0;
         let (preview_rect, _) = ui.allocate_exact_size(vec2(pw, ph), Sense::hover());
@@ -399,11 +484,9 @@ impl WpApp {
 
         ui.add_space(10.0);
 
-        // Title
         ui.label(egui::RichText::new(&title).size(15.0).color(TEXT_PRIMARY).strong());
         ui.add_space(4.0);
 
-        // Type badge
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Type ").color(TEXT_MUTED).size(12.0));
             egui::Frame::default()
@@ -415,9 +498,24 @@ impl WpApp {
                         egui::RichText::new(wtype.to_string()).size(11.0).color(Color32::WHITE),
                     );
                 });
+
+            // Badge for types that require WE
+            if matches!(wtype, WallpaperType::Scene | WallpaperType::Web) {
+                ui.add_space(4.0);
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(80, 60, 130))
+                    .corner_radius(CornerRadius::same(3))
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Requires Wine + WE")
+                                .size(10.0)
+                                .color(Color32::from_rgb(200, 180, 255)),
+                        );
+                    });
+            }
         });
 
-        // Tags
         if !tags.is_empty() {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -434,7 +532,6 @@ impl WpApp {
             });
         }
 
-        // Workshop ID + file
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(format!("ID: {workshop_id}"))
@@ -442,44 +539,29 @@ impl WpApp {
                 .color(TEXT_MUTED),
         );
 
-        match &wtype {
-            // Scene wallpapers store data in scene.pkg (proprietary binary) — file field is misleading
-            WallpaperType::Scene => {
-                ui.label(
-                    egui::RichText::new("Stored as scene.pkg — requires Wallpaper Engine renderer")
-                        .size(11.0)
-                        .color(TEXT_MUTED),
-                );
-            }
-            // For renderable types, show whether the file exists
-            _ if !file_name.is_empty() => {
-                let file_color = if file_exists {
-                    TEXT_MUTED
-                } else {
-                    Color32::from_rgb(243, 139, 168)
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "File: {file_name}{}",
-                        if file_exists { "" } else { " (missing)" }
-                    ))
-                    .size(11.0)
-                    .color(file_color),
-                );
-            }
-            _ => {}
+        if !file_name.is_empty() {
+            let file_color = if file_exists { TEXT_MUTED } else { Color32::from_rgb(243, 139, 168) };
+            ui.label(
+                egui::RichText::new(format!(
+                    "File: {file_name}{}",
+                    if file_exists { "" } else { " (missing)" }
+                ))
+                .size(11.0)
+                .color(file_color),
+            );
         }
 
         ui.add_space(12.0);
         ui.separator();
 
-        // Apply button + settings panel — pinned to bottom
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             ui.add_space(6.0);
 
             if can_apply {
                 let btn = egui::Button::new(
-                    egui::RichText::new("▶  Apply Wallpaper").size(14.0).color(Color32::WHITE),
+                    egui::RichText::new("▶  Apply via Wallpaper Engine")
+                        .size(13.0)
+                        .color(Color32::WHITE),
                 )
                 .fill(Color32::from_rgb(38, 130, 65))
                 .min_size(vec2(ui.available_width(), 38.0))
@@ -489,11 +571,10 @@ impl WpApp {
                     self.apply_selected();
                 }
             } else {
-                let reason = match wtype {
-                    WallpaperType::Scene => "Scene format not supported",
-                    WallpaperType::Web => "Web format not supported",
-                    WallpaperType::Application => "Windows-only",
-                    _ => "File missing",
+                let reason = if !we_available {
+                    "wallpaper_engine.exe not found"
+                } else {
+                    "File missing"
                 };
                 ui.add_enabled(
                     false,
@@ -507,18 +588,8 @@ impl WpApp {
 
             // ── Render Settings ───────────────────────────────────────────────
             ui.separator();
-            ui.label(
-                egui::RichText::new("Audio playback coming soon")
-                    .color(TEXT_MUTED)
-                    .small(),
-            );
             {
                 let mut s = self.settings.lock().unwrap();
-                ui.add(
-                    egui::Slider::new(&mut s.volume, 0.0..=1.0)
-                        .text("Volume")
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                );
                 egui::ComboBox::from_label("Quality")
                     .selected_text(s.quality.label())
                     .show_ui(ui, |ui| {
@@ -542,42 +613,12 @@ impl WpApp {
             );
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Click a wallpaper in the grid,\nor set a file path below.")
+                egui::RichText::new("Click a wallpaper in the grid to apply it\nvia Wallpaper Engine.")
                     .color(TEXT_MUTED)
                     .size(12.0),
             );
 
             ui.add_space(24.0);
-            ui.separator();
-            ui.add_space(16.0);
-
-            ui.label(egui::RichText::new("Apply an image file directly:").color(TEXT_MUTED).size(12.0));
-            ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.file_input)
-                    .desired_width(ui.available_width())
-                    .hint_text("/path/to/wallpaper.png"),
-            );
-            ui.add_space(6.0);
-
-            let apply_btn = egui::Button::new(
-                egui::RichText::new("Apply File").color(Color32::WHITE).size(13.0),
-            )
-            .fill(Color32::from_rgb(40, 100, 180))
-            .min_size(vec2(ui.available_width(), 32.0))
-            .corner_radius(CornerRadius::same(6));
-
-            if ui.add(apply_btn).clicked() && !self.file_input.trim().is_empty() {
-                let path = PathBuf::from(self.file_input.trim());
-                let name = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                self.apply_path(path, name);
-            }
-
-            ui.add_space(16.0);
             ui.separator();
             ui.add_space(10.0);
             ui.label(
@@ -607,8 +648,7 @@ impl WpApp {
                         ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new(
-                                "Install Wallpaper Engine on Steam and subscribe to wallpapers,\n\
-                                 or use the file path box on the right to apply any PNG/JPEG.",
+                                "Install Wallpaper Engine on Steam and subscribe to wallpapers.",
                             )
                             .size(13.0)
                             .color(TEXT_MUTED),
@@ -669,7 +709,6 @@ fn draw_card(
 ) {
     let painter = ui.painter_at(rect);
 
-    // Background
     let bg = if selected {
         CARD_SEL
     } else if resp.hovered() {
@@ -680,12 +719,10 @@ fn draw_card(
     painter.rect_filled(rect, CornerRadius::same(6), bg);
 
     if selected {
-        // Paint a 2px border by drawing a slightly-expanded rect beneath the card
         painter.rect_filled(rect.expand(2.0), CornerRadius::same(8), CARD_SEL_BORDER);
         painter.rect_filled(rect, CornerRadius::same(6), bg);
     }
 
-    // Thumbnail
     let img_rect = Rect::from_min_size(rect.min, vec2(CARD_W, IMG_H));
     if let Some(tex) = thumb {
         painter.image(
@@ -705,7 +742,6 @@ fn draw_card(
         );
     }
 
-    // Type badge (top-right corner of the thumbnail)
     let badge_label = type_badge_label(w.wallpaper_type());
     let badge_font = FontId::proportional(9.0);
     let badge_galley =
@@ -716,7 +752,6 @@ fn draw_card(
     painter.rect_filled(badge_rect, CornerRadius::same(3), type_badge_color(w.wallpaper_type()));
     painter.galley(badge_tl + vec2(4.0, 2.0), badge_galley, Color32::WHITE);
 
-    // Title
     let title = truncate(w.title(), 26);
     painter.text(
         pos2(rect.min.x + 6.0, rect.min.y + IMG_H + 5.0),

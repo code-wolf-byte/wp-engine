@@ -178,3 +178,26 @@ pub fn scan_wallpapers() -> Vec<Wallpaper> {
 pub fn find_by_id(id: &str) -> Option<Wallpaper> {
     scan_wallpapers().into_iter().find(|w| w.workshop_id == id)
 }
+
+/// Locate the Wallpaper Engine executable across all Steam library roots.
+///
+/// Tries the known executable names in order of preference:
+/// `wallpaper64.exe`, `wallpaper32.exe`, `wallpaper_engine.exe`
+pub fn find_wallpaper_engine_exe() -> Option<PathBuf> {
+    let exe_names = ["wallpaper64.exe", "wallpaper32.exe", "wallpaper_engine.exe"];
+
+    for root in find_steam_library_roots() {
+        let we_dir = root
+            .join("steamapps")
+            .join("common")
+            .join("wallpaper_engine");
+
+        for name in &exe_names {
+            let candidate = we_dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}

@@ -2,11 +2,12 @@ mod engine;
 mod platform;
 mod render;
 mod ui;
+mod wine;
 mod workshop;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use render::{FrameSource, RenderSettings, WallpaperContent};
+use render::{FrameSource, RenderSettings};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use workshop::Wallpaper;
@@ -30,19 +31,15 @@ enum Command {
         #[arg(long, help = "Filter by type: video, scene, web, application")]
         r#type: Option<String>,
     },
-    /// Apply a wallpaper by Steam Workshop ID (CLI, blocks until Ctrl-C)
+    /// Apply a Workshop wallpaper by ID via Wallpaper Engine (CLI, blocks until Ctrl-C)
     Set {
         id: String,
-    },
-    /// Apply any image file as wallpaper (CLI, blocks until Ctrl-C)
-    SetFile {
-        path: PathBuf,
     },
     /// Show metadata for a Workshop item (CLI)
     Info {
         id: String,
     },
-    /// List available GPU adapters (PAL probe)
+    /// List available GPU adapters (system probe)
     Probe,
     /// Inspect (and optionally extract) a Wallpaper Engine PKG archive
     PkgInfo {
@@ -51,20 +48,21 @@ enum Command {
         #[arg(long)]
         dump: Option<PathBuf>,
     },
+    /// Probe the Wine environment (binary, version, WINEPREFIX)
+    WineProbe,
 }
 
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        // No subcommand → open GUI
         None => run_ui(),
         Some(Command::List { r#type }) => cmd_list(r#type),
-        Some(Command::Set { id }) => cmd_set(&id),
-        Some(Command::SetFile { path }) => cmd_set_file(&path),
-        Some(Command::Info { id }) => cmd_info(&id),
-        Some(Command::Probe)       => cmd_probe(),
+        Some(Command::Set { id })      => cmd_set(&id),
+        Some(Command::Info { id })     => cmd_info(&id),
+        Some(Command::Probe)           => cmd_probe(),
         Some(Command::PkgInfo { path, dump }) => cmd_pkg_info(&path, dump.as_deref()),
+        Some(Command::WineProbe)       => cmd_wine_probe(),
     };
 
     if let Err(e) = result {
@@ -146,26 +144,51 @@ fn cmd_info(id: &str) -> Result<()> {
 }
 
 fn cmd_set(id: &str) -> Result<()> {
+    use wine::{ipc::IpcServer, process::WineProcess, WineEnv};
+
     let w = workshop::find_by_id(id)
         .ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
-    // Type support is checked inside from_wallpaper; unsupported types return Err.
-    let content = WallpaperContent::from_wallpaper(&w)?;
+    // Pass the wallpaper directory — WE finds scene.pkg / index.html internally.
+    let wallpaper_path = w.path.clone();
 
-    let path = w.wallpaper_file().unwrap_or_default();
-    println!("Loading: {}", path.display());
+    let we_exe = workshop::find_wallpaper_engine_exe()
+        .ok_or_else(|| anyhow!("wallpaper_engine.exe not found — install Wallpaper Engine via Steam"))?;
 
-    let frame_source = FrameSource::from_content(content)?;
-    println!("Applying \"{}\" to all outputs...", w.title());
+    let env = WineEnv::detect()?;
+
+    let ipc_server = IpcServer::bind()?;
+    let socket_path = ipc_server.socket_path.clone();
+
+    println!("Launching Wallpaper Engine for \"{}\"...", w.title());
+
+    let _we_process = WineProcess::launch_wallpaper_engine(
+        &env,
+        &we_exe,
+        &wallpaper_path,
+        &socket_path,
+        1920,
+        1080,
+    )?;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    wine::ipc::start_frame_receiver(ipc_server, tx);
+
+    println!("Waiting for first frame from hook DLL...");
+    let first_frame = rx
+        .recv()
+        .map_err(|_| anyhow!("hook DLL did not send any frames — check version.dll placement"))?;
+
+    let frame_source = FrameSource::from_ipc(first_frame, rx);
     let settings = Arc::new(Mutex::new(RenderSettings::default()));
     let handle = platform::detect_platform().spawn_wallpaper(frame_source, settings)?;
+
     println!("Wallpaper active. Press Ctrl-C to exit.");
     handle.wait();
     Ok(())
 }
 
 fn cmd_probe() -> Result<()> {
-    // ── 1. List all visible adapters ─────────────────────────────────────────
     let adapters = platform::probe_adapters();
     if adapters.is_empty() {
         println!("No GPU adapters found.");
@@ -179,33 +202,33 @@ fn cmd_probe() -> Result<()> {
             a.name, a.backend, a.device_type, a.vendor_id, a.device_id
         );
     }
-    println!("\n{} adapter(s) found\n", adapters.len());
-
-    // ── 2. Open the best device to confirm driver access works ───────────────
-    print!("Opening best device... ");
-    match platform::open_device() {
-        Ok(dev) => println!(
-            "OK  →  {} ({}, {})",
-            dev.info.name, dev.info.backend, dev.info.device_type
-        ),
-        Err(e) => println!("FAILED: {e}"),
-    }
-
+    println!("\n{} adapter(s) found", adapters.len());
     Ok(())
 }
 
-fn cmd_set_file(path: &PathBuf) -> Result<()> {
-    if !path.exists() {
-        return Err(anyhow!("file not found: {}", path.display()));
+fn cmd_wine_probe() -> Result<()> {
+    print!("Detecting Wine... ");
+    match wine::WineEnv::detect() {
+        Ok(env) => {
+            println!("OK");
+            println!("  {}", env.summary());
+            println!(
+                "  Prefix initialised: {}",
+                wine::prefix_is_initialised(&env.prefix)
+            );
+        }
+        Err(e) => {
+            println!("NOT FOUND");
+            println!("  {e}");
+        }
     }
-    println!("Loading: {}", path.display());
-    let content = WallpaperContent::from_path(path)?;
-    println!("Applying to all outputs…");
-    let frame_source = FrameSource::from_content(content)?;
-    let settings = Arc::new(Mutex::new(RenderSettings::default()));
-    let handle = platform::detect_platform().spawn_wallpaper(frame_source, settings)?;
-    println!("Wallpaper active. Press Ctrl-C to exit.");
-    handle.wait();
+
+    print!("Locating wallpaper_engine.exe... ");
+    match workshop::find_wallpaper_engine_exe() {
+        Some(p) => println!("found: {}", p.display()),
+        None    => println!("NOT FOUND (install Wallpaper Engine via Steam)"),
+    }
+
     Ok(())
 }
 
@@ -215,7 +238,6 @@ fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Resul
     println!("Files   : {}", pkg.len());
     println!();
 
-    // Collect and sort paths for a stable, readable table.
     let mut paths: Vec<&str> = pkg.paths().collect();
     paths.sort_unstable();
 
