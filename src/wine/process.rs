@@ -46,22 +46,18 @@ impl WineProcess {
     ) -> Result<Self> {
         let desktop_arg = format!("/desktop=wallpaper,{}x{}", width, height);
 
-        // ── Ensure WINEPREFIX directory exists (Wine refuses to start otherwise) ─
-        if !env.prefix.exists() {
-            eprintln!("[wp-engine] creating WINEPREFIX at {}", env.prefix.display());
-            std::fs::create_dir_all(&env.prefix)
-                .with_context(|| format!("failed to create WINEPREFIX at {}", env.prefix.display()))?;
+        // ── Find hook DLL first so we can install it into the prefix ─────────
+        let hook_dll = find_hook_dll(we_exe);
+
+        match &hook_dll {
+            Some(p) => eprintln!("[wp-engine]   version.dll   : {} (found)", p.display()),
+            None    => eprintln!("[wp-engine]   version.dll   : NOT FOUND — hook will not load"),
         }
 
-        // WINEDLLPATH: Linux-side directories Wine searches for native DLLs.
-        let hook_dll = find_hook_dll(we_exe);
-        let winedllpath = hook_dll
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // ── Ensure WINEPREFIX is initialised and hook DLL is installed ────────
+        ensure_prefix_ready(env, hook_dll.as_deref())?;
 
-        // ── Log launch parameters ──────────────────────────────────────────────
+        // ── Log launch parameters ─────────────────────────────────────────────
         eprintln!("[wp-engine] launching Wallpaper Engine");
         eprintln!("[wp-engine]   wine binary   : {}", env.binary.display());
         eprintln!("[wp-engine]   we_exe        : {}", we_exe.display());
@@ -69,30 +65,38 @@ impl WineProcess {
         eprintln!("[wp-engine]   socket_path   : {}", socket_path.display());
         eprintln!("[wp-engine]   desktop       : {}", desktop_arg);
         eprintln!("[wp-engine]   WINEPREFIX    : {}", env.prefix.display());
-        match &hook_dll {
-            Some(p) => eprintln!("[wp-engine]   version.dll   : {} (found)", p.display()),
-            None    => eprintln!("[wp-engine]   version.dll   : NOT FOUND — hook will not load"),
-        }
-        eprintln!("[wp-engine]   WINEDLLPATH   : {}", if winedllpath.is_empty() { "(unset)" } else { &winedllpath });
+
+        // Convert Linux path to Wine's Z: drive Windows path.
+        // e.g. /home/user/... → Z:\home\user\...
+        let win_wallpaper_path = format!(
+            "Z:{}",
+            wallpaper_path.to_string_lossy().replace('/', "\\")
+        );
 
         let mut cmd = std::process::Command::new(&env.binary);
         cmd.arg("explorer")
             .arg(&desktop_arg)
             .arg(we_exe)
-            .arg(wallpaper_path)
+            .arg("-file").arg(&win_wallpaper_path)
+            .arg("-width").arg(width.to_string())
+            .arg("-height").arg(height.to_string())
+            .arg("-silent")
             .env("WINEPREFIX", &env.prefix)
             // Show fixme + error channel only — enough to spot loading failures
             // without the usual wall of noise.
             .env("WINEDEBUG", "fixme-all,err+loaddll,err+module,err+relay")
-            .env("WINEDLLOVERRIDES", "version=n")
+            // n,b = native first, then builtin fallback.
+            // 32-bit Wine subprocesses that can't load the 64-bit DLL will fall
+            // back to Wine's own builtin version.dll stub gracefully.
+            // version=n,b  — load our hook DLL (native) before Wine's stub
+            // d3d11=n,dxgi=n — force DXVK's native DLLs over Wine's WineD3D
+            //                  (DXVK uses Vulkan, bypassing EGL/DRI2 which
+            //                   fails with NVIDIA on Wayland)
+            .env("WINEDLLOVERRIDES", "version=n,b;d3d11=n;dxgi=n")
             .env("WP_ENGINE_SOCKET", socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped()); // capture so we can forward with a [wine] prefix
-
-        if !winedllpath.is_empty() {
-            cmd.env("WINEDLLPATH", &winedllpath);
-        }
 
         let mut child = cmd
             .spawn()
@@ -138,6 +142,60 @@ impl Drop for WineProcess {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Ensure the WINEPREFIX directory exists, is initialised, and (if we have
+/// the hook DLL) has `version.dll` installed into `system32`.
+///
+/// `wineboot --init` is run **without** `WINEDLLOVERRIDES` so that Wine's own
+/// internal setup processes (msiexec, services) can load the real version.dll
+/// from their built-in search paths without interference.
+fn ensure_prefix_ready(env: &WineEnv, hook_dll: Option<&Path>) -> Result<()> {
+    // 1. Create prefix directory if it doesn't exist.
+    if !env.prefix.exists() {
+        eprintln!("[wp-engine] creating WINEPREFIX at {}", env.prefix.display());
+        std::fs::create_dir_all(&env.prefix)
+            .with_context(|| format!("failed to create WINEPREFIX at {}", env.prefix.display()))?;
+    }
+
+    // 2. Run wineboot if the prefix has never been initialised.
+    //    This creates drive_c/windows/system32 and the registry files.
+    if !super::prefix_is_initialised(&env.prefix) {
+        eprintln!("[wp-engine] initialising WINEPREFIX (first-time setup, may take 30–60 s)…");
+        let status = std::process::Command::new(&env.binary)
+            .arg("wineboot")
+            .arg("--init")
+            .env("WINEPREFIX", &env.prefix)
+            .env("WINEDEBUG", "-all")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("failed to run wine wineboot --init")?;
+        eprintln!("[wp-engine] wineboot finished (exit: {:?})", status.code());
+    }
+
+    // 3. Install the hook DLL into system32 so Wine finds it for every process
+    //    (including Wine's own internal ones that don't inherit WINEDLLPATH).
+    if let Some(src) = hook_dll {
+        let sys32 = env.prefix.join("drive_c/windows/system32");
+        if sys32.exists() {
+            let dest = sys32.join("version.dll");
+            eprintln!(
+                "[wp-engine] installing hook DLL into prefix system32: {}",
+                dest.display()
+            );
+            std::fs::copy(src, &dest)
+                .with_context(|| format!("failed to copy version.dll to {}", dest.display()))?;
+        } else {
+            eprintln!(
+                "[wp-engine] warn: {} does not exist — hook DLL not installed",
+                sys32.display()
+            );
+        }
+    }
+
+    Ok(())
+}
 
 fn find_hook_dll(we_exe: &Path) -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {

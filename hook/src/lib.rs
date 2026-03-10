@@ -5,7 +5,9 @@
 //!
 //! On `DLL_PROCESS_ATTACH`, spawns a setup thread that:
 //! 1. Suppresses WE's windows (IAT patch on ShowWindow/SetParent)
-//! 2. Hooks D3D11CreateDeviceAndSwapChain to intercept swap chain Present
+//! 2. Hooks D3D11CreateDevice (the only D3D11 IAT import WE has), then chains
+//!    through IDXGIDevice → IDXGIAdapter → IDXGIFactory to vtable-patch
+//!    CreateSwapChain/CreateSwapChainForHwnd → Present → frame capture
 //! 3. Connects to wp-engine's Unix socket IPC channel
 
 #![allow(non_snake_case, unsafe_op_in_unsafe_fn)]
