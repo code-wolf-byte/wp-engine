@@ -4,7 +4,6 @@ use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 
-use crate::engine::ResolvedScene;
 use super::content::WallpaperContent;
 
 /// A live source of RGBA frames for the Wayland renderer.
@@ -33,9 +32,20 @@ impl FrameSource {
         match content {
             WallpaperContent::Static(img) => Ok(FrameSource::Static(img)),
             WallpaperContent::Scene { dir } => {
-                let resolved = ResolvedScene::from_directory(&dir)?;
-                let img = resolved.render();
-                Ok(FrameSource::Static(Arc::new(img)))
+                let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
+                let target_fps = 30.0;
+
+                thread::spawn(move || {
+                    if let Err(e) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
+                        eprintln!("scene render error for '{}': {e}", dir.display());
+                    }
+                });
+
+                let first = rx
+                    .recv()
+                    .map_err(|_| anyhow!("scene renderer exited before producing any frames"))?;
+
+                Ok(FrameSource::Video { current: first, rx, fps: target_fps })
             }
             WallpaperContent::Video { path, fps } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);

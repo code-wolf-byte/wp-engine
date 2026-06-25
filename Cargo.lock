@@ -4568,6 +4568,7 @@ dependencies = [
  "dirs",
  "eframe",
  "egui",
+ "fastrand",
  "ffmpeg-next",
  "image 0.24.9",
  "lz4_flex",
