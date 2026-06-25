@@ -5,6 +5,9 @@ use std::io::{Cursor, Read};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TexFormat {
     Rgba8,
+    R8,
+    Rg88,
+    Rgb888,
     Dxt1,
     Dxt3,
     Dxt5,
@@ -14,6 +17,9 @@ impl TexFormat {
     fn from_u32(v: u32) -> Result<Self> {
         match v {
             0 => Ok(Self::Rgba8),
+            1 => Ok(Self::R8),
+            2 => Ok(Self::Rg88),
+            3 => Ok(Self::Rgb888),
             4 => Ok(Self::Dxt1),
             6 => Ok(Self::Dxt3),
             8 => Ok(Self::Dxt5),
@@ -25,7 +31,7 @@ impl TexFormat {
         match self {
             Self::Dxt1 => 8,
             Self::Dxt3 | Self::Dxt5 => 16,
-            Self::Rgba8 => 0,
+            Self::Rgba8 | Self::R8 | Self::Rg88 | Self::Rgb888 => 0,
         }
     }
 }
@@ -161,6 +167,24 @@ impl TexFile {
 
         let rgba = match self.format {
             TexFormat::Rgba8 => mip.data.clone(),
+            TexFormat::R8 => {
+                mip.data.iter().flat_map(|&r| [r, r, r, 255]).collect()
+            }
+            TexFormat::Rg88 => {
+                mip.data.chunks(2).flat_map(|rg| {
+                    let r = rg.first().copied().unwrap_or(0);
+                    let g = rg.get(1).copied().unwrap_or(0);
+                    [r, g, 0, 255]
+                }).collect()
+            }
+            TexFormat::Rgb888 => {
+                mip.data.chunks(3).flat_map(|rgb| {
+                    let r = rgb.first().copied().unwrap_or(0);
+                    let g = rgb.get(1).copied().unwrap_or(0);
+                    let b = rgb.get(2).copied().unwrap_or(0);
+                    [r, g, b, 255]
+                }).collect()
+            }
             TexFormat::Dxt1 => decode_dxt1(&mip.data, self.texture_width, self.texture_height),
             TexFormat::Dxt3 => decode_dxt3(&mip.data, self.texture_width, self.texture_height),
             TexFormat::Dxt5 => decode_dxt5(&mip.data, self.texture_width, self.texture_height),
