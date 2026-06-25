@@ -55,6 +55,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
             let Some(image_path) = obj.image.as_deref() else { continue };
+            if is_special_layer(image_path) || obj.particle.is_some() { continue; }
             match load_texture_from_dir(dir, image_path) {
                 Ok(img) => layers.push(layer_from_object(obj, img)),
                 Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
@@ -72,6 +73,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
             let Some(image_path) = obj.image.as_deref() else { continue };
+            if is_special_layer(image_path) || obj.particle.is_some() { continue; }
             let img = load_texture_from_pkg(pkg, image_path)
                 .or_else(|pkg_err| {
                     load_texture_from_dir(dir, image_path)
@@ -94,6 +96,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
             let Some(image_path) = obj.image.as_deref() else { continue };
+            if is_special_layer(image_path) || obj.particle.is_some() { continue; }
             match load_texture_from_pkg(pkg, image_path) {
                 Ok(img) => layers.push(layer_from_object(obj, img)),
                 Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
@@ -315,4 +318,13 @@ fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
 
     // 3. Fallback
     (1920, 1080)
+}
+
+fn is_special_layer(image_path: &str) -> bool {
+    let p = image_path.to_lowercase();
+    p.contains("projectlayer")
+        || p.contains("composelayer")
+        || p.contains("fullscreenlayer")
+        || p.contains("solidlayer")
+        || p.contains("solid_instance_model")
 }

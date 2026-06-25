@@ -11,6 +11,8 @@ pub enum TexFormat {
     Dxt1,
     Dxt3,
     Dxt5,
+    Bc4,
+    Bc7,
 }
 
 impl TexFormat {
@@ -21,16 +23,19 @@ impl TexFormat {
             2 => Ok(Self::Rg88),
             3 => Ok(Self::Rgb888),
             4 => Ok(Self::Dxt1),
+            5 => Ok(Self::Dxt3),
             6 => Ok(Self::Dxt3),
+            7 => Ok(Self::Bc4),
             8 => Ok(Self::Dxt5),
+            9 => Ok(Self::Bc7),
             other => bail!("unknown .tex format id: {other}"),
         }
     }
 
     fn block_size(self) -> usize {
         match self {
-            Self::Dxt1 => 8,
-            Self::Dxt3 | Self::Dxt5 => 16,
+            Self::Dxt1 | Self::Bc4 => 8,
+            Self::Dxt3 | Self::Dxt5 | Self::Bc7 => 16,
             Self::Rgba8 | Self::R8 | Self::Rg88 | Self::Rgb888 => 0,
         }
     }
@@ -52,6 +57,29 @@ pub struct TexFile {
 
 impl TexFile {
     pub fn parse(data: &[u8]) -> Result<Self> {
+        // Check for embedded PNG/JPEG first (fastest path).
+        let embedded_offset = find_marker(data, b"\x89PNG")
+            .or_else(|| find_marker(data, b"\xFF\xD8\xFF"));
+        if let Some(img_offset) = embedded_offset {
+            if img_offset > 20 {
+                let img_data = &data[img_offset..];
+                if let Ok(img) = image::load_from_memory(img_data) {
+                    let img = img.into_rgba8();
+                    return Ok(Self {
+                        format: TexFormat::Rgba8,
+                        image_width: img.width(),
+                        image_height: img.height(),
+                        texture_width: img.width(),
+                        texture_height: img.height(),
+                        mipmaps: vec![Mipmap {
+                            uncompressed_size: img.as_raw().len() as u32,
+                            data: img.into_raw(),
+                        }],
+                    });
+                }
+            }
+        }
+
         let mut cur = Cursor::new(data);
 
         let mut magic = [0u8; 4];
@@ -62,26 +90,33 @@ impl TexFile {
 
         let mut version = [0u8; 4];
         cur.read_exact(&mut version).context("reading TEXV version")?;
-
-        // Older formats (v0005) have null terminators after version strings.
-        // Skip null byte if present.
         skip_null(&mut cur);
 
-        // v0005 and some others have a TEXI section before TEXB.
+        // Check for TEXI section (V0005 format).
         let mut next_section = [0u8; 4];
         cur.read_exact(&mut next_section).context("reading section")?;
 
-        if &next_section == b"TEXI" {
-            // Skip TEXI version + null + header data until we find TEXB.
+        let texi_meta = if &next_section == b"TEXI" {
             let mut texi_ver = [0u8; 4];
             cur.read_exact(&mut texi_ver).ok();
             skip_null(&mut cur);
-            // TEXI contains image metadata; skip until TEXB marker.
+
+            let format_id = read_u32(&mut cur)?;
+            let _flags = read_u32(&mut cur)?;
+            let texture_width = read_u32(&mut cur)?;
+            let texture_height = read_u32(&mut cur)?;
+            let image_width = read_u32(&mut cur)?;
+            let image_height = read_u32(&mut cur)?;
+
             let texb_pos = find_marker(data, b"TEXB")
                 .context("TEXB section not found after TEXI")?;
             cur.set_position(texb_pos as u64);
             cur.read_exact(&mut next_section).context("reading TEXB")?;
-        }
+
+            Some((format_id, texture_width, texture_height, image_width, image_height))
+        } else {
+            None
+        };
 
         if &next_section != b"TEXB" {
             bail!("expected TEXB section, got {:?}", next_section);
@@ -91,6 +126,48 @@ impl TexFile {
         cur.read_exact(&mut container_ver).context("reading TEXB version")?;
         skip_null(&mut cur);
 
+        if let Some((format_id, texture_width, texture_height, image_width, image_height)) = texi_meta {
+            let mipmap_count = match &container_ver {
+                b"0001" | b"0002" => {
+                    let _image_count = read_u32(&mut cur)?;
+                    let mipmap_count = read_u32(&mut cur)?;
+                    let _tw = read_u32(&mut cur)?;
+                    let _th = read_u32(&mut cur)?;
+                    let _unk = read_u32(&mut cur)?;
+                    mipmap_count
+                }
+                b"0003" => {
+                    let _image_count = read_u32(&mut cur)?;
+                    let _flags = read_u32(&mut cur)?;
+                    let mipmap_count = read_u32(&mut cur)?;
+                    let _tw = read_u32(&mut cur)?;
+                    let _th = read_u32(&mut cur)?;
+                    let _unk = read_u32(&mut cur)?;
+                    mipmap_count
+                }
+                _ => {
+                    let _image_count = read_u32(&mut cur)?;
+                    let _flags = read_u32(&mut cur)?;
+                    let _unk0 = read_u32(&mut cur)?;
+                    let mipmap_count = read_u32(&mut cur)?;
+                    let _tw = read_u32(&mut cur)?;
+                    let _th = read_u32(&mut cur)?;
+                    let _unk1 = read_u32(&mut cur)?;
+                    mipmap_count
+                }
+            };
+
+            let v5_format_id = match format_id {
+                4 => 8,  // V0005 format 4 = DXT5 (16B/block), not DXT1
+                other => other,
+            };
+            let format = TexFormat::from_u32(v5_format_id)?;
+            let mipmaps = read_mipmaps_v5(&mut cur, mipmap_count)?;
+
+            return Ok(Self { format, image_width, image_height, texture_width, texture_height, mipmaps });
+        }
+
+        // V0007/V0008: standard TEXB layout
         let format_id = read_u32(&mut cur)?;
         let _flags = read_u32(&mut cur)?;
         let texture_width = read_u32(&mut cur)?;
@@ -100,66 +177,11 @@ impl TexFile {
         let image_height = read_u32(&mut cur)?;
         let _unknown2 = read_u32(&mut cur)?;
 
-        // Check if the remaining data embeds a standard image (PNG or JPEG).
-        let remaining_pos = cur.position() as usize;
-        let embedded_offset = find_marker(data, b"\x89PNG")
-            .or_else(|| find_marker(data, b"\xFF\xD8\xFF"));
-        if let Some(img_offset) = embedded_offset {
-            if img_offset >= remaining_pos {
-                let img_data = &data[img_offset..];
-                let img = image::load_from_memory(img_data)
-                    .context("decoding image embedded in .tex")?
-                    .into_rgba8();
-                return Ok(Self {
-                    format: TexFormat::Rgba8,
-                    image_width: img.width(),
-                    image_height: img.height(),
-                    texture_width: img.width(),
-                    texture_height: img.height(),
-                    mipmaps: vec![Mipmap {
-                        uncompressed_size: img.as_raw().len() as u32,
-                        data: img.into_raw(),
-                    }],
-                });
-            }
-        }
-
         let format = TexFormat::from_u32(format_id)?;
-
         let mipmap_count = read_u32(&mut cur)?;
+        let mipmaps = read_mipmaps(&mut cur, mipmap_count)?;
 
-        let mut mipmaps = Vec::with_capacity(mipmap_count as usize);
-        for i in 0..mipmap_count {
-            let compressed_size = read_u32(&mut cur)
-                .with_context(|| format!("reading mipmap {i} compressed_size"))?;
-            let uncompressed_size = read_u32(&mut cur)
-                .with_context(|| format!("reading mipmap {i} uncompressed_size"))?;
-
-            let mut compressed = vec![0u8; compressed_size as usize];
-            cur.read_exact(&mut compressed)
-                .with_context(|| format!("reading mipmap {i} data ({compressed_size} bytes)"))?;
-
-            let decompressed = if compressed_size == uncompressed_size {
-                compressed
-            } else {
-                lz4_flex::decompress(&compressed, uncompressed_size as usize)
-                    .with_context(|| format!("LZ4 decompress mipmap {i}"))?
-            };
-
-            mipmaps.push(Mipmap {
-                uncompressed_size,
-                data: decompressed,
-            });
-        }
-
-        Ok(Self {
-            format,
-            image_width,
-            image_height,
-            texture_width,
-            texture_height,
-            mipmaps,
-        })
+        Ok(Self { format, image_width, image_height, texture_width, texture_height, mipmaps })
     }
 
     pub fn to_rgba(&self) -> Result<RgbaImage> {
@@ -188,6 +210,8 @@ impl TexFile {
             TexFormat::Dxt1 => decode_dxt1(&mip.data, self.texture_width, self.texture_height),
             TexFormat::Dxt3 => decode_dxt3(&mip.data, self.texture_width, self.texture_height),
             TexFormat::Dxt5 => decode_dxt5(&mip.data, self.texture_width, self.texture_height),
+            TexFormat::Bc4 => decode_bc4(&mip.data, self.texture_width, self.texture_height),
+            TexFormat::Bc7 => decode_bc7(&mip.data, self.texture_width, self.texture_height),
         };
 
         let img = RgbaImage::from_raw(self.texture_width, self.texture_height, rgba)
@@ -409,7 +433,203 @@ fn decode_dxt5(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
+fn decode_bc4(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let bw = ((width + 3) / 4) as usize;
+    let bh = ((height + 3) / 4) as usize;
+    let mut out = vec![0u8; (width * height * 4) as usize];
+    let stride = width as usize * 4;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let offset = (by * bw + bx) * 8;
+            if offset + 8 > data.len() {
+                break;
+            }
+            let block = &data[offset..offset + 8];
+
+            let a0 = block[0];
+            let a1 = block[1];
+            let alpha_bits = u64::from(block[2])
+                | (u64::from(block[3]) << 8)
+                | (u64::from(block[4]) << 16)
+                | (u64::from(block[5]) << 24)
+                | (u64::from(block[6]) << 32)
+                | (u64::from(block[7]) << 40);
+
+            let palette = if a0 > a1 {
+                [
+                    a0, a1,
+                    ((6 * a0 as u16 + 1 * a1 as u16) / 7) as u8,
+                    ((5 * a0 as u16 + 2 * a1 as u16) / 7) as u8,
+                    ((4 * a0 as u16 + 3 * a1 as u16) / 7) as u8,
+                    ((3 * a0 as u16 + 4 * a1 as u16) / 7) as u8,
+                    ((2 * a0 as u16 + 5 * a1 as u16) / 7) as u8,
+                    ((1 * a0 as u16 + 6 * a1 as u16) / 7) as u8,
+                ]
+            } else {
+                [
+                    a0, a1,
+                    ((4 * a0 as u16 + 1 * a1 as u16) / 5) as u8,
+                    ((3 * a0 as u16 + 2 * a1 as u16) / 5) as u8,
+                    ((2 * a0 as u16 + 3 * a1 as u16) / 5) as u8,
+                    ((1 * a0 as u16 + 4 * a1 as u16) / 5) as u8,
+                    0, 255,
+                ]
+            };
+
+            for py in 0..4u32 {
+                for px in 0..4u32 {
+                    let x = bx as u32 * 4 + px;
+                    let y = by as u32 * 4 + py;
+                    if x >= width || y >= height {
+                        continue;
+                    }
+                    let idx = ((alpha_bits >> ((py * 4 + px) * 3)) & 7) as usize;
+                    let v = palette[idx];
+                    let dst = y as usize * stride + x as usize * 4;
+                    out[dst] = v;
+                    out[dst + 1] = v;
+                    out[dst + 2] = v;
+                    out[dst + 3] = 255;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn decode_bc7(data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let bw = ((width + 3) / 4) as usize;
+    let bh = ((height + 3) / 4) as usize;
+    let mut out = vec![0u8; (width * height * 4) as usize];
+    let stride = width as usize * 4;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let offset = (by * bw + bx) * 16;
+            if offset + 16 > data.len() {
+                break;
+            }
+            let block = &data[offset..offset + 16];
+
+            let mode = block[0].trailing_zeros();
+            let rgba = if mode == 6 {
+                decode_bc7_mode6(block)
+            } else {
+                [[128, 128, 128, 255]; 16]
+            };
+
+            for py in 0..4u32 {
+                for px in 0..4u32 {
+                    let x = bx as u32 * 4 + px;
+                    let y = by as u32 * 4 + py;
+                    if x >= width || y >= height {
+                        continue;
+                    }
+                    let src = (py * 4 + px) as usize;
+                    let dst = y as usize * stride + x as usize * 4;
+                    out[dst..dst + 4].copy_from_slice(&rgba[src]);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn decode_bc7_mode6(block: &[u8]) -> [[u8; 4]; 16] {
+    const WEIGHTS: [u32; 16] = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+
+    let bits = u128::from_le_bytes(block[0..16].try_into().unwrap());
+    let mut pos = 7; // skip mode bits (bit 6 set)
+
+    let mut endpoints = [[0u8; 4]; 2];
+    for ch in 0..4 {
+        for ep in 0..2 {
+            endpoints[ep][ch] = ((bits >> pos) & 0x7F) as u8;
+            pos += 7;
+        }
+    }
+    let p0 = ((bits >> pos) & 1) as u8; pos += 1;
+    let p1 = ((bits >> pos) & 1) as u8; pos += 1;
+
+    for ch in 0..4 {
+        endpoints[0][ch] = (endpoints[0][ch] << 1) | p0;
+        endpoints[1][ch] = (endpoints[1][ch] << 1) | p1;
+    }
+
+    let mut result = [[0u8; 4]; 16];
+    for i in 0..16 {
+        let nbits = if i == 0 { 3 } else { 4 };
+        let idx = ((bits >> pos) & ((1 << nbits) - 1)) as usize;
+        pos += nbits;
+        let w = WEIGHTS[idx];
+        for ch in 0..4 {
+            let e0 = endpoints[0][ch] as u32;
+            let e1 = endpoints[1][ch] as u32;
+            result[i][ch] = (((64 - w) * e0 + w * e1 + 32) >> 6) as u8;
+        }
+    }
+    result
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn read_mipmaps_v5(cur: &mut Cursor<&[u8]>, count: u32) -> Result<Vec<Mipmap>> {
+    let mut mipmaps = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        if i > 0 {
+            let _width = read_u32(cur)?;
+            let _height = read_u32(cur)?;
+            let _unk = read_u32(cur)?;
+        }
+        let uncompressed_size = read_u32(cur)
+            .with_context(|| format!("reading mipmap {i} uncompressed_size"))?;
+        let compressed_size = read_u32(cur)
+            .with_context(|| format!("reading mipmap {i} compressed_size"))?;
+
+        if uncompressed_size == 0 {
+            bail!("embedded video texture (not a static image)");
+        }
+
+        let mut compressed = vec![0u8; compressed_size as usize];
+        cur.read_exact(&mut compressed)
+            .with_context(|| format!("reading mipmap {i} data ({compressed_size} bytes)"))?;
+
+        let decompressed = if compressed_size == uncompressed_size {
+            compressed
+        } else {
+            lz4_flex::decompress(&compressed, uncompressed_size as usize)
+                .with_context(|| format!("LZ4 decompress mipmap {i}"))?
+        };
+
+        mipmaps.push(Mipmap { uncompressed_size, data: decompressed });
+    }
+    Ok(mipmaps)
+}
+
+fn read_mipmaps(cur: &mut Cursor<&[u8]>, count: u32) -> Result<Vec<Mipmap>> {
+    let mut mipmaps = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let compressed_size = read_u32(cur)
+            .with_context(|| format!("reading mipmap {i} compressed_size"))?;
+        let uncompressed_size = read_u32(cur)
+            .with_context(|| format!("reading mipmap {i} uncompressed_size"))?;
+
+        let mut compressed = vec![0u8; compressed_size as usize];
+        cur.read_exact(&mut compressed)
+            .with_context(|| format!("reading mipmap {i} data ({compressed_size} bytes)"))?;
+
+        let decompressed = if compressed_size == uncompressed_size {
+            compressed
+        } else {
+            lz4_flex::decompress(&compressed, uncompressed_size as usize)
+                .with_context(|| format!("LZ4 decompress mipmap {i}"))?
+        };
+
+        mipmaps.push(Mipmap { uncompressed_size, data: decompressed });
+    }
+    Ok(mipmaps)
+}
 
 fn read_u32(cur: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
