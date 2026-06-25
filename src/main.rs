@@ -51,6 +51,21 @@ enum Command {
         #[arg(long)]
         dump: Option<PathBuf>,
     },
+    /// Inspect a Wallpaper Engine .tex texture file
+    TexInfo {
+        path: PathBuf,
+        /// Save decoded texture as PNG
+        #[arg(long)]
+        save: Option<PathBuf>,
+    },
+    /// Render a scene wallpaper to a PNG file (for debugging)
+    RenderScene {
+        /// Workshop ID or directory path
+        id_or_path: String,
+        /// Output PNG path
+        #[arg(long, default_value = "scene_output.png")]
+        output: PathBuf,
+    },
 }
 
 fn main() {
@@ -65,6 +80,8 @@ fn main() {
         Some(Command::Info { id }) => cmd_info(&id),
         Some(Command::Probe)       => cmd_probe(),
         Some(Command::PkgInfo { path, dump }) => cmd_pkg_info(&path, dump.as_deref()),
+        Some(Command::TexInfo { path, save }) => cmd_tex_info(&path, save.as_deref()),
+        Some(Command::RenderScene { id_or_path, output }) => cmd_render_scene(&id_or_path, &output),
     };
 
     if let Err(e) = result {
@@ -245,5 +262,37 @@ fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Resul
         println!("\nExtracted {count} files to {}", dump_dir.display());
     }
 
+    Ok(())
+}
+
+fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Result<()> {
+    let data = std::fs::read(path)?;
+    let tex = engine::TexFile::parse(&data)?;
+    println!("Format:       {:?}", tex.format);
+    println!("Image size:   {}x{}", tex.image_width, tex.image_height);
+    println!("Texture size: {}x{}", tex.texture_width, tex.texture_height);
+    if let Some(out) = save {
+        let img = tex.to_rgba()?;
+        img.save(out)?;
+        println!("Saved to {}", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_render_scene(id_or_path: &str, output: &std::path::Path) -> Result<()> {
+    let dir = std::path::PathBuf::from(id_or_path);
+    let dir = if dir.exists() {
+        dir
+    } else {
+        workshop::find_by_id(id_or_path)
+            .map(|w| w.path)
+            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
+    };
+    println!("Loading scene from {}...", dir.display());
+    let scene = engine::ResolvedScene::from_directory(&dir)?;
+    println!("Rendering {}x{} with {} layers...", scene.width, scene.height, scene.layers.len());
+    let img = scene.render();
+    img.save(output)?;
+    println!("Saved to {}", output.display());
     Ok(())
 }
