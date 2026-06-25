@@ -127,7 +127,8 @@ fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<RgbaImage> {
     }
 
     // Try with .tex extension appended
-    let tex_appended = Path::new(&format!("{}.tex", full_path.display()));
+    let tex_path_str = format!("{}.tex", full_path.display());
+    let tex_appended = Path::new(&tex_path_str);
     if tex_appended.exists() {
         let data = std::fs::read(tex_appended)
             .with_context(|| format!("reading {}", tex_appended.display()))?;
