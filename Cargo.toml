@@ -36,8 +36,9 @@ clap = { version = "4", features = ["derive"] }
 wgpu     = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
 pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
 
-# Engine – texture decompression
+# Engine – texture decompression + particles
 lz4_flex = "0.11"
+fastrand = "2"
 
 # Utilities
 anyhow = "1"

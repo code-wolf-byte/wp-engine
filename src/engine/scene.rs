@@ -58,6 +58,7 @@ pub struct SceneObject {
     #[serde(rename = "parallaxDepth")]
     pub parallax_depth: Option<serde_json::Value>,
     pub image: Option<String>,
+    pub particle: Option<serde_json::Value>,
     #[serde(default)]
     pub effects: Vec<Effect>,
 }
