@@ -15,8 +15,9 @@ pub enum WallpaperContent {
     Static(Arc<RgbaImage>),
     /// A video file to be decoded frame-by-frame with FFmpeg.
     Video { path: PathBuf, fps: f64 },
+    /// A scene wallpaper — rendered by compositing decoded .tex layers.
+    Scene { dir: PathBuf },
     // Future variants (not yet implemented):
-    // Scene { pkg: PathBuf },
     // Web   { html: PathBuf },
     // Application { exe: PathBuf },
 }
@@ -29,9 +30,7 @@ impl WallpaperContent {
     /// image-loading failure.
     pub fn from_wallpaper(w: &Wallpaper) -> Result<Self> {
         match w.wallpaper_type() {
-            WallpaperType::Scene => Err(anyhow!(
-                "scene wallpapers require the proprietary Wallpaper Engine renderer"
-            )),
+            WallpaperType::Scene => Ok(WallpaperContent::Scene { dir: w.path.clone() }),
             WallpaperType::Web => Err(anyhow!("web wallpapers are not yet supported")),
             WallpaperType::Application => {
                 Err(anyhow!("application wallpapers are Windows-only"))

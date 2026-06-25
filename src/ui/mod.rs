@@ -366,8 +366,8 @@ impl WpApp {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let can_apply = matches!(wtype, WallpaperType::Video | WallpaperType::Unknown)
-            && file_exists;
+        let can_apply = matches!(wtype, WallpaperType::Video | WallpaperType::Scene | WallpaperType::Unknown)
+            && (file_exists || matches!(wtype, WallpaperType::Scene));
         let thumb = self.thumbnails.get(&workshop_id).cloned();
 
         // ── Render ────────────────────────────────────────────────────────────
@@ -443,10 +443,10 @@ impl WpApp {
         );
 
         match &wtype {
-            // Scene wallpapers store data in scene.pkg (proprietary binary) — file field is misleading
+            // Scene wallpapers are rendered via the built-in scene engine
             WallpaperType::Scene => {
                 ui.label(
-                    egui::RichText::new("Stored as scene.pkg — requires Wallpaper Engine renderer")
+                    egui::RichText::new("Scene wallpaper — rendered via built-in engine")
                         .size(11.0)
                         .color(TEXT_MUTED),
                 );
@@ -490,7 +490,6 @@ impl WpApp {
                 }
             } else {
                 let reason = match wtype {
-                    WallpaperType::Scene => "Scene format not supported",
                     WallpaperType::Web => "Web format not supported",
                     WallpaperType::Application => "Windows-only",
                     _ => "File missing",
