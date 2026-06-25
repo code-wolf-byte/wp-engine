@@ -52,9 +52,9 @@ pub struct General {
 pub struct SceneObject {
     pub name: Option<String>,
     pub visible: Option<serde_json::Value>,
-    pub origin: Option<String>,
-    pub angles: Option<String>,
-    pub size: Option<String>,
+    pub origin: Option<serde_json::Value>,
+    pub angles: Option<serde_json::Value>,
+    pub size: Option<serde_json::Value>,
     #[serde(rename = "parallaxDepth")]
     pub parallax_depth: Option<serde_json::Value>,
     pub image: Option<String>,
@@ -64,11 +64,11 @@ pub struct SceneObject {
 
 impl SceneObject {
     pub fn parsed_origin(&self) -> [f64; 3] {
-        parse_vec3(self.origin.as_deref())
+        self.origin.as_ref().and_then(|v| parse_value_vec3(v)).unwrap_or([0.0; 3])
     }
 
     pub fn parsed_size(&self) -> [f64; 3] {
-        parse_vec3(self.size.as_deref())
+        self.size.as_ref().and_then(|v| parse_value_vec3(v)).unwrap_or([0.0; 3])
     }
 
     pub fn is_visible(&self) -> bool {
@@ -85,7 +85,7 @@ impl SceneObject {
 
 #[derive(Debug, Deserialize)]
 pub struct Effect {
-    pub name: Option<String>,
+    pub name: Option<serde_json::Value>,
     #[serde(default)]
     pub passes: Vec<Pass>,
 }

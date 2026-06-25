@@ -94,13 +94,15 @@ impl TexFile {
         let image_height = read_u32(&mut cur)?;
         let _unknown2 = read_u32(&mut cur)?;
 
-        // Check if the remaining data contains a PNG (format_id=1 or embedded PNG)
+        // Check if the remaining data embeds a standard image (PNG or JPEG).
         let remaining_pos = cur.position() as usize;
-        if let Some(png_offset) = find_marker(data, b"\x89PNG") {
-            if png_offset >= remaining_pos {
-                let png_data = &data[png_offset..];
-                let img = image::load_from_memory(png_data)
-                    .context("decoding PNG embedded in .tex")?
+        let embedded_offset = find_marker(data, b"\x89PNG")
+            .or_else(|| find_marker(data, b"\xFF\xD8\xFF"));
+        if let Some(img_offset) = embedded_offset {
+            if img_offset >= remaining_pos {
+                let img_data = &data[img_offset..];
+                let img = image::load_from_memory(img_data)
+                    .context("decoding image embedded in .tex")?
                     .into_rgba8();
                 return Ok(Self {
                     format: TexFormat::Rgba8,
