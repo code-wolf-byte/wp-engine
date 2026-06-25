@@ -57,16 +57,35 @@ impl TexFile {
         let mut version = [0u8; 4];
         cur.read_exact(&mut version).context("reading TEXV version")?;
 
-        let mut container_magic = [0u8; 4];
-        cur.read_exact(&mut container_magic).context("reading TEXB magic")?;
-        if &container_magic != b"TEXB" {
-            bail!("expected TEXB container, got {:?}", container_magic);
+        // Older formats (v0005) have null terminators after version strings.
+        // Skip null byte if present.
+        skip_null(&mut cur);
+
+        // v0005 and some others have a TEXI section before TEXB.
+        let mut next_section = [0u8; 4];
+        cur.read_exact(&mut next_section).context("reading section")?;
+
+        if &next_section == b"TEXI" {
+            // Skip TEXI version + null + header data until we find TEXB.
+            let mut texi_ver = [0u8; 4];
+            cur.read_exact(&mut texi_ver).ok();
+            skip_null(&mut cur);
+            // TEXI contains image metadata; skip until TEXB marker.
+            let texb_pos = find_marker(data, b"TEXB")
+                .context("TEXB section not found after TEXI")?;
+            cur.set_position(texb_pos as u64);
+            cur.read_exact(&mut next_section).context("reading TEXB")?;
+        }
+
+        if &next_section != b"TEXB" {
+            bail!("expected TEXB section, got {:?}", next_section);
         }
 
         let mut container_ver = [0u8; 4];
         cur.read_exact(&mut container_ver).context("reading TEXB version")?;
+        skip_null(&mut cur);
 
-        let format = TexFormat::from_u32(read_u32(&mut cur)?)?;
+        let format_id = read_u32(&mut cur)?;
         let _flags = read_u32(&mut cur)?;
         let texture_width = read_u32(&mut cur)?;
         let texture_height = read_u32(&mut cur)?;
@@ -74,6 +93,30 @@ impl TexFile {
         let image_width = read_u32(&mut cur)?;
         let image_height = read_u32(&mut cur)?;
         let _unknown2 = read_u32(&mut cur)?;
+
+        // Check if the remaining data contains a PNG (format_id=1 or embedded PNG)
+        let remaining_pos = cur.position() as usize;
+        if let Some(png_offset) = find_marker(data, b"\x89PNG") {
+            if png_offset >= remaining_pos {
+                let png_data = &data[png_offset..];
+                let img = image::load_from_memory(png_data)
+                    .context("decoding PNG embedded in .tex")?
+                    .into_rgba8();
+                return Ok(Self {
+                    format: TexFormat::Rgba8,
+                    image_width: img.width(),
+                    image_height: img.height(),
+                    texture_width: img.width(),
+                    texture_height: img.height(),
+                    mipmaps: vec![Mipmap {
+                        uncompressed_size: img.as_raw().len() as u32,
+                        data: img.into_raw(),
+                    }],
+                });
+            }
+        }
+
+        let format = TexFormat::from_u32(format_id)?;
 
         let mipmap_count = read_u32(&mut cur)?;
 
@@ -346,4 +389,16 @@ fn read_u32(cur: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
     cur.read_exact(&mut buf).context("unexpected EOF reading u32")?;
     Ok(u32::from_le_bytes(buf))
+}
+
+fn skip_null(cur: &mut Cursor<&[u8]>) {
+    let pos = cur.position() as usize;
+    let data = cur.get_ref();
+    if pos < data.len() && data[pos] == 0 {
+        cur.set_position((pos + 1) as u64);
+    }
+}
+
+fn find_marker(data: &[u8], marker: &[u8]) -> Option<usize> {
+    data.windows(marker.len()).position(|w| w == marker)
 }

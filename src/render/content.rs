@@ -30,7 +30,14 @@ impl WallpaperContent {
     /// image-loading failure.
     pub fn from_wallpaper(w: &Wallpaper) -> Result<Self> {
         match w.wallpaper_type() {
-            WallpaperType::Scene => Ok(WallpaperContent::Scene { dir: w.path.clone() }),
+            WallpaperType::Scene => {
+                let dir = w.path.clone();
+                if dir.join("scene.json").exists() || dir.join("scene.pkg").exists() {
+                    Ok(WallpaperContent::Scene { dir })
+                } else {
+                    Err(anyhow!("scene wallpaper missing scene.json and scene.pkg in {}", dir.display()))
+                }
+            }
             WallpaperType::Web => Err(anyhow!("web wallpapers are not yet supported")),
             WallpaperType::Application => {
                 Err(anyhow!("application wallpapers are Windows-only"))

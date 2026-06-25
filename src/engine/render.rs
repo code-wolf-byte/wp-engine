@@ -22,48 +22,85 @@ pub struct Layer {
 }
 
 impl ResolvedScene {
-    /// Load a scene wallpaper from a directory containing scene.json and assets.
+    /// Load a scene wallpaper from a directory.
+    ///
+    /// Automatically detects whether assets are loose files or packed in a
+    /// `.pkg` archive and loads accordingly.
     pub fn from_directory(dir: &Path) -> Result<Self> {
-        let scene_path = dir.join("scene.json");
-        let scene_json = std::fs::read_to_string(&scene_path)
-            .with_context(|| format!("reading {}", scene_path.display()))?;
+        let scene_json_path = dir.join("scene.json");
+        let scene_pkg_path = dir.join("scene.pkg");
+
+        // If assets are packed in scene.pkg, load via the PKG path.
+        if scene_pkg_path.exists() {
+            let pkg = Package::from_file(&scene_pkg_path)?;
+
+            let scene_json = if scene_json_path.exists() {
+                std::fs::read_to_string(&scene_json_path)
+                    .with_context(|| format!("reading {}", scene_json_path.display()))?
+            } else if let Some(data) = pkg.get("scene.json") {
+                String::from_utf8(data.to_vec())
+                    .context("scene.json inside PKG is not valid UTF-8")?
+            } else {
+                anyhow::bail!("no scene.json found in directory or PKG archive");
+            };
+
+            return Self::from_package_with_dir(&pkg, &scene_json, dir);
+        }
+
+        // Loose-file scene: scene.json + textures alongside it.
+        let scene_json = std::fs::read_to_string(&scene_json_path)
+            .with_context(|| format!("reading {}", scene_json_path.display()))?;
         let scene = Scene::from_json(&scene_json)?;
 
         let mut layers = Vec::new();
-
         for obj in scene.visible_objects() {
-            let Some(image_path) = obj.image.as_deref() else {
-                continue;
-            };
-
-            let img = load_texture_from_dir(dir, image_path)?;
-
-            layers.push(layer_from_object(obj, img));
+            let Some(image_path) = obj.image.as_deref() else { continue };
+            match load_texture_from_dir(dir, image_path) {
+                Ok(img) => layers.push(layer_from_object(obj, img)),
+                Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
+            }
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-
         Ok(Self { width, height, layers })
     }
 
-    /// Load a scene wallpaper from a PKG archive + scene.json.
+    /// Load from a PKG archive, falling back to the directory for loose files.
+    fn from_package_with_dir(pkg: &Package, scene_json: &str, dir: &Path) -> Result<Self> {
+        let scene = Scene::from_json(scene_json)?;
+
+        let mut layers = Vec::new();
+        for obj in scene.visible_objects() {
+            let Some(image_path) = obj.image.as_deref() else { continue };
+            let img = load_texture_from_pkg(pkg, image_path)
+                .or_else(|pkg_err| {
+                    load_texture_from_dir(dir, image_path)
+                        .map_err(|dir_err| anyhow::anyhow!("pkg: {pkg_err}; dir: {dir_err}"))
+                });
+            match img {
+                Ok(img) => layers.push(layer_from_object(obj, img)),
+                Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
+            }
+        }
+
+        let (width, height) = guess_scene_dimensions(&scene, &layers);
+        Ok(Self { width, height, layers })
+    }
+
+    /// Load a scene wallpaper from a PKG archive + scene.json string.
     pub fn from_package(pkg: &Package, scene_json: &str) -> Result<Self> {
         let scene = Scene::from_json(scene_json)?;
 
         let mut layers = Vec::new();
-
         for obj in scene.visible_objects() {
-            let Some(image_path) = obj.image.as_deref() else {
-                continue;
-            };
-
-            let img = load_texture_from_pkg(pkg, image_path)?;
-
-            layers.push(layer_from_object(obj, img));
+            let Some(image_path) = obj.image.as_deref() else { continue };
+            match load_texture_from_pkg(pkg, image_path) {
+                Ok(img) => layers.push(layer_from_object(obj, img)),
+                Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
+            }
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-
         Ok(Self { width, height, layers })
     }
 
@@ -107,6 +144,11 @@ fn layer_from_object(obj: &SceneObject, img: RgbaImage) -> Layer {
 }
 
 fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<RgbaImage> {
+    // If it's a .json reference, resolve the model/material chain
+    if image_path.ends_with(".json") {
+        return resolve_model_chain_dir(dir, image_path);
+    }
+
     let full_path = dir.join(image_path);
 
     // Try as .tex first
@@ -140,6 +182,11 @@ fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<RgbaImage> {
 }
 
 fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<RgbaImage> {
+    // If the image path points to a .json model/material, resolve the chain.
+    if image_path.ends_with(".json") {
+        return resolve_model_chain_pkg(pkg, image_path);
+    }
+
     // Try as .tex
     let tex_name = if image_path.ends_with(".tex") {
         image_path.to_string()
@@ -163,21 +210,109 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<RgbaImage> {
     anyhow::bail!("texture not found in package: {image_path}")
 }
 
-fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
-    // Use the camera eye/center if available, otherwise use the largest layer
-    if let Some(cam) = &scene.camera {
-        if let Some(eye) = &cam.eye {
-            if eye.len() >= 2 && eye[0] > 0.0 && eye[1] > 0.0 {
-                return (eye[0] as u32, eye[1] as u32);
+/// Follow the model → material → texture reference chain in a PKG archive.
+fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
+    let data = pkg.get(json_path)
+        .with_context(|| format!("model/material not found in pkg: {json_path}"))?;
+    let val: serde_json::Value = serde_json::from_slice(data)
+        .with_context(|| format!("parsing {json_path}"))?;
+
+    // Model file: { "material": "materials/X.json" }
+    if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
+        return resolve_model_chain_pkg(pkg, mat_path);
+    }
+
+    // Material file: { "passes": [{ "textures": ["name"] }] }
+    if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
+        for pass in passes {
+            if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
+                for tex_ref in textures {
+                    if let Some(tex_name) = tex_ref.as_str() {
+                        let tex_path = format!("materials/{tex_name}.tex");
+                        if let Some(tex_data) = pkg.get(&tex_path) {
+                            let tex = TexFile::parse(tex_data)
+                                .with_context(|| format!("parsing {tex_path}"))?;
+                            return tex.to_rgba();
+                        }
+                        // Try without materials/ prefix
+                        let alt_path = format!("{tex_name}.tex");
+                        if let Some(tex_data) = pkg.get(&alt_path) {
+                            let tex = TexFile::parse(tex_data)?;
+                            return tex.to_rgba();
+                        }
+                    }
+                }
             }
         }
     }
 
-    let mut max_w = 1920u32;
-    let mut max_h = 1080u32;
+    anyhow::bail!("could not resolve texture from {json_path}")
+}
+
+/// Follow the model → material → texture chain for loose files on disk.
+fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
+    let full = dir.join(json_path);
+    let data = std::fs::read_to_string(&full)
+        .with_context(|| format!("reading {}", full.display()))?;
+    let val: serde_json::Value = serde_json::from_str(&data)
+        .with_context(|| format!("parsing {}", full.display()))?;
+
+    if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
+        return resolve_model_chain_dir(dir, mat_path);
+    }
+
+    if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
+        for pass in passes {
+            if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
+                for tex_ref in textures {
+                    if let Some(tex_name) = tex_ref.as_str() {
+                        let tex_path = dir.join(format!("materials/{tex_name}.tex"));
+                        if tex_path.exists() {
+                            let tex_data = std::fs::read(&tex_path)?;
+                            let tex = TexFile::parse(&tex_data)?;
+                            return tex.to_rgba();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("could not resolve texture from {json_path}")
+}
+
+fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
+    // 1. Try orthogonal projection dimensions from camera or general settings
+    if let Some(cam) = &scene.camera {
+        if let Some(proj) = &cam.orthogonal_projection {
+            if let (Some(w), Some(h)) = (proj.width, proj.height) {
+                if w > 0 && h > 0 {
+                    return (w, h);
+                }
+            }
+        }
+    }
+    if let Some(gen) = &scene.general {
+        if let Some(proj) = &gen.orthogonal_projection {
+            if let (Some(w), Some(h)) = (proj.width, proj.height) {
+                if w > 0 && h > 0 {
+                    return (w, h);
+                }
+            }
+        }
+    }
+
+    // 2. Use the largest layer dimensions
+    let mut max_w = 0u32;
+    let mut max_h = 0u32;
     for layer in layers {
         max_w = max_w.max(layer.image.width());
         max_h = max_h.max(layer.image.height());
     }
-    (max_w, max_h)
+    if max_w > 0 && max_h > 0 {
+        return (max_w, max_h);
+    }
+
+    // 3. Fallback
+    (1920, 1080)
 }

@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Top-level scene.json structure for Wallpaper Engine scene wallpapers.
+///
+/// Fields use `serde_json::Value` or `Option` liberally because Wallpaper
+/// Engine's format varies wildly across versions and creators.
 #[derive(Debug, Deserialize)]
 pub struct Scene {
     pub camera: Option<Camera>,
@@ -12,10 +15,24 @@ pub struct Scene {
 
 #[derive(Debug, Deserialize)]
 pub struct Camera {
-    pub center: Option<Vec<f64>>,
-    pub eye: Option<Vec<f64>>,
+    pub center: Option<serde_json::Value>,
+    pub eye: Option<serde_json::Value>,
     #[serde(rename = "parallaxamount")]
     pub parallax_amount: Option<f64>,
+    #[serde(rename = "orthogonalprojection")]
+    pub orthogonal_projection: Option<OrthogonalProjection>,
+}
+
+impl Camera {
+    pub fn parsed_eye(&self) -> Option<[f64; 3]> {
+        self.eye.as_ref().and_then(|v| parse_value_vec3(v))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrthogonalProjection {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,13 +40,18 @@ pub struct General {
     #[serde(rename = "supportsaudioprocessing")]
     pub supports_audio_processing: Option<bool>,
     pub speed: Option<f64>,
+    #[serde(rename = "orthogonalprojection")]
+    pub orthogonal_projection: Option<OrthogonalProjection>,
 }
 
 /// A single object/layer in the scene.
+///
+/// Uses `serde_json::Value` for fields that have inconsistent types across
+/// different Wallpaper Engine versions (e.g., `visible` can be bool or object).
 #[derive(Debug, Deserialize)]
 pub struct SceneObject {
     pub name: Option<String>,
-    pub visible: Option<bool>,
+    pub visible: Option<serde_json::Value>,
     pub origin: Option<String>,
     pub angles: Option<String>,
     pub size: Option<String>,
@@ -50,7 +72,14 @@ impl SceneObject {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible.unwrap_or(true)
+        match &self.visible {
+            None => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::Object(m)) => {
+                m.get("value").and_then(|v| v.as_bool()).unwrap_or(true)
+            }
+            _ => true,
+        }
     }
 }
 
@@ -64,7 +93,7 @@ pub struct Effect {
 #[derive(Debug, Deserialize)]
 pub struct Pass {
     pub material: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_textures")]
     pub textures: Vec<TextureRef>,
 }
 
@@ -73,9 +102,31 @@ pub struct TextureRef {
     pub file: Option<String>,
 }
 
+fn deserialize_textures<'de, D>(deserializer: D) -> std::result::Result<Vec<TextureRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items: Vec<Option<serde_json::Value>> = Vec::deserialize(deserializer)?;
+    Ok(items
+        .into_iter()
+        .filter_map(|v| {
+            let v = v?;
+            if v.is_null() { return None; }
+            if let Some(s) = v.as_str() {
+                return Some(TextureRef { file: Some(s.to_string()) });
+            }
+            serde_json::from_value(v).ok()
+        })
+        .collect())
+}
+
 impl Scene {
     pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json).context("failed to parse scene.json")
+        serde_json::from_str(json)
+            .with_context(|| {
+                let preview = if json.len() > 200 { &json[..200] } else { json };
+                format!("failed to parse scene.json: {preview}...")
+            })
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
@@ -119,4 +170,21 @@ fn parse_vec3(s: Option<&str>) -> [f64; 3] {
         parts.get(1).copied().unwrap_or(0.0),
         parts.get(2).copied().unwrap_or(0.0),
     ]
+}
+
+fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
+    match v {
+        serde_json::Value::String(s) => {
+            let r = parse_vec3(Some(s));
+            Some(r)
+        }
+        serde_json::Value::Array(arr) if arr.len() >= 3 => {
+            Some([
+                arr[0].as_f64().unwrap_or(0.0),
+                arr[1].as_f64().unwrap_or(0.0),
+                arr[2].as_f64().unwrap_or(0.0),
+            ])
+        }
+        _ => None,
+    }
 }
