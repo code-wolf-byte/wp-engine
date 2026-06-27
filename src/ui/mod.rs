@@ -7,6 +7,7 @@ use egui::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 // ── Layout constants ──────────────────────────────────────────────────────────
@@ -48,7 +49,10 @@ pub struct WpApp {
 
     file_input: String,
     settings: Arc<Mutex<RenderSettings>>,
+    pending_apply: Option<mpsc::Receiver<ApplyResult>>,
 }
+
+type ApplyResult = Result<(WallpaperHandle, String), String>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TypeFilter {
@@ -128,6 +132,7 @@ impl WpApp {
             status,
             file_input: String::new(),
             settings: Arc::new(Mutex::new(RenderSettings::default())),
+            pending_apply: None,
         }
     }
 
@@ -214,27 +219,45 @@ impl WpApp {
         }
     }
 
-    /// Create a `FrameSource` from parsed content and hand it to the Wayland renderer.
-    /// Stops any currently running wallpaper before starting the new one.
     fn apply_content(&mut self, content: WallpaperContent, display_title: String) {
-        match FrameSource::from_content(content) {
-            Err(e) => {
-                self.status = StatusMsg::err(format!("Renderer init failed: {e}"));
+        let old_renderer = self.renderer.take();
+        let settings = Arc::clone(&self.settings);
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            if let Some(old) = old_renderer {
+                old.stop();
             }
-            Ok(frame_source) => {
-                if let Some(old) = self.renderer.take() {
-                    old.stop();
-                }
-                match detect_platform().spawn_wallpaper(frame_source, Arc::clone(&self.settings)) {
-                    Ok(handle) => {
-                        self.renderer = Some(handle);
-                        self.active_title = Some(display_title.clone());
-                        self.status = StatusMsg::ok(format!("Applied \"{display_title}\""));
-                    }
-                    Err(e) => {
-                        self.status = StatusMsg::err(format!("Renderer error: {e}"));
-                    }
-                }
+            let result = FrameSource::from_content(content)
+                .and_then(|fs| {
+                    detect_platform().spawn_wallpaper(fs, settings)
+                })
+                .map(|handle| (handle, display_title.clone()))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+
+        self.pending_apply = Some(rx);
+        self.status = StatusMsg::ok("Applying...");
+    }
+
+    fn poll_pending_apply(&mut self) {
+        let Some(rx) = &self.pending_apply else { return };
+        match rx.try_recv() {
+            Ok(Ok((handle, title))) => {
+                self.renderer = Some(handle);
+                self.active_title = Some(title.clone());
+                self.status = StatusMsg::ok(format!("Applied \"{title}\""));
+                self.pending_apply = None;
+            }
+            Ok(Err(e)) => {
+                self.status = StatusMsg::err(e);
+                self.pending_apply = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status = StatusMsg::err("Apply thread crashed");
+                self.pending_apply = None;
             }
         }
     }
@@ -244,6 +267,10 @@ impl WpApp {
 
 impl eframe::App for WpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_pending_apply();
+        if self.pending_apply.is_some() {
+            ctx.request_repaint();
+        }
         self.flush_thumb_queue(ctx);
         self.render_toolbar(ctx);
         self.render_sidebar(ctx);

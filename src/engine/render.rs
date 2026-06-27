@@ -11,6 +11,7 @@ pub struct ResolvedScene {
     pub width: u32,
     pub height: u32,
     pub layers: Vec<Layer>,
+    pub scene: Scene,
 }
 
 pub struct Layer {
@@ -19,6 +20,7 @@ pub struct Layer {
     pub origin: [f64; 3],
     pub size: [f64; 3],
     pub parallax_depth: f64,
+    pub blend_mode: u32,
 }
 
 impl ResolvedScene {
@@ -63,7 +65,7 @@ impl ResolvedScene {
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-        Ok(Self { width, height, layers })
+        Ok(Self { width, height, layers, scene })
     }
 
     /// Load from a PKG archive, falling back to the directory for loose files.
@@ -86,7 +88,7 @@ impl ResolvedScene {
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-        Ok(Self { width, height, layers })
+        Ok(Self { width, height, layers, scene })
     }
 
     /// Load a scene wallpaper from a PKG archive + scene.json string.
@@ -104,7 +106,7 @@ impl ResolvedScene {
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-        Ok(Self { width, height, layers })
+        Ok(Self { width, height, layers, scene })
     }
 
     /// Composite all layers into a single RGBA image.
@@ -143,7 +145,13 @@ fn layer_from_object(obj: &SceneObject, img: RgbaImage) -> Layer {
         origin: obj.parsed_origin(),
         size: obj.parsed_size(),
         parallax_depth: parallax,
+        blend_mode: obj.color_blend_mode,
     }
+}
+
+fn is_video_path(p: &str) -> bool {
+    let p = p.to_lowercase();
+    p.ends_with(".mp4") || p.ends_with(".webm") || p.ends_with(".mkv") || p.ends_with(".avi")
 }
 
 fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<RgbaImage> {
@@ -153,6 +161,11 @@ fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<RgbaImage> {
     }
 
     let full_path = dir.join(image_path);
+
+    // Video file — extract first frame as static thumbnail
+    if is_video_path(image_path) && full_path.exists() {
+        return crate::render::ffmpeg::decode_first_frame(&full_path);
+    }
 
     // Try as .tex first
     let tex_path = full_path.with_extension("tex");
@@ -203,8 +216,22 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<RgbaImage> {
         return tex.to_rgba();
     }
 
-    // Try original path (might be a png/jpg embedded in pkg)
+    // Try original path (png/jpg or video embedded in pkg)
     if let Some(data) = pkg.get(image_path) {
+        if is_video_path(image_path) {
+            let ext = std::path::Path::new(image_path)
+                .extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+            let tmp = std::env::temp_dir().join(format!("we_vidtex_{}.{ext}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0)));
+            std::fs::write(&tmp, data)
+                .with_context(|| format!("writing video temp file: {}", tmp.display()))?;
+            let result = crate::render::ffmpeg::decode_first_frame(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            return result;
+        }
         return image::load_from_memory(data)
             .map(|i| i.into_rgba8())
             .with_context(|| format!("loading image from pkg: {image_path}"));

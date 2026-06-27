@@ -200,9 +200,9 @@ fn load_particles_pkg(
 
 fn load_effects(obj: &SceneObject, effects: &mut Vec<LayerEffect>) {
     for eff in &obj.effects {
-        let effect_name = match &eff.name {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            _ => continue,
+        let effect_name = match &eff.file {
+            Some(s) => s.clone(),
+            None => continue,
         };
 
         for pass in &eff.passes {

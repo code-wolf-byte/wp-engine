@@ -10,11 +10,14 @@
 //!   [`animated`] — real-time animated renderer   (Phase 7) ✓
 
 pub mod animated;
+pub mod gpu_renderer;
 pub mod effect;
+pub mod model;
 pub mod particle;
 pub mod pkg;
 pub mod render;
 pub mod scene;
+pub mod shaders;
 pub mod tex;
 
 pub use pkg::Package;

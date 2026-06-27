@@ -61,6 +61,8 @@ pub struct SceneObject {
     pub particle: Option<serde_json::Value>,
     #[serde(default)]
     pub effects: Vec<Effect>,
+    #[serde(rename = "colorBlendMode", default)]
+    pub color_blend_mode: u32,
 }
 
 impl SceneObject {
@@ -86,7 +88,8 @@ impl SceneObject {
 
 #[derive(Debug, Deserialize)]
 pub struct Effect {
-    pub name: Option<serde_json::Value>,
+    #[serde(rename = "file")]
+    pub file: Option<String>,
     #[serde(default)]
     pub passes: Vec<Pass>,
 }
@@ -96,6 +99,8 @@ pub struct Pass {
     pub material: Option<String>,
     #[serde(default, deserialize_with = "deserialize_textures")]
     pub textures: Vec<TextureRef>,
+    #[serde(default)]
+    pub constantshadervalues: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +190,11 @@ fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
                 arr[1].as_f64().unwrap_or(0.0),
                 arr[2].as_f64().unwrap_or(0.0),
             ])
+        }
+        serde_json::Value::Object(m) => {
+            // SceneScript animated property: {"value": "x y z", "script": "..."}
+            // Use the static default; runtime scripting is not yet supported.
+            m.get("value").and_then(|inner| parse_value_vec3(inner))
         }
         _ => None,
     }

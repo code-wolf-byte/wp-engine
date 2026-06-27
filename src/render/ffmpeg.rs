@@ -158,6 +158,71 @@ pub fn video_decode_loop(path: &Path, tx: &SyncSender<Arc<RgbaImage>>) -> Result
     }
 }
 
+/// Decode the first video frame from `path` and return it as an `RgbaImage`.
+/// Useful for extracting a static thumbnail from a video texture layer.
+pub fn decode_first_frame(path: &Path) -> Result<RgbaImage> {
+    use ffmpeg_next::{
+        codec::context::Context as CodecCtx,
+        format,
+        format::Pixel,
+        media::Type,
+        software::scaling::{context::Context as ScaleCtx, flag::Flags},
+        util::frame::video::Video as VideoFrame,
+    };
+
+    ffmpeg_next::init().map_err(|e| anyhow!("FFmpeg init: {e}"))?;
+
+    let mut ictx = format::input(&path)
+        .map_err(|e| anyhow!("cannot open '{}': {e}", path.display()))?;
+
+    let stream_idx = ictx
+        .streams()
+        .best(Type::Video)
+        .ok_or_else(|| anyhow!("no video stream in '{}'", path.display()))?
+        .index();
+
+    let mut decoder = {
+        let stream = ictx.stream(stream_idx).unwrap();
+        CodecCtx::from_parameters(stream.parameters())
+            .map_err(|e| anyhow!("codec context: {e}"))?
+            .decoder()
+            .video()
+            .map_err(|e| anyhow!("video decoder: {e}"))?
+    };
+
+    let mut scaler = ScaleCtx::get(
+        decoder.format(),
+        decoder.width(),
+        decoder.height(),
+        Pixel::RGBA,
+        decoder.width(),
+        decoder.height(),
+        Flags::BILINEAR,
+    )
+    .map_err(|e| anyhow!("scaler context: {e}"))?;
+
+    let mut raw = VideoFrame::empty();
+    let mut scaled = VideoFrame::empty();
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != stream_idx {
+            continue;
+        }
+        if decoder.send_packet(&packet).is_err() {
+            continue;
+        }
+        while decoder.receive_frame(&mut raw).is_ok() {
+            if scaler.run(&raw, &mut scaled).is_ok() {
+                if let Some(img) = frame_to_rgba(&scaled) {
+                    return Ok(img);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!("no decodable video frame found in '{}'", path.display()))
+}
+
 /// Copy one RGBA `VideoFrame` into an `RgbaImage`, trimming stride padding.
 fn frame_to_rgba(frame: &ffmpeg_next::util::frame::video::Video) -> Option<RgbaImage> {
     let w = frame.width();

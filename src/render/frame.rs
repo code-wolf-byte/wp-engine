@@ -36,8 +36,11 @@ impl FrameSource {
                 let target_fps = 30.0;
 
                 thread::spawn(move || {
-                    if let Err(e) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
-                        eprintln!("scene render error for '{}': {e}", dir.display());
+                    if let Err(e) = crate::engine::gpu_renderer::gpu_scene_render_loop(&dir, &tx, target_fps) {
+                        eprintln!("GPU scene render failed, falling back to CPU: {e}");
+                        if let Err(e2) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
+                            eprintln!("CPU scene render error: {e2}");
+                        }
                     }
                 });
 

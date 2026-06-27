@@ -34,6 +34,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Platform Abstraction Layer – GPU enumeration + device creation
 wgpu     = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
+naga     = { version = "27", features = ["glsl-in", "wgsl-out"] }
 pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
 
 # Engine – texture decompression + particles
