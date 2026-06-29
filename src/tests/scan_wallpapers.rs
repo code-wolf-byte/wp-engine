@@ -202,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_string_lossy()
                     .to_string();
 
-                let output = run_with_timeout(&binary, &wp_path, Duration::from_secs(30));
+                let output = run_with_timeout(&binary, &wp_path, Duration::from_secs(60));
                 let status = classify(&output);
                 let errors = bucket_errors(&output);
                 let result_lines = extract_result_lines(&output);

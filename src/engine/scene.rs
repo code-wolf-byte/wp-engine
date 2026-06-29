@@ -43,7 +43,7 @@ pub struct General {
     #[serde(rename = "orthogonalprojection")]
     pub orthogonal_projection: Option<OrthogonalProjection>,
     #[serde(rename = "clearcolor")]
-    pub clear_color: Option<String>,
+    pub clear_color: Option<serde_json::Value>,
 }
 
 /// A single object/layer in the scene.
@@ -70,10 +70,11 @@ pub struct SceneObject {
     pub color_blend_mode: u32,
     #[serde(default)]
     pub copybackground: bool,
+    // WE uses either integer indices or string names depending on wallpaper version.
     #[serde(default)]
-    pub parent: Option<String>,
+    pub parent: Option<serde_json::Value>,
     #[serde(default)]
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<serde_json::Value>,
 }
 
 impl SceneObject {
@@ -192,12 +193,28 @@ impl Scene {
         visited[index] = true;
         let obj = &objects[index];
         for dep in &obj.dependencies {
-            if let Some(&di) = name_to_index.get(dep) {
+            let di = if let Some(n) = dep.as_u64() {
+                // integer index
+                Some(n as usize).filter(|&i| i < objects.len())
+            } else if let Some(s) = dep.as_str() {
+                // string name
+                name_to_index.get(s).copied()
+            } else {
+                None
+            };
+            if let Some(di) = di {
                 Self::topo_dfs(di, objects, visited, result, name_to_index);
             }
         }
         if let Some(parent) = &obj.parent {
-            if let Some(&pi) = name_to_index.get(parent) {
+            let pi = if let Some(n) = parent.as_u64() {
+                Some(n as usize).filter(|&i| i < objects.len())
+            } else if let Some(s) = parent.as_str() {
+                name_to_index.get(s).copied()
+            } else {
+                None
+            };
+            if let Some(pi) = pi {
                 Self::topo_dfs(pi, objects, visited, result, name_to_index);
             }
         }

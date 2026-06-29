@@ -237,6 +237,51 @@ impl TexFile {
             Ok(img)
         }
     }
+
+    /// Decode every mipmap as a separate RGBA image (animation frame).
+    /// WE stores sprite animation frames as sequential mipmaps at the same resolution.
+    /// Falls back to a single frame (same as `to_rgba`) for non-animated textures.
+    pub fn to_rgba_frames(&self) -> Result<Vec<RgbaImage>> {
+        let mut frames = Vec::with_capacity(self.mipmaps.len());
+        for mip in &self.mipmaps {
+            let rgba: Vec<u8> = match self.format {
+                TexFormat::Rgba8 => mip.data.chunks_exact(4)
+                    .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
+                    .collect(),
+                TexFormat::R8 => mip.data.iter().flat_map(|&r| [r, r, r, 255]).collect(),
+                TexFormat::Rg88 => mip.data.chunks(2).flat_map(|rg| {
+                    let r = rg.first().copied().unwrap_or(0);
+                    let g = rg.get(1).copied().unwrap_or(0);
+                    [r, g, 0, 255]
+                }).collect(),
+                TexFormat::Rgb888 => mip.data.chunks(3).flat_map(|rgb| {
+                    [rgb.first().copied().unwrap_or(0),
+                     rgb.get(1).copied().unwrap_or(0),
+                     rgb.get(2).copied().unwrap_or(0), 255]
+                }).collect(),
+                TexFormat::Rgb565 => mip.data.chunks_exact(2)
+                    .flat_map(|b| rgb565_to_rgba(u16::from_le_bytes([b[0], b[1]])))
+                    .collect(),
+                TexFormat::Dxt1 => decode_dxt1(&mip.data, self.texture_width, self.texture_height),
+                TexFormat::Dxt3 => decode_dxt3(&mip.data, self.texture_width, self.texture_height),
+                TexFormat::Dxt5 => decode_dxt5(&mip.data, self.texture_width, self.texture_height),
+                TexFormat::Bc4 => decode_bc4(&mip.data, self.texture_width, self.texture_height),
+                TexFormat::Bc7 => decode_bc7(&mip.data, self.texture_width, self.texture_height),
+            };
+            if let Some(img) = RgbaImage::from_raw(self.texture_width, self.texture_height, rgba) {
+                let cropped = if self.image_width != self.texture_width || self.image_height != self.texture_height {
+                    image::imageops::crop_imm(&img, 0, 0, self.image_width, self.image_height).to_image()
+                } else {
+                    img
+                };
+                frames.push(cropped);
+            }
+        }
+        if frames.is_empty() {
+            anyhow::bail!("no decodable frames in .tex file");
+        }
+        Ok(frames)
+    }
 }
 
 // ── DXT decoders ──────────────────────────────────────────────────────────────

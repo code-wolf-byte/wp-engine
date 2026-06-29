@@ -36,10 +36,25 @@ impl FrameSource {
                 let target_fps = 30.0;
 
                 thread::spawn(move || {
-                    if let Err(e) = crate::engine::gpu_renderer::gpu_scene_render_loop(&dir, &tx, target_fps) {
-                        eprintln!("GPU scene render failed, falling back to CPU: {e}");
-                        if let Err(e2) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
-                            eprintln!("CPU scene render error: {e2}");
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::engine::gpu_renderer::gpu_scene_render_loop(&dir, &tx, target_fps)
+                    }));
+                    match r {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            eprintln!("GPU scene render failed, falling back to CPU: {e}");
+                            if let Err(e2) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
+                                eprintln!("CPU scene render error: {e2}");
+                            }
+                        }
+                        Err(panic_val) => {
+                            let msg = panic_val.downcast_ref::<String>().cloned()
+                                .or_else(|| panic_val.downcast_ref::<&str>().map(|s| s.to_string()))
+                                .unwrap_or_else(|| "(unknown panic)".into());
+                            eprintln!("GPU render thread panicked: {msg} — falling back to CPU");
+                            if let Err(e2) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
+                                eprintln!("CPU scene render error: {e2}");
+                            }
                         }
                     }
                 });

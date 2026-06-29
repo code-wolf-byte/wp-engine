@@ -55,3 +55,14 @@ pub fn load_material_from_dir(assets_dir: &Path, material_path: &str) -> Result<
         .with_context(|| format!("reading {}", path.display()))?;
     parse_material_json(&data)
 }
+
+/// Load material from effect bundle: assets/effects/{effect_name}/{material_path}
+pub fn load_material_from_effect(assets_dir: &Path, effect_name: &str, material_path: &str) -> Result<MaterialDef> {
+    let bundled = assets_dir.join("effects").join(effect_name).join(material_path);
+    if bundled.exists() {
+        let data = std::fs::read(&bundled)
+            .with_context(|| format!("reading {}", bundled.display()))?;
+        return parse_material_json(&data);
+    }
+    load_material_from_dir(assets_dir, material_path)
+}

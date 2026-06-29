@@ -303,10 +303,26 @@ fn preprocess_frag(model: &ShaderModel) -> String {
     out.push_str("#define lerp(a, b, t) mix(a, b, t)\n");
     out.push_str("#define mul(a, b) ((b) * (a))\n");
     out.push_str(&combo_defines(&model.effective_combos()));
-    // Inline WE standard includes so shaders using #include "common.h" / "common_blending.h"
-    // compile without an include resolver (those directives are stripped in the body pass).
-    out.push_str(WE_COMMON_H);
-    out.push_str(WE_COMMON_BLENDING_H);
+    // HLSL type aliases used pervasively in WE shaders.
+    // These must come BEFORE any inlined shader body (common.h etc. are inlined by the loader).
+    // We do NOT emit our WE_COMMON_H / WE_COMMON_BLENDING_H function bodies here because
+    // the loader already inlines the real WE common.h content into the source, and emitting
+    // our copies would cause "redefinition" errors in shaderc.
+    out.push_str("#define float2 vec2\n");
+    out.push_str("#define float3 vec3\n");
+    out.push_str("#define float4 vec4\n");
+    out.push_str("#define int2 ivec2\n");
+    out.push_str("#define int3 ivec3\n");
+    out.push_str("#define int4 ivec4\n");
+    out.push_str("#define CAST3X3(x) mat3(x)\n");
+    out.push_str("#define atan2(y,x) atan(y,x)\n");
+    out.push_str("#define fmod(x,y) ((x)-(y)*trunc((x)/(y)))\n");
+    out.push_str("#define ddx dFdx\n");
+    out.push_str("#define ddy(x) dFdy(-(x))\n");
+    out.push_str("#define log10(x) (log2(x)*0.301029995663981)\n");
+    // Constants sometimes needed by shaders that don't include common.h
+    out.push_str("#ifndef M_PI\n#define M_PI 3.14159265359\n#endif\n");
+    out.push_str("#ifndef M_PI_2\n#define M_PI_2 6.28318530718\n#endif\n");
 
     // Separate texture2D declarations with matching bindings
     for (i, name) in sampler_names.iter().enumerate() {
@@ -344,6 +360,14 @@ fn preprocess_frag(model: &ShaderModel) -> String {
         // Skip #include directives — included content is inlined in the header.
         if t.starts_with("#include ") { continue; }
 
+        // Replace #require LightingV1 with a no-op stub (same as linux-wallpaperengine).
+        if t.starts_with("#require LightingV1") {
+            out.push_str("vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir,\n");
+            out.push_str("    vec3 specularTint, vec3 baseReflectance, float roughness, float metallic)\n");
+            out.push_str("{ return vec3(0.0); }\n");
+            continue;
+        }
+
         let renamed = rename_reserved_word(line, "sample", "_wp_s");
         let l = renamed
             .replace("gl_FragColor",   "fragColor")
@@ -369,6 +393,18 @@ fn preprocess_vert(glsl: &str) -> String {
     out.push_str("#define texture2D(s, uv) texture(s, uv)\n");
     out.push_str("#define lerp(a, b, t) mix(a, b, t)\n");
     out.push_str("#define mul(a, b) ((b) * (a))\n");
+    out.push_str("#define float2 vec2\n");
+    out.push_str("#define float3 vec3\n");
+    out.push_str("#define float4 vec4\n");
+    out.push_str("#define int2 ivec2\n");
+    out.push_str("#define int3 ivec3\n");
+    out.push_str("#define int4 ivec4\n");
+    out.push_str("#define CAST3X3(x) mat3(x)\n");
+    out.push_str("#define atan2(y,x) atan(y,x)\n");
+    out.push_str("#define fmod(x,y) ((x)-(y)*trunc((x)/(y)))\n");
+    out.push_str("#define ddx dFdx\n");
+    out.push_str("#define ddy(x) dFdy(-(x))\n");
+    out.push_str("#define log10(x) (log2(x)*0.301029995663981)\n");
 
     // Collect scalar uniforms for UBO
     let mut scalars: Vec<(String, String)> = Vec::new();

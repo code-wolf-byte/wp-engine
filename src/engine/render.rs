@@ -17,6 +17,10 @@ pub struct ResolvedScene {
 pub struct Layer {
     pub name: String,
     pub image: RgbaImage,
+    /// Additional animation frames (frame 0 is `image`). Empty = not animated.
+    pub extra_frames: Vec<RgbaImage>,
+    /// Duration of each frame in milliseconds. 0 = not animated / unknown.
+    pub frame_duration_ms: u32,
     pub origin: [f64; 3],
     pub size: [f64; 3],
     pub scale: [f64; 3],   // WE scale multiplier (default 1.0), separate from size
@@ -279,6 +283,8 @@ fn layer_from_object(obj: &SceneObject, img: RgbaImage) -> Layer {
     Layer {
         name: obj.name.clone().unwrap_or_default(),
         image: img,
+        extra_frames: Vec::new(),
+        frame_duration_ms: 0,
         origin: obj.parsed_origin(),
         size: obj.parsed_size(),
         scale,

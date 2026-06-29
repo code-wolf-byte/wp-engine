@@ -20,9 +20,12 @@ pub struct GpuSceneRenderer {
     composite_pipelines: Vec<(u32, wgpu::RenderPipeline)>,
     effect_pipelines: Vec<(&'static str, wgpu::RenderPipeline)>,
     dynamic_pipelines: HashMap<String, wgpu::RenderPipeline>,
-    dynamic_uniform_keys: HashMap<String, Vec<(String, f32)>>,
+    // (key, glsl_type, default_value)
+    dynamic_uniform_keys: HashMap<String, Vec<(String, String, f32)>>,
+    dynamic_textures: HashMap<String, Vec<wgpu::Texture>>,
     effect_pipeline_layout: wgpu::PipelineLayout,
     shader_module: wgpu::ShaderModule,
+    dummy_tex: wgpu::Texture,
 }
 
 impl GpuSceneRenderer {
@@ -43,19 +46,20 @@ impl GpuSceneRenderer {
             ..Default::default()
         });
 
+        let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            },
+            count: None,
+        };
         let base_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("base_bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
+                tex_entry(0),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -72,6 +76,9 @@ impl GpuSceneRenderer {
                     },
                     count: None,
                 },
+                // Extra texture slots for multi-texture effects (g_Texture1..6)
+                tex_entry(3), tex_entry(4), tex_entry(5),
+                tex_entry(6), tex_entry(7), tex_entry(8),
             ],
         });
 
@@ -168,14 +175,37 @@ impl GpuSceneRenderer {
             effect_pipelines.push((*name, pipeline));
         }
 
+        let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
+
         Ok(Self {
             device, queue, sampler, base_bgl, effect_bgl,
             composite_pipelines, effect_pipelines,
             dynamic_pipelines: HashMap::new(),
             dynamic_uniform_keys: HashMap::new(),
+            dynamic_textures: HashMap::new(),
             effect_pipeline_layout: effect_layout,
             shader_module,
+            dummy_tex,
         })
+    }
+
+    fn create_white_1x1_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy_white"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            tex.as_image_copy(),
+            &[255u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        tex
     }
 
     fn create_pipeline(
@@ -257,17 +287,49 @@ impl GpuSceneRenderer {
         })
     }
 
-    pub fn add_dynamic_pipeline(&mut self, key: String, wgsl: &str, uniform_keys: Vec<(String, f32)>) -> Result<()> {
-        let fs_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&key),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
-        let pipeline = Self::create_pipeline_split_modules(
-            &self.device, &self.effect_pipeline_layout,
-            &self.shader_module, "vs_fullscreen",
-            &fs_module, "main",
-            &key, None,
-        );
+    pub fn add_dynamic_pipeline(&mut self, key: String, wgsl: &str, vert_wgsl: Option<&str>, uniform_keys: Vec<(String, String, f32)>) -> Result<()> {
+        use std::panic::AssertUnwindSafe;
+        let wgsl_owned: std::borrow::Cow<'static, str> = wgsl.to_string().into();
+        let label = key.clone();
+        let device = &self.device;
+        let fs_module = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label.as_str()),
+                source: wgpu::ShaderSource::Wgsl(wgsl_owned),
+            })
+        })).map_err(|e| {
+            let msg = e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "(unknown)".into());
+            anyhow!("shader module panicked for '{key}': {msg}")
+        })?;
+
+        let device = &self.device;
+        let layout = &self.effect_pipeline_layout;
+        let base = &self.shader_module;
+        let label2 = key.clone();
+        let vert_src_owned: Option<String> = vert_wgsl.map(|s| s.to_string());
+        let pipeline = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(ref vert_src) = vert_src_owned {
+                let vert_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(&format!("{label2}-vs")),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(vert_src.as_str())),
+                });
+                Self::create_pipeline_split_modules(
+                    device, layout, &vert_module, "main", &fs_module, "main", &label2, None,
+                )
+            } else {
+                Self::create_pipeline_split_modules(
+                    device, layout, base, "vs_we_effect", &fs_module, "main", &label2, None,
+                )
+            }
+        })).map_err(|e| {
+            let msg = e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "(unknown)".into());
+            anyhow!("pipeline panicked for '{key}': {msg}")
+        })?;
+
         self.dynamic_pipelines.insert(key.clone(), pipeline);
         self.dynamic_uniform_keys.insert(key, uniform_keys);
         Ok(())
@@ -387,12 +449,27 @@ impl GpuSceneRenderer {
                     dummy_composite[24..28].copy_from_slice(&1.0f32.to_le_bytes()); // color.b
                     self.queue.write_buffer(&composite_buf, 0, &dummy_composite);
 
+                    let dummy_view = self.dummy_tex.create_view(&Default::default());
+                    let effect_texs = self.dynamic_textures.get(*effect_name);
+                    let tex_view = |i: usize| -> wgpu::TextureView {
+                        effect_texs.and_then(|v| v.get(i))
+                            .unwrap_or(&self.dummy_tex)
+                            .create_view(&Default::default())
+                    };
+                    let t1 = tex_view(0); let t2 = tex_view(1); let t3 = tex_view(2);
+                    let t4 = tex_view(3); let t5 = tex_view(4); let t6 = tex_view(5);
                     let base_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None, layout: &self.base_bgl,
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&current_view) },
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                             wgpu::BindGroupEntry { binding: 2, resource: composite_buf.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&t1) },
+                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&t2) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&t3) },
+                            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&t4) },
+                            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&t5) },
+                            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&t6) },
                         ],
                     });
 
@@ -452,12 +529,19 @@ impl GpuSceneRenderer {
             });
             self.queue.write_buffer(&composite_buf, 0, &composite_data);
 
+            let dummy_view2 = self.dummy_tex.create_view(&Default::default());
             let base_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None, layout: &self.base_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&current_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 2, resource: composite_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dummy_view2) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&dummy_view2) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&dummy_view2) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&dummy_view2) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&dummy_view2) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&dummy_view2) },
                 ],
             });
 
@@ -557,14 +641,20 @@ pub fn gpu_scene_render_loop(
     let scene_model = crate::engine::model::scene_to_model(&resolved.scene)?;
 
     let clear_color: [f64; 3] = resolved.scene.general.as_ref()
-        .and_then(|g| g.clear_color.as_deref())
-        .and_then(|s| {
+        .and_then(|g| g.clear_color.as_ref())
+        .and_then(|v| {
+            // clear_color can be a plain string "R G B" or {"user":..., "value":"R G B"}
+            let s = if let Some(s) = v.as_str() { s.to_string() }
+                else if let Some(inner) = v.get("value").and_then(|i| i.as_str()) { inner.to_string() }
+                else { return None; };
             let parts: Vec<f64> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
             if parts.len() >= 3 { Some([parts[0], parts[1], parts[2]]) } else { None }
         })
         .unwrap_or([0.0, 0.0, 0.0]);
 
-    let gpu_layers: Vec<_> = resolved.layers.iter().enumerate()
+    // gpu_layers: (frames: Vec<Texture>, opacity, blend_mode, offset, scale, frame_duration_ms)
+    let gpu_layers: Vec<(Vec<wgpu::Texture>, f32, u32, [f32; 2], [f32; 2], u32)> =
+        resolved.layers.iter().enumerate()
         .map(|(i, l)| {
             let obj = scene_model.objects.get(i);
             let offset = obj.map(|o| {
@@ -575,12 +665,21 @@ pub fn gpu_scene_render_loop(
                 let xyz = o.scale_xyz();
                 [xyz[0], xyz[1]]
             }).unwrap_or([1.0f32, 1.0]);
-            let resized = if l.image.width() != w || l.image.height() != h {
-                image::imageops::resize(&l.image, w, h, image::imageops::FilterType::Lanczos3)
-            } else {
-                l.image.clone()
-            };
-            (renderer.upload_texture(&resized), 1.0f32, l.blend_mode, offset, scale)
+
+            // Build the frame list: frame 0 is l.image; rest are l.extra_frames.
+            let all_frames: Vec<RgbaImage> = std::iter::once(l.image.clone())
+                .chain(l.extra_frames.iter().cloned())
+                .collect();
+            let textures: Vec<wgpu::Texture> = all_frames.iter().map(|frame| {
+                let resized = if frame.width() != w || frame.height() != h {
+                    image::imageops::resize(frame, w, h, image::imageops::FilterType::Lanczos3)
+                } else {
+                    frame.clone()
+                };
+                renderer.upload_texture(&resized)
+            }).collect();
+
+            (textures, 1.0f32, l.blend_mode, offset, scale, l.frame_duration_ms)
         })
         .collect();
 
@@ -592,11 +691,21 @@ pub fn gpu_scene_render_loop(
         for (_, effect_name, _) in &scene_effects {
             if HARDCODED.contains(&effect_name.as_str()) { continue; }
             if renderer.dynamic_pipelines.contains_key(effect_name) { continue; }
-            let Ok(eff_def) = effect_def::load_effect_from_dir(&assets_dir, effect_name) else { continue; };
-            let Some(mat_path) = eff_def.passes.first().and_then(|p| p.material.as_deref()) else { continue; };
-            let Ok(mat_def) = effect_def::load_material_from_dir(&assets_dir, mat_path) else { continue; };
-            let Some(shader_name) = mat_def.passes.first().and_then(|p| p.shader.as_deref()) else { continue; };
-            let Ok((frag_glsl, _vert_glsl)) = loader::load_glsl_shader(&assets_dir, shader_name) else { continue; };
+            let Ok(eff_def) = effect_def::load_effect_from_dir(&assets_dir, effect_name) else {
+                eprintln!("[effect] SKIP '{effect_name}': no effect.json"); continue;
+            };
+            let Some(mat_path) = eff_def.passes.first().and_then(|p| p.material.as_deref()) else {
+                eprintln!("[effect] SKIP '{effect_name}': no material pass"); continue;
+            };
+            let Ok(mat_def) = effect_def::load_material_from_effect(&assets_dir, effect_name, mat_path) else {
+                eprintln!("[effect] SKIP '{effect_name}': material '{mat_path}' not found"); continue;
+            };
+            let Some(shader_name) = mat_def.passes.first().and_then(|p| p.shader.as_deref()) else {
+                eprintln!("[effect] SKIP '{effect_name}': no shader in material"); continue;
+            };
+            let Ok((frag_glsl, _vert_glsl)) = loader::load_glsl_shader_for_effect(&assets_dir, shader_name, Some(effect_name)) else {
+                eprintln!("[effect] SKIP '{effect_name}': shader '{shader_name}' not found"); continue;
+            };
             let blending_str = mat_def.passes.first()
                 .and_then(|p| p.blending.as_deref())
                 .unwrap_or("normal");
@@ -606,10 +715,37 @@ pub fn gpu_scene_render_loop(
                 HashMap::new(),
                 WEBlending::from_str(blending_str),
             );
-            let Ok(translated) = transpiler::translate(&model) else { continue; };
-            let keys: Vec<(String, f32)> = translated.uniform_keys.iter().map(|u| (u.key.clone(), u.default)).collect();
-            if let Err(e) = renderer.add_dynamic_pipeline(effect_name.clone(), &translated.wgsl, keys) {
-                eprintln!("dynamic shader '{}' failed: {e}", effect_name);
+            let translated = match transpiler::translate(&model) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[effect] SKIP '{effect_name}': GLSL→WGSL translation failed: {e}"); continue;
+                }
+            };
+            let keys: Vec<(String, String, f32)> = translated.uniform_keys.iter()
+                .map(|u| (u.key.clone(), u.glsl_type.clone(), u.default))
+                .collect();
+            if let Err(e) = renderer.add_dynamic_pipeline(effect_name.clone(), &translated.wgsl, translated.vert_wgsl.as_deref(), keys) {
+                eprintln!("[effect] SKIP '{effect_name}': pipeline creation failed: {e}");
+            } else {
+                eprintln!("[effect] LOADED '{effect_name}'");
+                // Load secondary textures (g_Texture1, g_Texture2, ...) from WE assets.
+                let mut textures: Vec<wgpu::Texture> = Vec::new();
+                if let Some(ref assets_dir) = loader::find_we_assets_dir() {
+                    for slot in model.texture_slots.iter().skip(1) {
+                        let path = slot.default_path.as_deref().unwrap_or("");
+                        let tex_path = assets_dir.join(format!("{path}.tex"));
+                        if let Ok(bytes) = std::fs::read(&tex_path) {
+                            if let Ok(tf) = crate::engine::tex::TexFile::parse(&bytes) {
+                                if let Ok(img) = tf.to_rgba() {
+                                    textures.push(renderer.upload_texture(&img));
+                                    continue;
+                                }
+                            }
+                        }
+                        // Fallback: push nothing — caller will use dummy
+                    }
+                }
+                renderer.dynamic_textures.insert(effect_name.clone(), textures);
             }
         }
     }
@@ -627,7 +763,7 @@ pub fn gpu_scene_render_loop(
                     make_effect_params(name, time, vals)
                 } else {
                     let keys = renderer.dynamic_uniform_keys.get(name).map(|v| v.as_slice()).unwrap_or(&[]);
-                    make_params_from_translated(keys, time, vals)
+                    make_params_from_translated_typed(keys, time, vals)
                 };
                 (*idx, name.as_str(), params)
             })
@@ -638,7 +774,14 @@ pub fn gpu_scene_render_loop(
             .collect();
 
         let layer_refs: Vec<(&wgpu::Texture, f32, u32, [f32; 2], [f32; 2])> = gpu_layers.iter()
-            .map(|(t, o, b, off, sc)| (t, *o, *b, *off, *sc))
+            .map(|(textures, o, b, off, sc, dur_ms)| {
+                let frame_idx = if textures.len() > 1 && *dur_ms > 0 {
+                    ((time * 1000.0 / *dur_ms as f32) as usize) % textures.len()
+                } else {
+                    0
+                };
+                (&textures[frame_idx], *o, *b, *off, *sc)
+            })
             .collect();
         renderer.render_frame(&layer_refs, &effect_refs, &target, w, h, clear_color);
 
@@ -666,7 +809,11 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<(usize, Stri
                 Some(s) => s,
                 None => continue,
             };
-            let name = file.rsplit('/').next().unwrap_or(file)
+            // WE effect paths look like "effects/{name}/effect.json"; the effect
+            // name is the directory, not the filename (which is always "effect.json").
+            let mut parts = file.rsplitn(3, '/');
+            let _filename = parts.next().unwrap_or(""); // "effect.json"
+            let name = parts.next().unwrap_or(file)     // "waterflow"
                 .trim_end_matches(".json")
                 .to_lowercase();
             let vals: ShaderVals = eff.passes.first()
@@ -690,26 +837,71 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<(usize, Stri
     result
 }
 
-fn make_params_from_translated(keys: &[(String, f32)], time: f32, vals: &ShaderVals) -> Vec<u8> {
+fn make_params_from_translated_typed(keys: &[(String, String, f32)], time: f32, vals: &ShaderVals) -> Vec<u8> {
     let mut bytes = Vec::new();
-    for (key, default) in keys {
+
+    let get_float = |key: &str, default: f32| -> f32 {
         let k = key.to_lowercase();
-        let val = if k.contains("time") {
-            time
-        } else if k == "g_alpha" || k == "g_useralpha" {
-            vals.get(key).copied().unwrap_or(1.0)
-        } else if k == "g_brightness" {
-            vals.get(key).copied().unwrap_or(1.0)
-        } else if k == "g_color" {
-            vals.get(key).copied().unwrap_or(1.0)
-        } else if k == "g_lightambientcolor" || k == "g_lightskylightcolor" {
-            vals.get(key).copied().unwrap_or(1.0)
-        } else {
-            vals.get(key).copied().unwrap_or(*default)
-        };
-        bytes.extend_from_slice(&val.to_le_bytes());
-        bytes.extend_from_slice(&[0u8; 12]); // std140 scalar slot = 16 bytes
+        if k.contains("time") { return time; }
+        if k == "g_alpha" || k == "g_useralpha" || k == "g_brightness" { return vals.get(key).copied().unwrap_or(1.0); }
+        vals.get(key).copied().unwrap_or(default)
+    };
+
+    for (key, glsl_type, default) in keys {
+        match glsl_type.as_str() {
+            "vec2" => {
+                let x = get_float(key, *default);
+                let y = get_float(&format!("{key}_y"), *default);
+                bytes.extend_from_slice(&x.to_le_bytes());
+                bytes.extend_from_slice(&y.to_le_bytes());
+                bytes.extend_from_slice(&[0u8; 8]); // pad to 16
+            }
+            "vec3" => {
+                let r = get_float(&format!("{key}_r"), *default);
+                let g = get_float(&format!("{key}_g"), *default);
+                let b = get_float(&format!("{key}_b"), *default);
+                bytes.extend_from_slice(&r.to_le_bytes());
+                bytes.extend_from_slice(&g.to_le_bytes());
+                bytes.extend_from_slice(&b.to_le_bytes());
+                bytes.extend_from_slice(&[0u8; 4]); // pad to 16
+            }
+            "vec4" => {
+                let x = get_float(&format!("{key}_x"), *default);
+                let y = get_float(&format!("{key}_y"), *default);
+                let z = get_float(&format!("{key}_z"), *default);
+                let w = get_float(&format!("{key}_w"), *default);
+                bytes.extend_from_slice(&x.to_le_bytes());
+                bytes.extend_from_slice(&y.to_le_bytes());
+                bytes.extend_from_slice(&z.to_le_bytes());
+                bytes.extend_from_slice(&w.to_le_bytes()); // 16 bytes, no pad
+            }
+            "mat4" => {
+                // Identity matrix: 4 columns × 4 floats, column-major
+                let identity: [f32; 16] = [
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    0.0, 0.0, 0.0, 1.0,
+                ];
+                for f in identity { bytes.extend_from_slice(&f.to_le_bytes()); }
+            }
+            "mat3" => {
+                // std140 mat3: 3 columns × (vec3 + 4 bytes pad) = 3 × 16 bytes
+                let cols: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+                for col in cols {
+                    for f in col { bytes.extend_from_slice(&f.to_le_bytes()); }
+                    bytes.extend_from_slice(&[0u8; 4]);
+                }
+            }
+            _ => {
+                // float / int / bool / unknown: 4 bytes + 12 pad = 16 bytes
+                let val = get_float(key, *default);
+                bytes.extend_from_slice(&val.to_le_bytes());
+                bytes.extend_from_slice(&[0u8; 12]);
+            }
+        }
     }
+
     if bytes.is_empty() {
         bytes.extend_from_slice(&[0u8; 16]);
     }
