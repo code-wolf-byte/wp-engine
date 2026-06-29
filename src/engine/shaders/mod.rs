@@ -1,3 +1,4 @@
+pub mod compiler;
 pub mod effect_def;
 pub mod loader;
 pub mod particle_def;

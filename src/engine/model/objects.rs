@@ -23,6 +23,7 @@ pub struct ObjectModel {
     pub blend_mode: u32,
     pub effects: Vec<EffectModel>,
     pub particle: Option<serde_json::Value>,
+    pub copybackground: bool,
 }
 
 impl ObjectModel {

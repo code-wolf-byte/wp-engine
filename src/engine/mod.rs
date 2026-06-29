@@ -17,6 +17,7 @@ pub mod particle;
 pub mod pkg;
 pub mod render;
 pub mod scene;
+pub mod script;
 pub mod shaders;
 pub mod tex;
 

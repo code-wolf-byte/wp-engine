@@ -35,14 +35,17 @@ fn object_to_model(index: usize, obj: &scene::SceneObject) -> ObjectModel {
         name: obj.name.clone().unwrap_or_default(),
         image: obj.image.clone(),
         origin: obj.origin.as_ref().map(json_to_animated).unwrap_or_default(),
-        scale: obj.size.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
-        angles: AnimatedValue::default(),
-        alpha: AnimatedValue::from(1.0f32),
-        color: AnimatedValue::from([1.0f32, 1.0, 1.0]),
+        // WE "scale" is a vec3 multiplier applied to the layer's native texture dimensions.
+        // "size" is an optional pixel-dimension override (rarely set; texture size takes precedence).
+        scale: obj.scale.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
+        angles: obj.angles.as_ref().map(json_to_animated).unwrap_or_default(),
+        alpha: obj.alpha.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from(1.0f32)),
+        color: obj.color.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
         visible: obj.visible.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from(true)),
         blend_mode: obj.color_blend_mode,
         effects: obj.effects.iter().map(effect_to_model).collect(),
         particle: obj.particle.clone(),
+        copybackground: obj.copybackground,
     }
 }
 
@@ -65,7 +68,7 @@ fn pass_to_model(pass: &scene::Pass) -> PassModel {
         .collect();
 
     PassModel {
-        combos: HashMap::new(),
+        combos: pass.combos.clone(),
         shader_values,
         textures,
     }
@@ -75,9 +78,26 @@ fn json_to_animated(v: &serde_json::Value) -> AnimatedValue {
     match v {
         serde_json::Value::Object(map) => {
             if let (Some(script), Some(inner)) = (map.get("script"), map.get("value")) {
+                // {"script": "...", "value": X} — animated/scripted value
                 let script_src = script.as_str().unwrap_or("").to_string();
                 let inner_val = json_to_animated(inner);
                 AnimatedValue::scripted(inner_val.value, script_src)
+            } else if let Some(inner) = map.get("value") {
+                // {"user": "ui_editor_properties_*", "value": X} — user-configurable constant.
+                // This is the dominant format in WE scene JSON for all effect parameters.
+                // The "user" key is just a reference to the UI property name; we extract the value.
+                json_to_animated(inner)
+            } else {
+                AnimatedValue::default()
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            // [r, g, b] arrays used for Vec3 color values
+            let floats: Vec<f32> = arr.iter()
+                .filter_map(|x| x.as_f64().map(|f| f as f32))
+                .collect();
+            if floats.len() == 3 {
+                AnimatedValue::static_val(DynamicValue::Vec3([floats[0], floats[1], floats[2]]))
             } else {
                 AnimatedValue::default()
             }
@@ -92,8 +112,11 @@ fn json_to_animated(v: &serde_json::Value) -> AnimatedValue {
             let parts: Vec<f32> = s.split_whitespace()
                 .filter_map(|p| p.parse().ok())
                 .collect();
-            if parts.len() == 3 {
+            if parts.len() >= 3 {
                 AnimatedValue::static_val(DynamicValue::Vec3([parts[0], parts[1], parts[2]]))
+            } else if parts.len() == 2 {
+                // WE size strings are often "W H" without a z component; treat z as 1
+                AnimatedValue::static_val(DynamicValue::Vec3([parts[0], parts[1], 1.0]))
             } else {
                 AnimatedValue::static_val(DynamicValue::Str(s.clone()))
             }

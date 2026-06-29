@@ -15,7 +15,6 @@ use smithay_client_toolkit::{
 };
 use std::sync::{Arc, Mutex, mpsc::SyncSender};
 use std::thread;
-use std::time::Duration;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
@@ -84,6 +83,8 @@ struct WallpaperSurface {
     layer: LayerSurface,
     width: u32,
     height: u32,
+    /// Previous frame's SHM pool — kept alive until compositor releases the buffer.
+    pool: Option<SlotPool>,
 }
 
 struct WallpaperState {
@@ -93,29 +94,21 @@ struct WallpaperState {
     shm:               Shm,
     layer_shell:       LayerShell,
     surfaces:          Vec<WallpaperSurface>,
-    /// Live frame source — replaces the old static `image: RgbaImage`.
     frame_source:      FrameSource,
-    /// GPU-accelerated scaler (falls back to CPU on error).
     gpu_scaler:        platform::GpuScaler,
-    /// Render settings shared with the UI thread.
     settings:          Arc<Mutex<RenderSettings>>,
+    /// Queue handle stored so draw_at can request wl_surface_frame callbacks.
+    qh:                Option<QueueHandle<WallpaperState>>,
 }
 
 impl WallpaperState {
-    /// Draw the current frame onto the surface at `surfaces[idx]`.
-    ///
-    /// Takes `&self` (not `&mut self`) so the calloop timer callback can call
-    /// this after releasing the `&mut` borrow from `frame_source.try_advance()`.
-    /// The frame is obtained via `Arc::clone` — a cheap atomic refcount bump,
-    /// no pixel data is copied at this point.
-    fn draw_at(&self, idx: usize) {
+    fn draw_at(&mut self, idx: usize) {
         let width = self.surfaces[idx].width;
         let height = self.surfaces[idx].height;
         if width == 0 || height == 0 {
             return;
         }
 
-        // Cheap Arc clone — no image data is duplicated.
         let frame = std::sync::Arc::clone(self.frame_source.current_frame());
 
         let stride = width * 4;
@@ -140,15 +133,28 @@ impl WallpaperState {
             }
         };
 
-        // Scale frame to output resolution via GPU (falls back to CPU on error).
         let quality = self.settings.lock().unwrap().quality;
         let pixels = self.gpu_scaler.scale(frame.as_ref(), width, height, quality);
         canvas.copy_from_slice(&pixels);
 
         let wl_surf = self.surfaces[idx].layer.wl_surface();
+
+        // Request a wl_surface_frame callback before committing — only for
+        // animated sources. The callback fires after the compositor presents
+        // this frame, at which point we advance to the next frame and draw again.
+        // Static sources draw once on configure and never request more callbacks.
+        if self.frame_source.is_animated() {
+            if let Some(qh) = &self.qh {
+                wl_surf.frame(qh, wl_surf.clone());
+            }
+        }
+
         wl_surf.attach(Some(buffer.wl_buffer()), 0, 0);
         wl_surf.damage_buffer(0, 0, width as i32, height as i32);
         wl_surf.commit();
+
+        // Keep the SHM pool alive until the compositor reads the buffer.
+        self.surfaces[idx].pool = Some(pool);
     }
 }
 
@@ -192,6 +198,7 @@ fn wallpaper_loop(
         frame_source,
         gpu_scaler,
         settings,
+        qh: Some(qh.clone()),
     };
 
     // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces.
@@ -211,43 +218,6 @@ fn wallpaper_loop(
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
-
-    // ── Animated wallpapers: high-frequency poll, render only on new frames ────
-    //
-    // The decoder thread paces itself using the frame's PTS timestamps, so
-    // frames arrive at the video's native rate. We poll at 120 Hz (every 8 ms)
-    // to keep display latency low without tying render calls to a fixed-fps
-    // timer that might not match the video's actual frame rate.
-    //
-    // On each tick:
-    //   1. `try_advance()` takes at most ONE frame from the channel (&mut,
-    //      released before step 2).
-    //   2. Only if a new frame arrived, `draw_at` redraws every output
-    //      (&self borrow, no conflict with step 1).
-    //   3. Return `ToDuration` to reschedule.
-    if state.frame_source.is_animated() {
-        const POLL_INTERVAL: Duration = Duration::from_millis(8); // ~120 Hz
-
-        event_loop
-            .handle()
-            .insert_source(
-                calloop::timer::Timer::from_duration(POLL_INTERVAL),
-                |_deadline, _metadata, state: &mut WallpaperState| {
-                    // Step 1: try to pull the next frame (&mut, released here).
-                    if state.frame_source.try_advance() {
-                        // Step 2: new frame available — redraw all outputs.
-                        let n = state.surfaces.len();
-                        for idx in 0..n {
-                            state.draw_at(idx);
-                        }
-                    }
-
-                    // Step 3: reschedule.
-                    calloop::timer::TimeoutAction::ToDuration(POLL_INTERVAL)
-                },
-            )
-            .map_err(|e| anyhow!("timer source insert failed: {e}"))?;
-    }
 
     // Give the loop signal to the spawning thread before blocking.
     let _ = signal_tx.send(event_loop.get_signal());
@@ -272,9 +242,18 @@ impl CompositorHandler for WallpaperState {
         _: &wl_surface::WlSurface, _: wl_output::Transform,
     ) {}
     fn frame(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _time: u32,
-    ) {}
+        &mut self, _: &Connection, qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface, _time: u32,
+    ) {
+        // Compositor has presented the previous frame and is ready for the next.
+        // This mirrors linux-wallpaperengine's surfaceFrameCallback pattern.
+        let idx = self.surfaces.iter().position(|s| s.layer.wl_surface() == surface);
+        if let Some(idx) = idx {
+            self.qh = Some(qh.clone());
+            self.frame_source.try_advance();
+            self.draw_at(idx);
+        }
+    }
 }
 
 impl OutputHandler for WallpaperState {
@@ -302,7 +281,7 @@ impl OutputHandler for WallpaperState {
         layer.set_size(0, 0);
         layer.commit();
 
-        self.surfaces.push(WallpaperSurface { layer, width: 0, height: 0 });
+        self.surfaces.push(WallpaperSurface { layer, width: 0, height: 0, pool: None });
     }
 
     fn update_output(

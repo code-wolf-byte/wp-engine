@@ -19,8 +19,11 @@ pub struct Layer {
     pub image: RgbaImage,
     pub origin: [f64; 3],
     pub size: [f64; 3],
+    pub scale: [f64; 3],   // WE scale multiplier (default 1.0), separate from size
     pub parallax_depth: f64,
     pub blend_mode: u32,
+    /// True for WE "copybackground" layers — source is the rendered canvas so far.
+    pub copybackground: bool,
 }
 
 impl ResolvedScene {
@@ -56,12 +59,30 @@ impl ResolvedScene {
 
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
-            let Some(image_path) = obj.image.as_deref() else { continue };
-            if is_special_layer(image_path) || obj.particle.is_some() { continue; }
-            match load_texture_from_dir(dir, image_path) {
-                Ok(img) => layers.push(layer_from_object(obj, img)),
-                Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
+            if obj.particle.is_some() { continue; }
+            if obj.copybackground {
+                if !obj.effects.is_empty() {
+                    layers.push(layer_from_object(obj, placeholder_for(obj)));
+                }
+                continue;
             }
+            let img = match obj.image.as_deref() {
+                None => {
+                    if obj.effects.is_empty() { continue; }
+                    placeholder_for(obj)
+                }
+                Some(path) => {
+                    if is_special_layer(path) { continue; }
+                    match load_texture_from_dir(dir, path) {
+                        Ok(img) => img,
+                        Err(_) => {
+                            if obj.effects.is_empty() { continue; }
+                            placeholder_for(obj)
+                        }
+                    }
+                }
+            };
+            layers.push(layer_from_object(obj, img));
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
@@ -74,17 +95,39 @@ impl ResolvedScene {
 
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
-            let Some(image_path) = obj.image.as_deref() else { continue };
-            if is_special_layer(image_path) || obj.particle.is_some() { continue; }
-            let img = load_texture_from_pkg(pkg, image_path)
-                .or_else(|pkg_err| {
-                    load_texture_from_dir(dir, image_path)
-                        .map_err(|dir_err| anyhow::anyhow!("pkg: {pkg_err}; dir: {dir_err}"))
-                });
-            match img {
-                Ok(img) => layers.push(layer_from_object(obj, img)),
-                Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
+            if obj.particle.is_some() { continue; }
+            // copybackground layers use a transparent desktop capture we can't render.
+            // Use an opaque placeholder so screen-space effects have a visible base.
+            if obj.copybackground {
+                if !obj.effects.is_empty() {
+                    let ph = placeholder_for(obj);
+                    eprintln!("[DEBUG] copybackground layer '{}' → placeholder {}×{}", obj.name.as_deref().unwrap_or("?"), ph.width(), ph.height());
+                    layers.push(layer_from_object(obj, ph));
+                }
+                continue;
             }
+            let img = match obj.image.as_deref() {
+                None => {
+                    if obj.effects.is_empty() { continue; }
+                    placeholder_for(obj)
+                }
+                Some(path) => {
+                    if is_special_layer(path) { continue; }
+                    match load_texture_from_pkg(pkg, path)
+                        .or_else(|pkg_err| {
+                            load_texture_from_dir(dir, path)
+                                .map_err(|dir_err| anyhow::anyhow!("pkg: {pkg_err}; dir: {dir_err}"))
+                        })
+                    {
+                        Ok(img) => img,
+                        Err(_) => {
+                            if obj.effects.is_empty() { continue; }
+                            placeholder_for(obj)
+                        }
+                    }
+                }
+            };
+            layers.push(layer_from_object(obj, img));
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
@@ -97,12 +140,30 @@ impl ResolvedScene {
 
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
-            let Some(image_path) = obj.image.as_deref() else { continue };
-            if is_special_layer(image_path) || obj.particle.is_some() { continue; }
-            match load_texture_from_pkg(pkg, image_path) {
-                Ok(img) => layers.push(layer_from_object(obj, img)),
-                Err(e) => eprintln!("warn: skipping layer {:?}: {e}", obj.name),
+            if obj.particle.is_some() { continue; }
+            if obj.copybackground {
+                if !obj.effects.is_empty() {
+                    layers.push(layer_from_object(obj, placeholder_for(obj)));
+                }
+                continue;
             }
+            let img = match obj.image.as_deref() {
+                None => {
+                    if obj.effects.is_empty() { continue; }
+                    placeholder_for(obj)
+                }
+                Some(path) => {
+                    if is_special_layer(path) { continue; }
+                    match load_texture_from_pkg(pkg, path) {
+                        Ok(img) => img,
+                        Err(_) => {
+                            if obj.effects.is_empty() { continue; }
+                            placeholder_for(obj)
+                        }
+                    }
+                }
+            };
+            layers.push(layer_from_object(obj, img));
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
@@ -114,18 +175,86 @@ impl ResolvedScene {
         let mut canvas = RgbaImage::new(self.width, self.height);
 
         for layer in &self.layers {
-            let resized = if layer.image.width() != self.width || layer.image.height() != self.height {
-                image::imageops::resize(
-                    &layer.image,
-                    self.width,
-                    self.height,
-                    image::imageops::FilterType::Lanczos3,
-                )
+            let draw_w = if layer.size[0] != 0.0 {
+                (layer.size[0] * layer.scale[0]) as u32
+            } else {
+                layer.image.width()
+            };
+            let draw_h = if layer.size[1] != 0.0 {
+                (layer.size[1] * layer.scale[1]) as u32
+            } else {
+                layer.image.height()
+            };
+            if draw_w == 0 || draw_h == 0 {
+                continue;
+            }
+
+            let resized = if layer.image.width() != draw_w || layer.image.height() != draw_h {
+                image::imageops::resize(&layer.image, draw_w, draw_h, image::imageops::FilterType::Lanczos3)
             } else {
                 layer.image.clone()
             };
 
-            image::imageops::overlay(&mut canvas, &resized, 0, 0);
+            // WE origin is scene-center with Y-up; convert to top-left pixel coords.
+            let px = (self.width as f64 / 2.0 + layer.origin[0] - draw_w as f64 / 2.0) as i64;
+            let py = (self.height as f64 / 2.0 - layer.origin[1] - draw_h as f64 / 2.0) as i64;
+
+            match layer.blend_mode {
+                2 => {
+                    let cw = canvas.width() as i64;
+                    let ch = canvas.height() as i64;
+                    for y in 0..draw_h {
+                        for x in 0..draw_w {
+                            let cx = px + x as i64;
+                            let cy = py + y as i64;
+                            if cx >= 0 && cx < cw && cy >= 0 && cy < ch {
+                                let src = resized.get_pixel(x, y);
+                                let dst = canvas.get_pixel_mut(cx as u32, cy as u32);
+                                dst[0] = (dst[0] as u32 + src[0] as u32).min(255) as u8;
+                                dst[1] = (dst[1] as u32 + src[1] as u32).min(255) as u8;
+                                dst[2] = (dst[2] as u32 + src[2] as u32).min(255) as u8;
+                            }
+                        }
+                    }
+                }
+                4 => {
+                    let cw = canvas.width() as i64;
+                    let ch = canvas.height() as i64;
+                    for y in 0..draw_h {
+                        for x in 0..draw_w {
+                            let cx = px + x as i64;
+                            let cy = py + y as i64;
+                            if cx >= 0 && cx < cw && cy >= 0 && cy < ch {
+                                let src = resized.get_pixel(x, y);
+                                let dst = canvas.get_pixel_mut(cx as u32, cy as u32);
+                                dst[0] = (dst[0] as u32 * src[0] as u32 / 255) as u8;
+                                dst[1] = (dst[1] as u32 * src[1] as u32 / 255) as u8;
+                                dst[2] = (dst[2] as u32 * src[2] as u32 / 255) as u8;
+                            }
+                        }
+                    }
+                }
+                5 => {
+                    let cw = canvas.width() as i64;
+                    let ch = canvas.height() as i64;
+                    for y in 0..draw_h {
+                        for x in 0..draw_w {
+                            let cx = px + x as i64;
+                            let cy = py + y as i64;
+                            if cx >= 0 && cx < cw && cy >= 0 && cy < ch {
+                                let src = resized.get_pixel(x, y);
+                                let dst = canvas.get_pixel_mut(cx as u32, cy as u32);
+                                dst[0] = dst[0].max(src[0]);
+                                dst[1] = dst[1].max(src[1]);
+                                dst[2] = dst[2].max(src[2]);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    image::imageops::overlay(&mut canvas, &resized, px, py);
+                }
+            }
         }
 
         canvas
@@ -139,13 +268,23 @@ fn layer_from_object(obj: &SceneObject, img: RgbaImage) -> Layer {
         _ => 0.0,
     };
 
+    let scale = match &obj.scale {
+        Some(v) => {
+            let s = crate::engine::scene::parse_value_vec3(v).unwrap_or([1.0, 1.0, 1.0]);
+            s
+        }
+        None => [1.0, 1.0, 1.0],
+    };
+
     Layer {
         name: obj.name.clone().unwrap_or_default(),
         image: img,
         origin: obj.parsed_origin(),
         size: obj.parsed_size(),
+        scale,
         parallax_depth: parallax,
         blend_mode: obj.color_blend_mode,
+        copybackground: obj.copybackground,
     }
 }
 
@@ -345,6 +484,15 @@ fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
 
     // 3. Fallback
     (1920, 1080)
+}
+
+/// For model/copybackground layers we can't render, create a solid gray placeholder
+/// so any screen-space effects applied to them have a visible base to work with.
+fn placeholder_for(obj: &SceneObject) -> RgbaImage {
+    let size = obj.parsed_size();
+    let w = if size[0] > 0.0 { size[0] as u32 } else { 1920 };
+    let h = if size[1] > 0.0 { size[1] as u32 } else { 1080 };
+    RgbaImage::from_pixel(w, h, image::Rgba([140u8, 140, 140, 255]))
 }
 
 fn is_special_layer(image_path: &str) -> bool {

@@ -7,12 +7,16 @@ edition = "2021"
 name = "wp-engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "scan-wallpapers"
+path = "src/tests/scan_wallpapers.rs"
+
 [dependencies]
 # Wayland renderer
-smithay-client-toolkit = "0.18"
+smithay-client-toolkit  = "0.18"
 wayland-client          = "0.31"
 wayland-protocols-wlr   = "0.2"
-calloop                 = "0.12"
+calloop                 = { version = "0.12", features = ["executor"] }
 calloop-wayland-source  = "0.2"
 
 # GUI
@@ -34,7 +38,8 @@ clap = { version = "4", features = ["derive"] }
 
 # Platform Abstraction Layer – GPU enumeration + device creation
 wgpu     = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
-naga     = { version = "27", features = ["glsl-in", "wgsl-out"] }
+naga     = { version = "27", features = ["glsl-in", "wgsl-out", "spv-in"] }
+shaderc  = "0.8"
 pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
 
 # Engine – texture decompression + particles
@@ -44,3 +49,6 @@ fastrand = "2"
 # Utilities
 anyhow = "1"
 dirs   = "5"
+
+# Preview window (animation testing without Wayland)
+minifb = "0.27"

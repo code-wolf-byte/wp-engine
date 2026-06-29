@@ -66,6 +66,25 @@ enum Command {
         #[arg(long, default_value = "scene_output.png")]
         output: PathBuf,
     },
+    /// Preview an animated scene wallpaper in a window (for testing animation)
+    PreviewScene {
+        /// Workshop ID or directory path
+        id_or_path: String,
+        /// Window width
+        #[arg(long, default_value_t = 960)]
+        width: u32,
+        /// Window height
+        #[arg(long, default_value_t = 540)]
+        height: u32,
+    },
+    /// Test whether a scene wallpaper animates (headless — no window required)
+    TestScene {
+        /// Workshop ID or directory path
+        id_or_path: String,
+        /// Number of frames to collect (at 30fps, 60 = 2 seconds)
+        #[arg(long, default_value_t = 60)]
+        frames: usize,
+    },
 }
 
 fn main() {
@@ -82,6 +101,8 @@ fn main() {
         Some(Command::PkgInfo { path, dump }) => cmd_pkg_info(&path, dump.as_deref()),
         Some(Command::TexInfo { path, save }) => cmd_tex_info(&path, save.as_deref()),
         Some(Command::RenderScene { id_or_path, output }) => cmd_render_scene(&id_or_path, &output),
+        Some(Command::PreviewScene { id_or_path, width, height }) => cmd_preview_scene(&id_or_path, width, height),
+        Some(Command::TestScene { id_or_path, frames }) => cmd_test_scene(&id_or_path, frames),
     };
 
     if let Err(e) = result {
@@ -294,5 +315,140 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path) -> Result<()> {
     let img = scene.render();
     img.save(output)?;
     println!("Saved to {}", output.display());
+    Ok(())
+}
+
+fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
+    use std::sync::{Arc, mpsc::sync_channel};
+
+    let dir = std::path::PathBuf::from(id_or_path);
+    let dir = if dir.exists() {
+        dir
+    } else {
+        workshop::find_by_id(id_or_path)
+            .map(|w| w.path)
+            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
+    };
+
+    println!("GPU scene animation test: collecting {num_frames} frames from {}", dir.display());
+    let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
+    let render_dir = dir.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = crate::engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+            eprintln!("gpu scene error: {e}");
+        }
+    });
+
+    let mut collected = Vec::with_capacity(num_frames);
+    for i in 0..num_frames {
+        match rx.recv() {
+            Ok(frame) => {
+                if i == 0 || i == num_frames / 2 || i == num_frames - 1 {
+                    eprintln!("  frame {i}: {}x{}", frame.width(), frame.height());
+                }
+                collected.push(frame);
+            }
+            Err(_) => {
+                eprintln!("  channel closed after {} frames", collected.len());
+                break;
+            }
+        }
+    }
+
+    if collected.len() < 2 {
+        anyhow::bail!("not enough frames collected (got {})", collected.len());
+    }
+
+    // Compare frame[0] against every other frame; take the maximum change found.
+    // Using max rather than first-vs-last avoids false negatives when a periodic
+    // effect's endpoints happen to land near the same phase.
+    let first = collected.first().unwrap();
+    let first_bytes = first.as_raw();
+    let total_pixels = (first.width() * first.height()) as usize;
+
+    fn count_changed(a: &[u8], b: &[u8]) -> usize {
+        a.chunks(4).zip(b.chunks(4))
+            .filter(|(a, b)| {
+                let dr = (a[0] as i32 - b[0] as i32).abs();
+                let dg = (a[1] as i32 - b[1] as i32).abs();
+                let db = (a[2] as i32 - b[2] as i32).abs();
+                dr + dg + db > 6
+            })
+            .count()
+    }
+
+    let (best_frame, changed_pixels) = collected.iter().enumerate().skip(1)
+        .map(|(i, f)| (i, count_changed(first_bytes, f.as_raw())))
+        .max_by_key(|(_, n)| *n)
+        .unwrap_or((0, 0));
+
+    let pct = changed_pixels as f64 / total_pixels as f64 * 100.0;
+    println!("\nCollected {} frames at 30fps (~{:.1}s)", collected.len(), collected.len() as f64 / 30.0);
+    println!("Changed pixels (frame[0] vs frame[{best_frame}]): {changed_pixels}/{total_pixels} ({pct:.1}%)");
+
+    if pct > 0.1 {
+        println!("PASS: scene IS animating ({pct:.1}% of pixels changed)");
+    } else {
+        println!("FAIL: scene appears static (only {pct:.2}% changed — likely effect/rendering bug)");
+    }
+
+    // Save first and best-changed frames for visual inspection
+    let last = collected.last().unwrap();
+    first.save("/tmp/wp_frame_first.png")?;
+    last.save("/tmp/wp_frame_last.png")?;
+    println!("Saved /tmp/wp_frame_first.png and /tmp/wp_frame_last.png for visual comparison");
+
+    Ok(())
+}
+
+fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
+    use minifb::{Key, Window, WindowOptions};
+    use image::imageops::FilterType;
+    use std::sync::{Arc, mpsc::sync_channel};
+
+    let dir = std::path::PathBuf::from(id_or_path);
+    let dir = if dir.exists() {
+        dir
+    } else {
+        workshop::find_by_id(id_or_path)
+            .map(|w| w.path)
+            .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
+    };
+
+    println!("Loading scene from {}...", dir.display());
+    let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
+    let render_dir = dir.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = crate::engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+            eprintln!("gpu scene error: {e}");
+        }
+    });
+
+    println!("Waiting for first frame...");
+    let mut current = rx.recv()?;
+    println!("First frame received — opening {}x{} preview window. Press Esc to quit.", width, height);
+
+    let mut window = Window::new(
+        "wp-engine preview",
+        width as usize,
+        height as usize,
+        WindowOptions::default(),
+    )?;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        if let Ok(frame) = rx.try_recv() {
+            current = frame;
+        }
+
+        let scaled = image::imageops::resize(&*current, width, height, FilterType::Nearest);
+        let buf: Vec<u32> = scaled.pixels().map(|p| {
+            let [r, g, b, _a] = p.0;
+            (r as u32) << 16 | (g as u32) << 8 | b as u32
+        }).collect();
+
+        window.update_with_buffer(&buf, width as usize, height as usize).unwrap_or(());
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+
     Ok(())
 }

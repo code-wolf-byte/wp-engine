@@ -1,9 +1,47 @@
-// ── Fullscreen triangle vertex shader ─────────────────────────────────────────
+// ── Shared output struct ──────────────────────────────────────────────────────
 
 struct VsOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
 }
+
+// ── Vertex-quad shader (layer composite) ─────────────────────────────────────
+// Vertices carry pre-computed NDC positions and UVs.
+// Position is already in NDC space (computed on CPU from origin/size/scale/angle).
+
+@vertex
+fn vs_quad(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VsOutput {
+    var out: VsOutput;
+    out.position = vec4(pos, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+// ── WE dynamic-effect vertex shader ─────────────────────────────────────────
+// Default vertex shader for translated WE GLSL fragment shaders that declare
+// (vec4 v_TexCoord, vec2 v_Scroll) as their varyings. Fullscreen triangle.
+
+struct WeOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) v_TexCoord: vec4<f32>,
+    @location(1) v_Scroll: vec2<f32>,
+}
+
+@vertex
+fn vs_we_effect(@builtin(vertex_index) vi: u32) -> WeOutput {
+    var out: WeOutput;
+    let x = f32(i32(vi & 1u)) * 4.0 - 1.0;
+    let y = f32(i32(vi >> 1u)) * 4.0 - 1.0;
+    out.position = vec4(x, y, 0.0, 1.0);
+    let u = (x + 1.0) * 0.5;
+    let v = (1.0 - y) * 0.5;
+    out.v_TexCoord = vec4(u, v, u, v);
+    out.v_Scroll = vec2(u, v);
+    return out;
+}
+
+// ── Fullscreen triangle vertex shader (effects) ───────────────────────────────
+// Used for effect passes that fill the entire layer render target.
 
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> VsOutput {
@@ -26,28 +64,21 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> VsOutput {
 
 // ── Passthrough (compositing / layer blit) ───────────────────────────────────
 
+// CompositeParams: position/scale/rotation are baked into quad vertices on the CPU
+// (matching linux-wallpaperengine's vertex-buffer approach). Only per-layer
+// blending parameters remain here.
 struct CompositeParams {
     opacity: f32,
-    offset_x: f32,   // normalized UV offset from center (origin_pixels / canvas_width)
-    offset_y: f32,   // normalized UV offset from center (origin_pixels / canvas_height)
-    scale_x: f32,    // x scale factor (1.0 = no scaling)
-    // second vec4
-    scale_y: f32,    // y scale factor
-    _p1: f32,
-    _p2: f32,
-    _p3: f32,
+    _p1: f32, _p2: f32, _p3: f32,  // bytes 4-15 padding
+    color: vec3<f32>,               // byte 16 (vec3 alignment=16)
+    _p4: f32,                       // byte 28
 }
 @group(0) @binding(2) var<uniform> composite: CompositeParams;
 
 @fragment
 fn fs_composite(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let center = vec2(0.5 + composite.offset_x, 0.5 + composite.offset_y);
-    let local_uv = (uv - center) / vec2(composite.scale_x, composite.scale_y) + vec2(0.5);
-    if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) {
-        return vec4(0.0, 0.0, 0.0, 0.0);
-    }
-    let s = textureSample(src_tex, src_sampler, local_uv);
-    return vec4(s.rgb, s.a * composite.opacity);
+    let s = textureSample(src_tex, src_sampler, uv);
+    return vec4(s.rgb * composite.color, s.a * composite.opacity);
 }
 
 // ── Pulse ────────────────────────────────────────────────────────────────────

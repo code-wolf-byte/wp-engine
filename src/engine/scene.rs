@@ -42,6 +42,8 @@ pub struct General {
     pub speed: Option<f64>,
     #[serde(rename = "orthogonalprojection")]
     pub orthogonal_projection: Option<OrthogonalProjection>,
+    #[serde(rename = "clearcolor")]
+    pub clear_color: Option<String>,
 }
 
 /// A single object/layer in the scene.
@@ -55,6 +57,9 @@ pub struct SceneObject {
     pub origin: Option<serde_json::Value>,
     pub angles: Option<serde_json::Value>,
     pub size: Option<serde_json::Value>,
+    pub scale: Option<serde_json::Value>,
+    pub alpha: Option<serde_json::Value>,
+    pub color: Option<serde_json::Value>,
     #[serde(rename = "parallaxDepth")]
     pub parallax_depth: Option<serde_json::Value>,
     pub image: Option<String>,
@@ -63,6 +68,12 @@ pub struct SceneObject {
     pub effects: Vec<Effect>,
     #[serde(rename = "colorBlendMode", default)]
     pub color_blend_mode: u32,
+    #[serde(default)]
+    pub copybackground: bool,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 impl SceneObject {
@@ -97,6 +108,8 @@ pub struct Effect {
 #[derive(Debug, Deserialize)]
 pub struct Pass {
     pub material: Option<String>,
+    #[serde(default)]
+    pub combos: std::collections::HashMap<String, i32>,
     #[serde(default, deserialize_with = "deserialize_textures")]
     pub textures: Vec<TextureRef>,
     #[serde(default)]
@@ -151,6 +164,46 @@ impl Scene {
             .collect()
     }
 
+    pub fn topological_render_order(&self) -> Vec<&SceneObject> {
+        let mut name_to_index = std::collections::HashMap::new();
+        for (i, obj) in self.objects.iter().enumerate() {
+            if let Some(name) = &obj.name {
+                name_to_index.insert(name.clone(), i);
+            }
+        }
+        let mut visited = vec![false; self.objects.len()];
+        let mut result = Vec::with_capacity(self.objects.len());
+        for i in 0..self.objects.len() {
+            if !visited[i] {
+                Self::topo_dfs(i, &self.objects, &mut visited, &mut result, &name_to_index);
+            }
+        }
+        result
+    }
+
+    fn topo_dfs<'a>(
+        index: usize,
+        objects: &'a [SceneObject],
+        visited: &mut Vec<bool>,
+        result: &mut Vec<&'a SceneObject>,
+        name_to_index: &std::collections::HashMap<String, usize>,
+    ) {
+        if visited[index] { return; }
+        visited[index] = true;
+        let obj = &objects[index];
+        for dep in &obj.dependencies {
+            if let Some(&di) = name_to_index.get(dep) {
+                Self::topo_dfs(di, objects, visited, result, name_to_index);
+            }
+        }
+        if let Some(parent) = &obj.parent {
+            if let Some(&pi) = name_to_index.get(parent) {
+                Self::topo_dfs(pi, objects, visited, result, name_to_index);
+            }
+        }
+        result.push(obj);
+    }
+
     pub fn texture_paths(&self) -> Vec<&str> {
         let mut paths: Vec<&str> = self.image_paths();
         for obj in &self.objects {
@@ -178,7 +231,7 @@ fn parse_vec3(s: Option<&str>) -> [f64; 3] {
     ]
 }
 
-fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
+pub fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
     match v {
         serde_json::Value::String(s) => {
             let r = parse_vec3(Some(s));

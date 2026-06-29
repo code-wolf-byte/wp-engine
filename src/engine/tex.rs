@@ -8,6 +8,7 @@ pub enum TexFormat {
     R8,
     Rg88,
     Rgb888,
+    Rgb565,
     Dxt1,
     Dxt3,
     Dxt5,
@@ -18,16 +19,15 @@ pub enum TexFormat {
 impl TexFormat {
     fn from_u32(v: u32) -> Result<Self> {
         match v {
-            0 => Ok(Self::Rgba8),
-            1 => Ok(Self::R8),
-            2 => Ok(Self::Rg88),
-            3 => Ok(Self::Rgb888),
-            4 => Ok(Self::Dxt1),
-            5 => Ok(Self::Dxt3),
-            6 => Ok(Self::Dxt3),
-            7 => Ok(Self::Bc4),
-            8 => Ok(Self::Dxt5),
-            9 => Ok(Self::Bc7),
+            0 => Ok(Self::Rgba8),   // ARGB8888 (stored BGRA — swap in to_rgba)
+            1 => Ok(Self::Rgb888),  // RGB888
+            2 => Ok(Self::Rgb565),  // RGB565
+            4 => Ok(Self::Dxt5),   // DXT5
+            6 => Ok(Self::Dxt3),   // DXT3
+            7 => Ok(Self::Dxt1),   // DXT1
+            8 => Ok(Self::Rg88),   // RG88
+            9 => Ok(Self::R8),     // R8
+            12 => Ok(Self::Bc7),   // BC7
             other => bail!("unknown .tex format id: {other}"),
         }
     }
@@ -36,7 +36,7 @@ impl TexFormat {
         match self {
             Self::Dxt1 | Self::Bc4 => 8,
             Self::Dxt3 | Self::Dxt5 | Self::Bc7 => 16,
-            Self::Rgba8 | Self::R8 | Self::Rg88 | Self::Rgb888 => 0,
+            Self::Rgba8 | Self::R8 | Self::Rg88 | Self::Rgb888 | Self::Rgb565 => 0,
         }
     }
 }
@@ -145,6 +145,17 @@ impl TexFile {
                     let _unk = read_u32(&mut cur)?;
                     mipmap_count
                 }
+                b"0004" => {
+                    let _free_image_format = read_u32(&mut cur)?;
+                    let _is_video_mp4 = read_u32(&mut cur)?;
+                    let _image_count = read_u32(&mut cur)?;
+                    let _flags = read_u32(&mut cur)?;
+                    let mipmap_count = read_u32(&mut cur)?;
+                    let _tw = read_u32(&mut cur)?;
+                    let _th = read_u32(&mut cur)?;
+                    let _unk = read_u32(&mut cur)?;
+                    mipmap_count
+                }
                 _ => {
                     let _image_count = read_u32(&mut cur)?;
                     let _flags = read_u32(&mut cur)?;
@@ -157,11 +168,7 @@ impl TexFile {
                 }
             };
 
-            let v5_format_id = match format_id {
-                4 => 8,  // V0005 format 4 = DXT5 (16B/block), not DXT1
-                other => other,
-            };
-            let format = TexFormat::from_u32(v5_format_id)?;
+            let format = TexFormat::from_u32(format_id)?;
             let mipmaps = read_mipmaps_v5(&mut cur, mipmap_count)?;
 
             return Ok(Self { format, image_width, image_height, texture_width, texture_height, mipmaps });
@@ -188,7 +195,10 @@ impl TexFile {
         let mip = self.mipmaps.first().context("no mipmaps in .tex file")?;
 
         let rgba = match self.format {
-            TexFormat::Rgba8 => mip.data.clone(),
+            // WE stores ARGB8888 as BGRA in memory; swap R and B to produce RGBA.
+            TexFormat::Rgba8 => mip.data.chunks_exact(4)
+                .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
+                .collect(),
             TexFormat::R8 => {
                 mip.data.iter().flat_map(|&r| [r, r, r, 255]).collect()
             }
@@ -207,6 +217,9 @@ impl TexFile {
                     [r, g, b, 255]
                 }).collect()
             }
+            TexFormat::Rgb565 => mip.data.chunks_exact(2)
+                .flat_map(|b| rgb565_to_rgba(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
             TexFormat::Dxt1 => decode_dxt1(&mip.data, self.texture_width, self.texture_height),
             TexFormat::Dxt3 => decode_dxt3(&mip.data, self.texture_width, self.texture_height),
             TexFormat::Dxt5 => decode_dxt5(&mip.data, self.texture_width, self.texture_height),

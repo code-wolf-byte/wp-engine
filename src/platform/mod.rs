@@ -1,6 +1,9 @@
 pub mod device;
 pub mod display;
 pub mod gpu;
+#[cfg(target_os = "macos")]
+pub mod macos;
+pub mod platform_info;
 pub mod scaler;
 pub mod wayland;
 

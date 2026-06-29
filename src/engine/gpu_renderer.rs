@@ -335,6 +335,7 @@ impl GpuSceneRenderer {
         effects: &[(usize, &str, &[u8])],
         target: &wgpu::Texture,
         w: u32, h: u32,
+        clear_color: [f64; 3],
     ) {
         let target_view = target.create_view(&Default::default());
 
@@ -349,7 +350,9 @@ impl GpuSceneRenderer {
                     view: &target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_color[0], g: clear_color[1], b: clear_color[2], a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -376,11 +379,12 @@ impl GpuSceneRenderer {
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     });
-                    // dummy: opacity=1, offset=0, scale=1 for effect intermediate passes
+                    // CompositeParams: opacity=1, color=(1,1,1) — pass-through for effect intermediates
                     let mut dummy_composite = [0u8; 32];
-                    dummy_composite[0..4].copy_from_slice(&1.0f32.to_le_bytes());
-                    dummy_composite[12..16].copy_from_slice(&1.0f32.to_le_bytes());
-                    dummy_composite[16..20].copy_from_slice(&1.0f32.to_le_bytes());
+                    dummy_composite[0..4].copy_from_slice(&1.0f32.to_le_bytes());   // opacity
+                    dummy_composite[16..20].copy_from_slice(&1.0f32.to_le_bytes()); // color.r
+                    dummy_composite[20..24].copy_from_slice(&1.0f32.to_le_bytes()); // color.g
+                    dummy_composite[24..28].copy_from_slice(&1.0f32.to_le_bytes()); // color.b
                     self.queue.write_buffer(&composite_buf, 0, &dummy_composite);
 
                     let base_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -434,12 +438,12 @@ impl GpuSceneRenderer {
                 }
             }
 
+            // CompositeParams WGSL layout: opacity(0), pad(4-15), color.r(16), color.g(20), color.b(24)
             let mut composite_data = [0u8; 32];
             composite_data[0..4].copy_from_slice(&opacity.to_le_bytes());
-            composite_data[4..8].copy_from_slice(&offset_norm[0].to_le_bytes());
-            composite_data[8..12].copy_from_slice(&offset_norm[1].to_le_bytes());
-            composite_data[12..16].copy_from_slice(&scale[0].to_le_bytes());
-            composite_data[16..20].copy_from_slice(&scale[1].to_le_bytes());
+            composite_data[16..20].copy_from_slice(&1.0f32.to_le_bytes()); // color.r
+            composite_data[20..24].copy_from_slice(&1.0f32.to_le_bytes()); // color.g
+            composite_data[24..28].copy_from_slice(&1.0f32.to_le_bytes()); // color.b
 
             let composite_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None, size: 32,
@@ -481,10 +485,16 @@ impl GpuSceneRenderer {
     }
 
     pub fn readback(&self, target: &wgpu::Texture, w: u32, h: u32) -> Result<RgbaImage> {
-        let output_size = (w * h * 4) as u64;
+        // wgpu requires bytes_per_row to be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT (256).
+        // Widths not divisible by 64 (e.g. 1080, 1366) would panic without this padding.
+        let unpadded_bpr = w * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bpr = (unpadded_bpr + align - 1) / align * align;
+        let staging_size = (padded_bpr * h) as u64;
+
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: output_size,
+            size: staging_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -499,7 +509,7 @@ impl GpuSceneRenderer {
                 buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(w * 4),
+                    bytes_per_row: Some(padded_bpr),
                     rows_per_image: Some(h),
                 },
             },
@@ -510,13 +520,18 @@ impl GpuSceneRenderer {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         rx.recv()
             .map_err(|_| anyhow!("readback channel disconnected"))?
             .map_err(|e| anyhow!("buffer map failed: {e:?}"))?;
 
         let data = slice.get_mapped_range();
-        let pixels = data.to_vec();
+        // Strip row padding to produce a tightly-packed RGBA image.
+        let pixels: Vec<u8> = data
+            .chunks(padded_bpr as usize)
+            .flat_map(|row| &row[..unpadded_bpr as usize])
+            .copied()
+            .collect();
         drop(data);
         staging.unmap();
 
@@ -540,6 +555,14 @@ pub fn gpu_scene_render_loop(
     let h = resolved.height;
 
     let scene_model = crate::engine::model::scene_to_model(&resolved.scene)?;
+
+    let clear_color: [f64; 3] = resolved.scene.general.as_ref()
+        .and_then(|g| g.clear_color.as_deref())
+        .and_then(|s| {
+            let parts: Vec<f64> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            if parts.len() >= 3 { Some([parts[0], parts[1], parts[2]]) } else { None }
+        })
+        .unwrap_or([0.0, 0.0, 0.0]);
 
     let gpu_layers: Vec<_> = resolved.layers.iter().enumerate()
         .map(|(i, l)| {
@@ -584,7 +607,8 @@ pub fn gpu_scene_render_loop(
                 WEBlending::from_str(blending_str),
             );
             let Ok(translated) = transpiler::translate(&model) else { continue; };
-            if let Err(e) = renderer.add_dynamic_pipeline(effect_name.clone(), &translated.wgsl, translated.uniform_keys) {
+            let keys: Vec<(String, f32)> = translated.uniform_keys.iter().map(|u| (u.key.clone(), u.default)).collect();
+            if let Err(e) = renderer.add_dynamic_pipeline(effect_name.clone(), &translated.wgsl, keys) {
                 eprintln!("dynamic shader '{}' failed: {e}", effect_name);
             }
         }
@@ -616,7 +640,7 @@ pub fn gpu_scene_render_loop(
         let layer_refs: Vec<(&wgpu::Texture, f32, u32, [f32; 2], [f32; 2])> = gpu_layers.iter()
             .map(|(t, o, b, off, sc)| (t, *o, *b, *off, *sc))
             .collect();
-        renderer.render_frame(&layer_refs, &effect_refs, &target, w, h);
+        renderer.render_frame(&layer_refs, &effect_refs, &target, w, h, clear_color);
 
         let frame = renderer.readback(&target, w, h)?;
         if tx.send(Arc::new(frame)).is_err() {
@@ -669,8 +693,17 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<(usize, Stri
 fn make_params_from_translated(keys: &[(String, f32)], time: f32, vals: &ShaderVals) -> Vec<u8> {
     let mut bytes = Vec::new();
     for (key, default) in keys {
-        let val = if key.to_lowercase().contains("time") {
+        let k = key.to_lowercase();
+        let val = if k.contains("time") {
             time
+        } else if k == "g_alpha" || k == "g_useralpha" {
+            vals.get(key).copied().unwrap_or(1.0)
+        } else if k == "g_brightness" {
+            vals.get(key).copied().unwrap_or(1.0)
+        } else if k == "g_color" {
+            vals.get(key).copied().unwrap_or(1.0)
+        } else if k == "g_lightambientcolor" || k == "g_lightskylightcolor" {
+            vals.get(key).copied().unwrap_or(1.0)
         } else {
             vals.get(key).copied().unwrap_or(*default)
         };
@@ -699,10 +732,10 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "ui_editor_properties_power", 1.0),
             get(vals, "ui_editor_properties_pulse_phase", 0.0),
             0.0, 0.0, 0.0,
-            // tint_low RGB (default white)
-            get(vals, "ui_editor_properties_tint_low_r", 1.0),
-            get(vals, "ui_editor_properties_tint_low_g", 1.0),
-            get(vals, "ui_editor_properties_tint_low_b", 1.0),
+            // tint_low: 0.5 so pulse oscillates 50%–100% brightness
+            get(vals, "ui_editor_properties_tint_low_r", 0.5),
+            get(vals, "ui_editor_properties_tint_low_g", 0.5),
+            get(vals, "ui_editor_properties_tint_low_b", 0.5),
             0.0, // pad
             // tint_high RGB (default white)
             get(vals, "ui_editor_properties_tint_high_r", 1.0),
