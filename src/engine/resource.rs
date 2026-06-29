@@ -1,77 +1,150 @@
-use anyhow::{anyhow, Result};
+//! Central GPU resource manager.
+//!
+//! [`ResourceManager`] owns the wgpu device/queue references and caches all
+//! GPU-side textures. Every other module that needs a texture should obtain it
+//! through this manager rather than uploading its own copy.
+
+use anyhow::{Context, Result};
+use image::RgbaImage;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-// Assuming a simplified GPU texture handle for demonstration purposes.
-// In a real wgpu setup, this would be a wgpu::Texture object or wrapper.
-pub type GpuTextureHandle = u64; 
+use crate::engine::pkg::Package;
+use crate::engine::tex::TexFile;
+use crate::engine::shaders::loader;
 
-/// Manages the lifecycle and access to all loaded GPU resources (textures, materials).
-/// This acts as the central singleton cache required by modern rendering engines.
 pub struct ResourceManager {
-    // Maps resource identifiers (file paths, names) to their GPU handle.
-    texture_cache: Mutex<HashMap<String, GpuTextureHandle>>,
-    // Stores the actual texture data/info associated with the handle.
-    loaded_textures: HashMap<GpuTextureHandle, String>, 
-
-    // Placeholder for other resource types (e.g., ShaderProgram handles)
-    // shader_cache: Mutex<HashMap<String, GpuShaderProgram>>,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    sampler: wgpu::Sampler,
+    dummy_texture: Arc<wgpu::Texture>,
+    texture_cache: Mutex<HashMap<String, Arc<wgpu::Texture>>>,
 }
 
 impl ResourceManager {
-    /// Creates a new singleton instance of the Resource Manager.
-    pub fn new() -> Self {
-        Self {
-            texture_cache: Mutex::new(HashMap::new()),
-            loaded_textures: HashMap::new(),
-        }
+    /// Create a new `ResourceManager` owning the given device and queue.
+    /// Creates a bilinear-repeat sampler and a 1×1 white dummy texture.
+    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("rm_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let dummy_texture = Arc::new(Self::create_white_1x1(&device, &queue));
+        Self { device, queue, sampler, dummy_texture, texture_cache: Mutex::new(HashMap::new()) }
     }
 
-    /// Retrieves or loads a texture given a file path or resource ID.
-    /// 
-    /// This is the primary public interface for all resource consumers.
-    pub fn get_texture(&self, identifier: &str) -> Result<GpuTextureHandle> {
-        // Check cache first
+    /// Return a cached texture or load it on demand.
+    ///
+    /// Resolution order:
+    /// 1. In-memory cache.
+    /// 2. `pkg`, if provided — decoded via [`TexFile`].
+    /// 3. WE global assets directory (via [`loader::find_we_assets_dir`]).
+    pub fn get_or_load(&self, key: &str, pkg: Option<&Package>) -> Result<Arc<wgpu::Texture>> {
         {
             let cache = self.texture_cache.lock().unwrap();
-            if let Some(&handle) = cache.get(identifier) {
-                return Ok(handle);
+            if let Some(tex) = cache.get(key) {
+                return Ok(Arc::clone(tex));
             }
         }
 
-        // Resource not found, must load it (simulate loading process)
-        println!("ResourceManager: Loading texture for '{}'...", identifier);
-        let new_handle = self.load_texture_from_disk(identifier)?; // The actual GPU upload happens here
-        
-        // Store in cache
-        {
-            let mut cache = self.texture_cache.lock().unwrap();
-            cache.insert(identifier.to_owned(), new_handle);
+        if let Some(package) = pkg {
+            if let Some(bytes) = package.get(key) {
+                let img = TexFile::parse(bytes)
+                    .with_context(|| format!("parsing tex from pkg: {key}"))?
+                    .to_rgba()
+                    .with_context(|| format!("decoding RGBA from pkg tex: {key}"))?;
+                let tex = Arc::new(self.upload_rgba(&img));
+                self.texture_cache.lock().unwrap().insert(key.to_owned(), Arc::clone(&tex));
+                return Ok(tex);
+            }
         }
 
-        Ok(new_handle)
+        let tex = Arc::new(self.load_from_disk(key)
+            .with_context(|| format!("loading texture from disk: {key}"))?);
+        self.texture_cache.lock().unwrap().insert(key.to_owned(), Arc::clone(&tex));
+        Ok(tex)
     }
 
-
-    /// Placeholder for actual GPU loading logic (e.g., calling wgpu::SurfaceTexture::create).
-    fn load_texture_from_disk(&self, identifier: &str) -> Result<GpuTextureHandle> {
-        // In a real implementation, this would read the file (JPEG/PNG), 
-        // upload it to VRAM via wgpu, and return the resulting GPU handle.
-
-        // For now, we use a simple hash to simulate unique handles.
-        let pseudo_handle: GpuTextureHandle = identifier.chars().fold(1337, |acc, c| acc * 31 + c as u64);
-        Ok(pseudo_handle)
+    /// Store a pre-built texture under `key`.
+    pub fn store(&self, key: String, tex: Arc<wgpu::Texture>) {
+        self.texture_cache.lock().unwrap().insert(key, tex);
     }
 
-    /// Stores a texture explicitly, useful for dynamic/runtime generated textures.
-    pub fn store_texture(&self, name: &str, handle: GpuTextureHandle) {
-        let mut cache = self.texture_cache.lock().unwrap();
-        if !cache.contains_key(name) {
-            println!("ResourceManager: Storing new dynamic texture for '{}' with handle {}", name, handle);
-            cache.insert(name.to_owned(), handle);
-            self.loaded_textures.insert(handle, name.to_string());
-        }
+    /// Upload an [`RgbaImage`] to the GPU. Not cached — use [`store`] if caching is needed.
+    pub fn upload_rgba(&self, img: &RgbaImage) -> wgpu::Texture {
+        let (w, h) = img.dimensions();
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("rm_rgba_tex"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            img.as_raw(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        tex
     }
 
-    // Other methods for other resources (e.g., get_shader, get_mesh) would go here.
+    /// Upload multiple animation frames. Returns Vec in frame order. Not cached.
+    pub fn upload_frames(&self, frames: Vec<RgbaImage>) -> Vec<Arc<wgpu::Texture>> {
+        frames.iter().map(|img| Arc::new(self.upload_rgba(img))).collect()
+    }
+
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
+    pub fn sampler(&self) -> &wgpu::Sampler { &self.sampler }
+
+    /// 1×1 opaque-white texture for unbound texture slots.
+    pub fn dummy_texture(&self) -> Arc<wgpu::Texture> { Arc::clone(&self.dummy_texture) }
+
+    fn create_white_1x1(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy_white_1x1"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            tex.as_image_copy(),
+            &[255u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        tex
+    }
+
+    fn load_from_disk(&self, key: &str) -> Result<wgpu::Texture> {
+        let assets_dir = loader::find_we_assets_dir()
+            .with_context(|| format!("WE assets dir not found while loading '{key}'"))?;
+        let candidates = [assets_dir.join(key), assets_dir.join(format!("{key}.tex"))];
+        let bytes = candidates.iter()
+            .find_map(|p| std::fs::read(p).ok())
+            .with_context(|| format!("texture '{key}' not found in WE assets dir"))?;
+        let img = TexFile::parse(&bytes)
+            .with_context(|| format!("parsing tex '{key}'"))?
+            .to_rgba()
+            .with_context(|| format!("decoding RGBA '{key}'"))?;
+        Ok(self.upload_rgba(&img))
+    }
 }

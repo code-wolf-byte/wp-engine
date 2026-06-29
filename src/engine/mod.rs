@@ -1,47 +1,48 @@
 //! Wallpaper Engine scene rendering engine.
 //!
-//! Phases:
-//!   [`pkg`]      — PKG archive extractor        (Phase 1) ✓
-//!   [`tex`]      — .tex texture decoder          (Phase 2) ✓
-//!   [`resource`] — Central resource cache and management (NEW) (Phase 0) ✅
-//!   [`scene`]    — scene.json parser             (Phase 3) ✓
-//!   [`render`]   — structured GPU rendering pipeline (Phase 4) ✓
-//!   [`particle`] — particle system               (Phase 5) ✓
-//!   [`effect`]   — Shader effects computation       (Phase 6) ✓
+//! Core modules:
+//!   [`pkg`]           — PKG archive extractor
+//!   [`tex`]           — .tex texture decoder
+//!   [`scene`]         — scene.json parser
+//!   [`render`]        — CPU-side scene resolver (Layer)
+//!   [`resource`]      — Central GPU resource cache (ResourceManager)
+//!   [`fbo`]           — Named GPU render targets (RenderTarget / CFBO)
+//!   [`camera`]        — Orthogonal scene camera (SceneCamera)
+//!   [`pass`]          — Single render pass descriptor (ScenePass / CPass)
+//!   [`engine_object`] — GPU scene object (SceneObject / CImage)
+//!   [`engine`]        — Top-level scene engine (SceneEngine / CScene)
+//!   [`gpu_renderer`]  — Low-level wgpu pipeline executor
+//!   [`particle`]      — Particle system
+//!   [`effect`]        — Shader effect definitions
+//!   [`shaders`]       — GLSL → WGSL transpiler + loader
 
 pub mod animated;
-pub mod stubs;
-pub mod gpu_renderer;
+pub mod camera;
 pub mod effect;
+pub mod engine;
+pub mod engine_object;
+pub mod fbo;
+pub mod gpu_renderer;
 pub mod model;
 pub mod particle;
+pub mod pass;
 pub mod pkg;
 pub mod render;
+pub mod resource;
 pub mod scene;
 pub mod script;
 pub mod shaders;
 pub mod tex;
 
-// New central resource management module: handles textures, shaders, meshes.
-pub mod resource;
-
-// Exporting the central resource manager.
-pub use resource::ResourceManager;
+// Convenience re-exports.
+pub use camera::SceneCamera;
+pub use engine::SceneEngine;
+pub use engine_object::{SceneObject, SceneObjectBuilder};
+pub use fbo::{RenderTarget, RenderTargetPool};
+pub use pass::{ScenePass, UniformValue};
 pub use pkg::Package;
 pub use render::ResolvedScene;
+pub use resource::ResourceManager;
 pub use scene::Scene;
 pub use tex::TexFile;
 
-/**
- * Global access point for the engine's core functionality. 
- * This should be initialized once at application startup.
- */
-pub type GlobalResourceManager = Arc<ResourceManager>;
-
-
-fn main_engine_startup() {
-    // Placeholder function demonstrating where the resource manager is instantiated and passed to all modules.
-    let _resource_manager = Arc::new(ResourceManager::new());
-
-    println!("Engine initialized with global Resource Manager.");
-}
