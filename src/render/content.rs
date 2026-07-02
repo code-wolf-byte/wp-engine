@@ -14,7 +14,7 @@ pub enum WallpaperContent {
     /// A pre-loaded static RGBA image (PNG, JPEG, …).
     Static(Arc<RgbaImage>),
     /// A video file to be decoded frame-by-frame with FFmpeg.
-    Video { path: PathBuf, fps: f64 },
+    Video { path: PathBuf },
     /// A scene wallpaper — rendered by compositing decoded .tex layers.
     Scene { dir: PathBuf },
     // Future variants (not yet implemented):
@@ -35,13 +35,14 @@ impl WallpaperContent {
                 if dir.join("scene.json").exists() || dir.join("scene.pkg").exists() {
                     Ok(WallpaperContent::Scene { dir })
                 } else {
-                    Err(anyhow!("scene wallpaper missing scene.json and scene.pkg in {}", dir.display()))
+                    Err(anyhow!(
+                        "scene wallpaper missing scene.json and scene.pkg in {}",
+                        dir.display()
+                    ))
                 }
             }
             WallpaperType::Web => Err(anyhow!("web wallpapers are not yet supported")),
-            WallpaperType::Application => {
-                Err(anyhow!("application wallpapers are Windows-only"))
-            }
+            WallpaperType::Application => Err(anyhow!("application wallpapers are Windows-only")),
             WallpaperType::Video | WallpaperType::Unknown => {
                 let path = w
                     .wallpaper_file()
@@ -66,10 +67,9 @@ impl WallpaperContent {
             .to_lowercase();
 
         match ext.as_str() {
-            "mp4" | "webm" | "mkv" | "avi" | "mov" | "flv" | "wmv" => {
-                let fps = super::ffmpeg::probe_fps(path)?;
-                Ok(WallpaperContent::Video { path: path.to_owned(), fps })
-            }
+            "mp4" | "webm" | "mkv" | "avi" | "mov" | "flv" | "wmv" => Ok(WallpaperContent::Video {
+                path: path.to_owned(),
+            }),
             _ => {
                 let img = image::open(path)
                     .map_err(|e| anyhow!("failed to load image {}: {}", path.display(), e))?

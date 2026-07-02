@@ -41,16 +41,22 @@ pub struct SceneObject {
 impl SceneObject {
     /// Advance animation by `dt_ms` milliseconds.
     pub fn tick(&mut self, _dt_ms: f64) {
-        if self.frame_duration_ms == 0 || self.base_frames.len() <= 1 { return; }
+        if self.frame_duration_ms == 0 || self.base_frames.len() <= 1 {
+            return;
+        }
         self.current_frame = (self.current_frame + 1) % self.base_frames.len();
     }
 
     /// Return the texture for the current animation frame.
     pub fn current_texture(&self) -> &wgpu::Texture {
-        &self.base_frames[self.current_frame.min(self.base_frames.len().saturating_sub(1))]
+        &self.base_frames[self
+            .current_frame
+            .min(self.base_frames.len().saturating_sub(1))]
     }
 
-    pub fn has_effects(&self) -> bool { !self.passes.is_empty() }
+    pub fn has_effects(&self) -> bool {
+        !self.passes.is_empty()
+    }
 
     pub fn is_animated(&self) -> bool {
         self.base_frames.len() > 1 && self.frame_duration_ms > 0
@@ -96,7 +102,7 @@ impl SceneObjectBuilder {
     /// Allocate per-object FBOs at scene dimensions and assemble the [`SceneObject`].
     pub fn build(self, device: &wgpu::Device, w: u32, h: u32) -> SceneObject {
         let primary_fbo = RenderTarget::new(device, format!("{}_primary", self.name), w, h);
-        let sub_fbo     = RenderTarget::new(device, format!("{}_sub",     self.name), w, h);
+        let sub_fbo = RenderTarget::new(device, format!("{}_sub", self.name), w, h);
         SceneObject {
             id: self.id,
             name: self.name,

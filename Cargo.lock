@@ -4844,6 +4844,7 @@ name = "wp-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "calloop 0.12.4",
  "calloop-wayland-source 0.2.0",
  "clap",

@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,9 @@ enum Status {
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Status::Pass   => write!(f, "PASS"),
+            Status::Pass => write!(f, "PASS"),
             Status::Static => write!(f, "STATIC"),
-            Status::Fail   => write!(f, "FAIL"),
+            Status::Fail => write!(f, "FAIL"),
         }
     }
 }
@@ -94,14 +94,22 @@ fn bucket_errors(output: &str) -> Vec<String> {
     let mut buckets = Vec::new();
     for line in output.lines() {
         let l = line.trim();
-        if l.starts_with("warning") { continue; }
+        if l.starts_with("warning") {
+            continue;
+        }
         if l.contains("shaderc") && l.contains("error") {
             buckets.push("glslang_compile".to_string());
-        } else if l.contains("naga SPIR-V") || l.contains("naga validation") || l.contains("naga WGSL") {
+        } else if l.contains("naga SPIR-V")
+            || l.contains("naga validation")
+            || l.contains("naga WGSL")
+        {
             buckets.push("naga".to_string());
         } else if l.contains("panicked") || l.contains("panic") {
             buckets.push("panic".to_string());
-        } else if l.contains("wgpu error") || l.contains("Validation Error") || l.contains("pipeline failed") {
+        } else if l.contains("wgpu error")
+            || l.contains("Validation Error")
+            || l.contains("pipeline failed")
+        {
             buckets.push("wgpu_validation".to_string());
         } else if l.contains("translation failed") {
             buckets.push("translation".to_string());
@@ -114,10 +122,12 @@ fn bucket_errors(output: &str) -> Vec<String> {
 }
 
 fn extract_result_lines(output: &str) -> Vec<String> {
-    output.lines()
+    output
+        .lines()
         .filter(|l| {
             let l = l.trim();
-            l.starts_with("PASS:") || l.starts_with("FAIL:")
+            l.starts_with("PASS:")
+                || l.starts_with("FAIL:")
                 || l.contains("not enough frames")
                 || l.contains("channel closed")
                 || l.contains("Changed pixels")
@@ -130,19 +140,32 @@ fn extract_result_lines(output: &str) -> Vec<String> {
 
 fn discover_wallpapers(workshop_dir: &str) -> Vec<(PathBuf, String)> {
     let mut wallpapers = Vec::new();
-    let Ok(entries) = fs::read_dir(workshop_dir) else { return wallpapers };
+    let Ok(entries) = fs::read_dir(workshop_dir) else {
+        return wallpapers;
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() { continue; }
+        if !path.is_dir() {
+            continue;
+        }
         let pj = path.join("project.json");
-        let Ok(content) = fs::read_to_string(&pj) else { continue };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else { continue };
-        if json.get("type").and_then(|v| v.as_str()) != Some("scene") { continue; }
-        let title = json.get("title")
+        let Ok(content) = fs::read_to_string(&pj) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if json.get("type").and_then(|v| v.as_str()) != Some("scene") {
+            continue;
+        }
+        let title = json
+            .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("?")
-            .chars().take(60).collect();
+            .chars()
+            .take(60)
+            .collect();
         wallpapers.push((path, title));
     }
 
@@ -152,7 +175,8 @@ fn discover_wallpapers(workshop_dir: &str) -> Vec<(PathBuf, String)> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Binary path: explicit arg or sibling in the same target/ dir
-    let wp_engine = std::env::args().nth(1)
+    let wp_engine = std::env::args()
+        .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let mut p = std::env::current_exe().unwrap();
@@ -175,7 +199,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total = wallpapers.len();
     println!("Found {total} scene wallpapers to test.\n");
 
-    let parallelism = thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+    let parallelism = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
     println!("Running with {parallelism} parallel workers.\n");
 
     // Work queue: Arc<Mutex<Receiver>> shared across worker threads
@@ -187,17 +214,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let wp_engine_str = wp_engine.to_string_lossy().to_string();
 
-    let workers: Vec<_> = (0..parallelism).map(|_| {
-        let work_rx = Arc::clone(&work_rx);
-        let res_tx = res_tx.clone();
-        let binary = wp_engine_str.clone();
-        thread::spawn(move || {
-            loop {
+    let workers: Vec<_> = (0..parallelism)
+        .map(|_| {
+            let work_rx = Arc::clone(&work_rx);
+            let res_tx = res_tx.clone();
+            let binary = wp_engine_str.clone();
+            thread::spawn(move || loop {
                 let task = { work_rx.lock().unwrap().recv() };
                 let Ok((path, title)) = task else { break };
 
                 let wp_path = path.to_string_lossy().to_string();
-                let id = path.file_name()
+                let id = path
+                    .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
@@ -207,26 +235,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let errors = bucket_errors(&output);
                 let result_lines = extract_result_lines(&output);
 
-                let _ = res_tx.send(WallpaperResult { id, title, path: wp_path, status, errors, result_lines });
-            }
+                let _ = res_tx.send(WallpaperResult {
+                    id,
+                    title,
+                    path: wp_path,
+                    status,
+                    errors,
+                    result_lines,
+                });
+            })
         })
-    }).collect();
+        .collect();
 
     // Feed work
     for (path, title) in wallpapers {
         work_tx.send((path, title)).unwrap();
     }
-    drop(work_tx);  // signals workers to exit when queue is empty
-    drop(res_tx);   // drop our copy so channel closes when all workers finish
+    drop(work_tx); // signals workers to exit when queue is empty
+    drop(res_tx); // drop our copy so channel closes when all workers finish
 
     // Collect results and print progress live
     let mut results = Vec::new();
     for result in res_rx {
-        println!("[{:>12}] {:<62} … {}", result.id, result.title, result.status);
+        println!(
+            "[{:>12}] {:<62} … {}",
+            result.id, result.title, result.status
+        );
         results.push(result);
     }
 
-    for w in workers { let _ = w.join(); }
+    for w in workers {
+        let _ = w.join();
+    }
 
     // Sort results by ID for deterministic output
     results.sort_by(|a, b| a.id.cmp(&b.id));
@@ -236,30 +276,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = fs::File::create(out_path)?;
 
     for r in &results {
-        writeln!(out, "════════════════════════════════════════════════════════════════")?;
+        writeln!(
+            out,
+            "════════════════════════════════════════════════════════════════"
+        )?;
         writeln!(out, "ID:     {}", r.id)?;
         writeln!(out, "TITLE:  {}", r.title)?;
         writeln!(out, "PATH:   {}", r.path)?;
         writeln!(out, "STATUS: {}", r.status)?;
         if !r.errors.is_empty() {
             writeln!(out, "ERRORS:")?;
-            for e in &r.errors { writeln!(out, "  {e}")?; }
+            for e in &r.errors {
+                writeln!(out, "  {e}")?;
+            }
         }
         if !r.result_lines.is_empty() {
             writeln!(out, "RESULT:")?;
-            for l in &r.result_lines { writeln!(out, "  {l}")?; }
+            for l in &r.result_lines {
+                writeln!(out, "  {l}")?;
+            }
         }
         writeln!(out)?;
     }
 
     // ── Summary ───────────────────────────────────────────────────────────────
-    let pass   = results.iter().filter(|r| r.status == Status::Pass).count();
-    let static_ = results.iter().filter(|r| r.status == Status::Static).count();
-    let fail   = results.iter().filter(|r| r.status == Status::Fail).count();
+    let pass = results.iter().filter(|r| r.status == Status::Pass).count();
+    let static_ = results
+        .iter()
+        .filter(|r| r.status == Status::Static)
+        .count();
+    let fail = results.iter().filter(|r| r.status == Status::Fail).count();
 
     let mut error_counts: HashMap<String, usize> = HashMap::new();
     for r in &results {
-        for e in &r.errors { *error_counts.entry(e.clone()).or_default() += 1; }
+        for e in &r.errors {
+            *error_counts.entry(e.clone()).or_default() += 1;
+        }
     }
 
     let summary = format!(

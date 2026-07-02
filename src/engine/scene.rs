@@ -25,7 +25,11 @@ pub struct Camera {
 
 impl Camera {
     pub fn parsed_eye(&self) -> Option<[f64; 3]> {
-        self.eye.as_ref().and_then(|v| parse_value_vec3(v))
+        self.eye.as_ref().and_then(parse_value_vec3)
+    }
+
+    pub fn parsed_center(&self) -> Option<[f64; 3]> {
+        self.center.as_ref().and_then(parse_value_vec3)
     }
 }
 
@@ -52,6 +56,7 @@ pub struct General {
 /// different Wallpaper Engine versions (e.g., `visible` can be bool or object).
 #[derive(Debug, Deserialize)]
 pub struct SceneObject {
+    pub id: Option<i64>,
     pub name: Option<String>,
     pub visible: Option<serde_json::Value>,
     pub origin: Option<serde_json::Value>,
@@ -79,11 +84,17 @@ pub struct SceneObject {
 
 impl SceneObject {
     pub fn parsed_origin(&self) -> [f64; 3] {
-        self.origin.as_ref().and_then(|v| parse_value_vec3(v)).unwrap_or([0.0; 3])
+        self.origin
+            .as_ref()
+            .and_then(|v| parse_value_vec3(v))
+            .unwrap_or([0.0; 3])
     }
 
     pub fn parsed_size(&self) -> [f64; 3] {
-        self.size.as_ref().and_then(|v| parse_value_vec3(v)).unwrap_or([0.0; 3])
+        self.size
+            .as_ref()
+            .and_then(|v| parse_value_vec3(v))
+            .unwrap_or([0.0; 3])
     }
 
     pub fn is_visible(&self) -> bool {
@@ -100,10 +111,33 @@ impl SceneObject {
 
 #[derive(Debug, Deserialize)]
 pub struct Effect {
-    #[serde(rename = "file")]
+    pub id: Option<i64>,
     pub file: Option<String>,
+    pub name: Option<serde_json::Value>,
+    pub visible: Option<serde_json::Value>,
     #[serde(default)]
     pub passes: Vec<Pass>,
+}
+
+impl Effect {
+    pub fn name_string(&self) -> Option<String> {
+        match &self.name {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(value) if !value.is_null() => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        match &self.visible {
+            None => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::Object(m)) => {
+                m.get("value").and_then(|v| v.as_bool()).unwrap_or(true)
+            }
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +154,7 @@ pub struct Pass {
 #[derive(Debug, Deserialize)]
 pub struct TextureRef {
     pub file: Option<String>,
+    pub name: Option<String>,
 }
 
 fn deserialize_textures<'de, D>(deserializer: D) -> std::result::Result<Vec<TextureRef>, D::Error>
@@ -131,9 +166,14 @@ where
         .into_iter()
         .filter_map(|v| {
             let v = v?;
-            if v.is_null() { return None; }
+            if v.is_null() {
+                return None;
+            }
             if let Some(s) = v.as_str() {
-                return Some(TextureRef { file: Some(s.to_string()) });
+                return Some(TextureRef {
+                    file: Some(s.to_string()),
+                    name: Some(s.to_string()),
+                });
             }
             serde_json::from_value(v).ok()
         })
@@ -142,11 +182,10 @@ where
 
 impl Scene {
     pub fn from_json(json: &str) -> Result<Self> {
-        serde_json::from_str(json)
-            .with_context(|| {
-                let preview = if json.len() > 200 { &json[..200] } else { json };
-                format!("failed to parse scene.json: {preview}...")
-            })
+        serde_json::from_str(json).with_context(|| {
+            let preview = if json.len() > 200 { &json[..200] } else { json };
+            format!("failed to parse scene.json: {preview}...")
+        })
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
@@ -189,7 +228,9 @@ impl Scene {
         result: &mut Vec<&'a SceneObject>,
         name_to_index: &std::collections::HashMap<String, usize>,
     ) {
-        if visited[index] { return; }
+        if visited[index] {
+            return;
+        }
         visited[index] = true;
         let obj = &objects[index];
         for dep in &obj.dependencies {
@@ -240,7 +281,10 @@ impl Scene {
 
 fn parse_vec3(s: Option<&str>) -> [f64; 3] {
     let Some(s) = s else { return [0.0; 3] };
-    let parts: Vec<f64> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+    let parts: Vec<f64> = s
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect();
     [
         parts.first().copied().unwrap_or(0.0),
         parts.get(1).copied().unwrap_or(0.0),
@@ -254,13 +298,11 @@ pub fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
             let r = parse_vec3(Some(s));
             Some(r)
         }
-        serde_json::Value::Array(arr) if arr.len() >= 3 => {
-            Some([
-                arr[0].as_f64().unwrap_or(0.0),
-                arr[1].as_f64().unwrap_or(0.0),
-                arr[2].as_f64().unwrap_or(0.0),
-            ])
-        }
+        serde_json::Value::Array(arr) if arr.len() >= 3 => Some([
+            arr[0].as_f64().unwrap_or(0.0),
+            arr[1].as_f64().unwrap_or(0.0),
+            arr[2].as_f64().unwrap_or(0.0),
+        ]),
         serde_json::Value::Object(m) => {
             // SceneScript animated property: {"value": "x y z", "script": "..."}
             // Use the static default; runtime scripting is not yet supported.

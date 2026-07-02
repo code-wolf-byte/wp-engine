@@ -81,7 +81,11 @@ impl Package {
     /// Parse a PKG archive from an already-loaded byte buffer.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let (files, base_offset) = Self::parse_directory(&data)?;
-        Ok(Self { data, files, base_offset })
+        Ok(Self {
+            data,
+            files,
+            base_offset,
+        })
     }
 
     /// Return the raw bytes for `path`, or `None` if the path is not in the archive.
@@ -145,14 +149,16 @@ impl Package {
 
 fn read_u32(cur: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
-    cur.read_exact(&mut buf).context("unexpected EOF reading u32")?;
+    cur.read_exact(&mut buf)
+        .context("unexpected EOF reading u32")?;
     Ok(u32::from_le_bytes(buf))
 }
 
 fn read_sized_string(cur: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u32(cur)? as usize;
     let mut buf = vec![0u8; len];
-    cur.read_exact(&mut buf).context("unexpected EOF reading string bytes")?;
+    cur.read_exact(&mut buf)
+        .context("unexpected EOF reading string bytes")?;
     String::from_utf8(buf).context("PKG string is not valid UTF-8")
 }
 

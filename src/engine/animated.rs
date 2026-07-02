@@ -5,6 +5,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::assets::AssetStore;
 use super::effect::SceneEffect;
 use super::particle::{ParticleConfig, ParticleSystem};
 use super::render::ResolvedScene;
@@ -47,37 +48,20 @@ impl SceneAnimState {
             })
             .collect();
 
-        // Parse particles from scene.json
-        let scene_path = dir.join("scene.json");
+        // Parse particles/effects through the same loose-file + PKG asset
+        // resolver that the scene graph uses.
         let mut particles = Vec::new();
         let mut effects = Vec::new();
 
-        if let Ok(scene_json) = std::fs::read_to_string(&scene_path) {
-            if let Ok(scene) = super::scene::Scene::from_json(&scene_json) {
-                for obj in &scene.objects {
-                    if !obj.is_visible() {
-                        continue;
-                    }
-                    load_particles(dir, obj, width, height, &mut particles);
-                    load_effects(obj, &mut effects);
-                }
-            }
-        } else {
-            let pkg_path = dir.join("scene.pkg");
-            if pkg_path.exists() {
-                if let Ok(pkg) = super::pkg::Package::from_file(&pkg_path) {
-                    if let Some(data) = pkg.get("scene.json") {
-                        if let Ok(json) = std::str::from_utf8(data) {
-                            if let Ok(scene) = super::scene::Scene::from_json(json) {
-                                for obj in &scene.objects {
-                                    if !obj.is_visible() {
-                                        continue;
-                                    }
-                                    load_particles_pkg(&pkg, obj, width, height, &mut particles);
-                                    load_effects(obj, &mut effects);
-                                }
-                            }
+        if let Ok(assets) = AssetStore::from_directory(dir) {
+            if let Ok(scene_json) = assets.scene_json() {
+                if let Ok(scene) = super::scene::Scene::from_json(&scene_json) {
+                    for obj in &scene.objects {
+                        if !obj.is_visible() {
+                            continue;
                         }
+                        load_particles(&assets, obj, width, height, &mut particles);
+                        load_effects(obj, &mut effects);
                     }
                 }
             }
@@ -149,7 +133,7 @@ pub fn scene_render_loop(
 }
 
 fn load_particles(
-    dir: &Path,
+    assets: &AssetStore,
     obj: &SceneObject,
     width: u32,
     height: u32,
@@ -160,8 +144,7 @@ fn load_particles(
         _ => return,
     };
 
-    let config_path = dir.join(&particle_ref);
-    let data = match std::fs::read_to_string(&config_path) {
+    let data = match assets.read_string(&particle_ref) {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -171,39 +154,12 @@ fn load_particles(
     }
 }
 
-fn load_particles_pkg(
-    pkg: &super::pkg::Package,
-    obj: &SceneObject,
-    width: u32,
-    height: u32,
-    particles: &mut Vec<ParticleSystem>,
-) {
-    let particle_ref = match &obj.particle {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        _ => return,
-    };
-
-    let data = match pkg.get(&particle_ref) {
-        Some(d) => d,
-        None => return,
-    };
-
-    let json = match std::str::from_utf8(data) {
-        Ok(j) => j,
-        Err(_) => return,
-    };
-
-    if let Ok(config) = serde_json::from_str::<ParticleConfig>(json) {
-        particles.push(ParticleSystem::from_config(&config, width, height));
-    }
-}
-
 fn load_effects(obj: &SceneObject, effects: &mut Vec<LayerEffect>) {
     for eff in &obj.effects {
-        let effect_name = match &eff.file {
-            Some(s) => s.clone(),
-            None => continue,
-        };
+        let effect_name = eff
+            .name_string()
+            .or_else(|| eff.file.clone())
+            .unwrap_or_default();
 
         for pass in &eff.passes {
             if let Some(material) = &pass.material {

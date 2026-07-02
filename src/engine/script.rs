@@ -16,7 +16,10 @@ pub fn eval_script_opt(script: Option<&str>, current_value: f32, env: &ScriptEnv
     }
 }
 
-pub fn eval_vec3_script_opt(animated: &crate::engine::model::AnimatedValue, env: &ScriptEnv) -> [f32; 3] {
+pub fn eval_vec3_script_opt(
+    animated: &crate::engine::model::AnimatedValue,
+    env: &ScriptEnv,
+) -> [f32; 3] {
     // Default to [1.0; 3] so scale and color don't zero-out the output when missing
     let base = animated.as_vec3().unwrap_or([1.0; 3]);
     match &animated.script {
@@ -97,45 +100,90 @@ fn lex(src: &str) -> Vec<Token> {
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
-            ' ' | '\t' | '\n' | '\r' => { i += 1; }
-            '(' => { tokens.push(Token::LParen); i += 1; }
-            ')' => { tokens.push(Token::RParen); i += 1; }
-            '+' => { tokens.push(Token::Plus); i += 1; }
-            '-' => { tokens.push(Token::Minus); i += 1; }
-            '*' => { tokens.push(Token::Star); i += 1; }
-            '/' => { tokens.push(Token::Slash); i += 1; }
-            '%' => { tokens.push(Token::Percent); i += 1; }
-            ',' => { tokens.push(Token::Comma); i += 1; }
-            '.' => { tokens.push(Token::Dot); i += 1; }
-            '?' => { tokens.push(Token::Question); i += 1; }
-            ':' => { tokens.push(Token::Colon); i += 1; }
+            ' ' | '\t' | '\n' | '\r' => {
+                i += 1;
+            }
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+            }
+            '+' => {
+                tokens.push(Token::Plus);
+                i += 1;
+            }
+            '-' => {
+                tokens.push(Token::Minus);
+                i += 1;
+            }
+            '*' => {
+                tokens.push(Token::Star);
+                i += 1;
+            }
+            '/' => {
+                tokens.push(Token::Slash);
+                i += 1;
+            }
+            '%' => {
+                tokens.push(Token::Percent);
+                i += 1;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
+                i += 1;
+            }
+            '.' => {
+                tokens.push(Token::Dot);
+                i += 1;
+            }
+            '?' => {
+                tokens.push(Token::Question);
+                i += 1;
+            }
+            ':' => {
+                tokens.push(Token::Colon);
+                i += 1;
+            }
             '<' => {
-                if i + 1 < chars.len() && chars[i+1] == '=' {
-                    tokens.push(Token::LtEq); i += 2;
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token::LtEq);
+                    i += 2;
                 } else {
-                    tokens.push(Token::Lt); i += 1;
+                    tokens.push(Token::Lt);
+                    i += 1;
                 }
             }
             '>' => {
-                if i + 1 < chars.len() && chars[i+1] == '=' {
-                    tokens.push(Token::GtEq); i += 2;
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token::GtEq);
+                    i += 2;
                 } else {
-                    tokens.push(Token::Gt); i += 1;
+                    tokens.push(Token::Gt);
+                    i += 1;
                 }
             }
-            '=' if i + 1 < chars.len() && chars[i+1] == '=' => {
-                tokens.push(Token::EqEq); i += 2;
+            '=' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                tokens.push(Token::EqEq);
+                i += 2;
             }
-            '!' if i + 1 < chars.len() && chars[i+1] == '=' => {
-                tokens.push(Token::BangEq); i += 2;
+            '!' if i + 1 < chars.len() && chars[i + 1] == '=' => {
+                tokens.push(Token::BangEq);
+                i += 2;
             }
-            '&' if i + 1 < chars.len() && chars[i+1] == '&' => {
-                tokens.push(Token::AmpAmp); i += 2;
+            '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
+                tokens.push(Token::AmpAmp);
+                i += 2;
             }
-            '|' if i + 1 < chars.len() && chars[i+1] == '|' => {
-                tokens.push(Token::PipePipe); i += 2;
+            '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
+                tokens.push(Token::PipePipe);
+                i += 2;
             }
-            c if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i+1].is_ascii_digit()) => {
+            c if c.is_ascii_digit()
+                || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) =>
+            {
                 let start = i;
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                     i += 1;
@@ -151,7 +199,9 @@ fn lex(src: &str) -> Vec<Token> {
                 let s: String = chars[start..i].iter().collect();
                 tokens.push(Token::Ident(s));
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     tokens.push(Token::Eof);
@@ -175,20 +225,37 @@ impl Parser {
 
     fn consume(&mut self) -> Token {
         let t = self.tokens[self.pos].clone();
-        if self.pos + 1 < self.tokens.len() { self.pos += 1; }
+        if self.pos + 1 < self.tokens.len() {
+            self.pos += 1;
+        }
         t
     }
 
     fn expect_lparen(&mut self) -> Option<()> {
-        if *self.peek() == Token::LParen { self.consume(); Some(()) } else { None }
+        if *self.peek() == Token::LParen {
+            self.consume();
+            Some(())
+        } else {
+            None
+        }
     }
 
     fn expect_comma(&mut self) -> Option<()> {
-        if *self.peek() == Token::Comma { self.consume(); Some(()) } else { None }
+        if *self.peek() == Token::Comma {
+            self.consume();
+            Some(())
+        } else {
+            None
+        }
     }
 
     fn expect_rparen(&mut self) -> Option<()> {
-        if *self.peek() == Token::RParen { self.consume(); Some(()) } else { None }
+        if *self.peek() == Token::RParen {
+            self.consume();
+            Some(())
+        } else {
+            None
+        }
     }
 
     // ternary: expr ? expr : expr
@@ -197,7 +264,9 @@ impl Parser {
         if *self.peek() == Token::Question {
             self.consume();
             let a = self.parse_ternary()?;
-            if *self.peek() != Token::Colon { return None; }
+            if *self.peek() != Token::Colon {
+                return None;
+            }
             self.consume();
             let b = self.parse_ternary()?;
             return Some(if cond != 0.0 { a } else { b });
@@ -230,12 +299,36 @@ impl Parser {
         loop {
             let op = self.peek().clone();
             match op {
-                Token::Lt    => { self.consume(); let r = self.parse_add()?; v = if v < r { 1.0 } else { 0.0 }; }
-                Token::Gt    => { self.consume(); let r = self.parse_add()?; v = if v > r { 1.0 } else { 0.0 }; }
-                Token::LtEq  => { self.consume(); let r = self.parse_add()?; v = if v <= r { 1.0 } else { 0.0 }; }
-                Token::GtEq  => { self.consume(); let r = self.parse_add()?; v = if v >= r { 1.0 } else { 0.0 }; }
-                Token::EqEq  => { self.consume(); let r = self.parse_add()?; v = if (v - r).abs() < 1e-7 { 1.0 } else { 0.0 }; }
-                Token::BangEq => { self.consume(); let r = self.parse_add()?; v = if (v - r).abs() >= 1e-7 { 1.0 } else { 0.0 }; }
+                Token::Lt => {
+                    self.consume();
+                    let r = self.parse_add()?;
+                    v = if v < r { 1.0 } else { 0.0 };
+                }
+                Token::Gt => {
+                    self.consume();
+                    let r = self.parse_add()?;
+                    v = if v > r { 1.0 } else { 0.0 };
+                }
+                Token::LtEq => {
+                    self.consume();
+                    let r = self.parse_add()?;
+                    v = if v <= r { 1.0 } else { 0.0 };
+                }
+                Token::GtEq => {
+                    self.consume();
+                    let r = self.parse_add()?;
+                    v = if v >= r { 1.0 } else { 0.0 };
+                }
+                Token::EqEq => {
+                    self.consume();
+                    let r = self.parse_add()?;
+                    v = if (v - r).abs() < 1e-7 { 1.0 } else { 0.0 };
+                }
+                Token::BangEq => {
+                    self.consume();
+                    let r = self.parse_add()?;
+                    v = if (v - r).abs() >= 1e-7 { 1.0 } else { 0.0 };
+                }
                 _ => break,
             }
         }
@@ -246,8 +339,14 @@ impl Parser {
         let mut v = self.parse_mul()?;
         loop {
             match self.peek().clone() {
-                Token::Plus  => { self.consume(); v += self.parse_mul()?; }
-                Token::Minus => { self.consume(); v -= self.parse_mul()?; }
+                Token::Plus => {
+                    self.consume();
+                    v += self.parse_mul()?;
+                }
+                Token::Minus => {
+                    self.consume();
+                    v -= self.parse_mul()?;
+                }
                 _ => break,
             }
         }
@@ -258,9 +357,20 @@ impl Parser {
         let mut v = self.parse_unary()?;
         loop {
             match self.peek().clone() {
-                Token::Star    => { self.consume(); v *= self.parse_unary()?; }
-                Token::Slash   => { self.consume(); let r = self.parse_unary()?; v /= if r == 0.0 { 1.0 } else { r }; }
-                Token::Percent => { self.consume(); let r = self.parse_unary()?; v = v % if r == 0.0 { 1.0 } else { r }; }
+                Token::Star => {
+                    self.consume();
+                    v *= self.parse_unary()?;
+                }
+                Token::Slash => {
+                    self.consume();
+                    let r = self.parse_unary()?;
+                    v /= if r == 0.0 { 1.0 } else { r };
+                }
+                Token::Percent => {
+                    self.consume();
+                    let r = self.parse_unary()?;
+                    v = v % if r == 0.0 { 1.0 } else { r };
+                }
                 _ => break,
             }
         }
@@ -277,7 +387,10 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Option<f32> {
         match self.peek().clone() {
-            Token::Num(n) => { self.consume(); Some(n) }
+            Token::Num(n) => {
+                self.consume();
+                Some(n)
+            }
             Token::LParen => {
                 self.consume();
                 let v = self.parse_ternary()?;
@@ -310,14 +423,38 @@ impl Parser {
                     self.consume();
                     let a = self.parse_ternary()?;
                     let result = match full.as_str() {
-                        "Math.sin"   => { self.expect_rparen()?; a.sin() }
-                        "Math.cos"   => { self.expect_rparen()?; a.cos() }
-                        "Math.abs"   => { self.expect_rparen()?; a.abs() }
-                        "Math.floor" => { self.expect_rparen()?; a.floor() }
-                        "Math.ceil"  => { self.expect_rparen()?; a.ceil() }
-                        "Math.round" => { self.expect_rparen()?; a.round() }
-                        "Math.sqrt"  => { self.expect_rparen()?; a.sqrt() }
-                        "Math.log"   => { self.expect_rparen()?; a.ln() }
+                        "Math.sin" => {
+                            self.expect_rparen()?;
+                            a.sin()
+                        }
+                        "Math.cos" => {
+                            self.expect_rparen()?;
+                            a.cos()
+                        }
+                        "Math.abs" => {
+                            self.expect_rparen()?;
+                            a.abs()
+                        }
+                        "Math.floor" => {
+                            self.expect_rparen()?;
+                            a.floor()
+                        }
+                        "Math.ceil" => {
+                            self.expect_rparen()?;
+                            a.ceil()
+                        }
+                        "Math.round" => {
+                            self.expect_rparen()?;
+                            a.round()
+                        }
+                        "Math.sqrt" => {
+                            self.expect_rparen()?;
+                            a.sqrt()
+                        }
+                        "Math.log" => {
+                            self.expect_rparen()?;
+                            a.ln()
+                        }
                         "Math.pow" => {
                             self.expect_comma()?;
                             let b = self.parse_ternary()?;
@@ -352,7 +489,10 @@ impl Parser {
                             let t = ((x - a) / (edge1 - a)).clamp(0.0, 1.0);
                             t * t * (3.0 - 2.0 * t)
                         }
-                        _ => { self.expect_rparen()?; 0.0 }
+                        _ => {
+                            self.expect_rparen()?;
+                            0.0
+                        }
                     };
                     return Some(result);
                 }

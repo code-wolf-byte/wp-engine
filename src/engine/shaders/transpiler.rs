@@ -1,6 +1,6 @@
+use crate::engine::model::ShaderModel;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use crate::engine::model::ShaderModel;
 
 const WE_COMMON_H: &str = "\
 #define M_PI 3.14159265359\n\
@@ -107,11 +107,20 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
         if (t.starts_with("varying ") || t.starts_with("attribute ")) {
             let tok: Vec<&str> = t.split_whitespace().collect();
             if tok.len() >= 3 {
-                let name_raw = t.split("//").next().unwrap_or(t)
-                    .split_whitespace().nth(2).unwrap_or("").trim_end_matches(';');
+                let name_raw = t
+                    .split("//")
+                    .next()
+                    .unwrap_or(t)
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or("")
+                    .trim_end_matches(';');
                 if name_raw.contains('[') {
-                    anyhow::bail!("array varying '{}' not supported by naga — skipping shader '{}'",
-                        name_raw, model.name);
+                    anyhow::bail!(
+                        "array varying '{}' not supported by naga — skipping shader '{}'",
+                        name_raw,
+                        model.name
+                    );
                 }
             }
         }
@@ -123,8 +132,15 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
     let wgsl = spirv_to_wgsl(&spv).context("SPIR-V→WGSL conversion failed")?;
 
     // Build a map from glsl_name → (material_key, default) for annotated uniforms.
-    let annotated: std::collections::HashMap<&str, (&str, f32)> = model.value_uniforms.iter()
-        .map(|u| (u.glsl_name.as_str(), (u.material_key.as_str(), u.default.as_float())))
+    let annotated: std::collections::HashMap<&str, (&str, f32)> = model
+        .value_uniforms
+        .iter()
+        .map(|u| {
+            (
+                u.glsl_name.as_str(),
+                (u.material_key.as_str(), u.default.as_float()),
+            )
+        })
         .collect();
 
     // The UBO contains ALL non-sampler uniforms in source order (same as preprocess_frag).
@@ -137,10 +153,15 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
             let ty = tok[1];
             if !ty.starts_with("sampler") && !ty.is_empty() {
                 let name = tok[2].trim_end_matches(';');
-                let (key, default) = annotated.get(name)
+                let (key, default) = annotated
+                    .get(name)
                     .map(|(k, d)| (k.to_string(), *d))
                     .unwrap_or_else(|| (name.to_string(), 0.0));
-                uniform_keys.push(UniformEntry { key, glsl_type: ty.to_string(), default });
+                uniform_keys.push(UniformEntry {
+                    key,
+                    glsl_type: ty.to_string(),
+                    default,
+                });
             }
         }
     }
@@ -179,7 +200,10 @@ pub fn translate_with_vertex(model: &ShaderModel, vert_glsl: &str) -> Result<Tra
     let mut result = translate(model)?;
     match translate_vertex(vert_glsl) {
         Ok(wgsl) => result.vert_wgsl = Some(wgsl),
-        Err(e) => eprintln!("warn: vertex shader translation failed for '{}': {e}", model.name),
+        Err(e) => eprintln!(
+            "warn: vertex shader translation failed for '{}': {e}",
+            model.name
+        ),
     }
     Ok(result)
 }
@@ -192,17 +216,18 @@ pub fn translate_with_vertex(model: &ShaderModel, vert_glsl: &str) -> Result<Tra
 fn glsl_to_spirv(glsl: &str, stage: naga::ShaderStage) -> Result<Vec<u8>> {
     let (kind, filename) = match stage {
         naga::ShaderStage::Fragment => (shaderc::ShaderKind::Fragment, "shader.frag"),
-        naga::ShaderStage::Vertex   => (shaderc::ShaderKind::Vertex,   "shader.vert"),
-        _                           => (shaderc::ShaderKind::Compute,  "shader.comp"),
+        naga::ShaderStage::Vertex => (shaderc::ShaderKind::Vertex, "shader.vert"),
+        _ => (shaderc::ShaderKind::Compute, "shader.comp"),
     };
 
-    let compiler = shaderc::Compiler::new()
-        .context("failed to create shaderc compiler")?;
-    let mut options = shaderc::CompileOptions::new()
-        .context("failed to create shaderc options")?;
+    let compiler = shaderc::Compiler::new().context("failed to create shaderc compiler")?;
+    let mut options = shaderc::CompileOptions::new().context("failed to create shaderc options")?;
     // Target Vulkan SPIR-V — required for naga's spv-in reader.
     // Our preprocessor already emits Vulkan GLSL 4.50 with explicit set/binding/location qualifiers.
-    options.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_1 as u32);
+    options.set_target_env(
+        shaderc::TargetEnv::Vulkan,
+        shaderc::EnvVersion::Vulkan1_1 as u32,
+    );
     options.set_source_language(shaderc::SourceLanguage::GLSL);
     options.set_optimization_level(shaderc::OptimizationLevel::Performance);
 
@@ -216,21 +241,24 @@ fn glsl_to_spirv(glsl: &str, stage: naga::ShaderStage) -> Result<Vec<u8>> {
 // ── SPIR-V → WGSL via naga ───────────────────────────────────────────────────
 
 fn spirv_to_wgsl(spv: &[u8]) -> Result<String> {
-    let module = naga::front::spv::parse_u8_slice(spv, &naga::front::spv::Options {
-        adjust_coordinate_space: true,
-        ..Default::default()
-    }).context("naga SPIR-V parse failed")?;
+    let module = naga::front::spv::parse_u8_slice(
+        spv,
+        &naga::front::spv::Options {
+            adjust_coordinate_space: true,
+            ..Default::default()
+        },
+    )
+    .context("naga SPIR-V parse failed")?;
 
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
-    ).validate(&module).context("naga validation failed")?;
+    )
+    .validate(&module)
+    .context("naga validation failed")?;
 
-    naga::back::wgsl::write_string(
-        &module,
-        &info,
-        naga::back::wgsl::WriterFlags::empty(),
-    ).context("naga WGSL output failed")
+    naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+        .context("naga WGSL output failed")
 }
 
 // ── Preprocessors ─────────────────────────────────────────────────────────────
@@ -252,16 +280,16 @@ fn preprocess_frag(model: &ShaderModel) -> String {
     let src = &model.frag_glsl;
 
     // First pass: collect declarations in order
-    let mut sampler_names: Vec<String> = Vec::new();  // g_Texture0, g_Texture1, ...
-    let mut scalars:  Vec<(String, String)> = Vec::new(); // (type, name) → UBO
-    let mut inputs:   Vec<(String, String)> = Vec::new(); // varyings
+    let mut sampler_names: Vec<String> = Vec::new(); // g_Texture0, g_Texture1, ...
+    let mut scalars: Vec<(String, String)> = Vec::new(); // (type, name) → UBO
+    let mut inputs: Vec<(String, String)> = Vec::new(); // varyings
 
     for line in src.lines() {
         let t = line.trim();
         let decl = t.split("//").next().unwrap_or(t).trim();
         let tok: Vec<&str> = decl.split_whitespace().collect();
         if tok.len() >= 3 && tok[0] == "uniform" {
-            let ty   = tok[1];
+            let ty = tok[1];
             let name = tok[2].trim_end_matches(';');
             if ty.starts_with("sampler") {
                 sampler_names.push(name.to_string());
@@ -270,11 +298,17 @@ fn preprocess_frag(model: &ShaderModel) -> String {
             }
         } else if t.starts_with("varying ") || t.starts_with("attribute ") {
             if tok.len() >= 3 {
-                let ty   = tok[1];
-                let name_raw = decl.split_whitespace().nth(2).unwrap_or("").trim_end_matches(';');
+                let ty = tok[1];
+                let name_raw = decl
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or("")
+                    .trim_end_matches(';');
                 // Skip array varyings (e.g. `varying vec2 v_TexCoord[7]`) — naga cannot
                 // represent arrays as entry-point I/O; the shader would fail at SPIR-V parse.
-                if name_raw.contains('[') { continue; }
+                if name_raw.contains('[') {
+                    continue;
+                }
                 inputs.push((ty.to_string(), name_raw.to_string()));
             }
         }
@@ -282,7 +316,10 @@ fn preprocess_frag(model: &ShaderModel) -> String {
 
     // Texture binding indices: 1st texture → 0, rest → 3, 4, 5, ...
     let tex_binding = |i: usize| -> u32 {
-        match i { 0 => 0, n => 2 + n as u32 }  // 0→0, 1→3, 2→4, 3→5
+        match i {
+            0 => 0,
+            n => 2 + n as u32,
+        } // 0→0, 1→3, 2→4, 3→5
     };
 
     let mut out = String::new();
@@ -295,10 +332,14 @@ fn preprocess_frag(model: &ShaderModel) -> String {
     // Use separate texture2D + sampler for all texture sample macros so naga sees
     // OpSampledImage (from constructor) rather than OpLoad of a combined sampler2D.
     out.push_str("#define texSample2D(s, uv) texture(sampler2D(s, _wp_sampler), uv)\n");
-    out.push_str("#define texSample2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), uv, lod)\n");
+    out.push_str(
+        "#define texSample2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), uv, lod)\n",
+    );
     out.push_str("#define textureSample2D(s, uv) texture(sampler2D(s, _wp_sampler), uv)\n");
     out.push_str("#define texture2D(s, uv) texture(sampler2D(s, _wp_sampler), uv)\n");
-    out.push_str("#define texture2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), uv, lod)\n");
+    out.push_str(
+        "#define texture2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), uv, lod)\n",
+    );
     out.push_str("#define textureCube(s, uv) texture(samplerCube(s, _wp_sampler), uv)\n");
     out.push_str("#define lerp(a, b, t) mix(a, b, t)\n");
     out.push_str("#define mul(a, b) ((b) * (a))\n");
@@ -327,7 +368,9 @@ fn preprocess_frag(model: &ShaderModel) -> String {
     // Separate texture2D declarations with matching bindings
     for (i, name) in sampler_names.iter().enumerate() {
         let b = tex_binding(i);
-        out.push_str(&format!("layout(set=0, binding={b}) uniform texture2D {name};\n"));
+        out.push_str(&format!(
+            "layout(set=0, binding={b}) uniform texture2D {name};\n"
+        ));
     }
     // Shared sampler at binding 1
     if !sampler_names.is_empty() {
@@ -355,22 +398,30 @@ fn preprocess_frag(model: &ShaderModel) -> String {
         }
         let decl = t.split("//").next().unwrap_or(t).trim();
         let first = decl.split_whitespace().next().unwrap_or("");
-        if first == "varying" || first == "attribute" || first == "uniform" { continue; }
+        if first == "varying" || first == "attribute" || first == "uniform" {
+            continue;
+        }
 
         // Skip #include directives — included content is inlined in the header.
-        if t.starts_with("#include ") { continue; }
+        if t.starts_with("#include ") {
+            continue;
+        }
 
         // Replace #require LightingV1 with a no-op stub (same as linux-wallpaperengine).
         if t.starts_with("#require LightingV1") {
-            out.push_str("vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir,\n");
-            out.push_str("    vec3 specularTint, vec3 baseReflectance, float roughness, float metallic)\n");
+            out.push_str(
+                "vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir,\n",
+            );
+            out.push_str(
+                "    vec3 specularTint, vec3 baseReflectance, float roughness, float metallic)\n",
+            );
             out.push_str("{ return vec3(0.0); }\n");
             continue;
         }
 
         let renamed = rename_reserved_word(line, "sample", "_wp_s");
         let l = renamed
-            .replace("gl_FragColor",   "fragColor")
+            .replace("gl_FragColor", "fragColor")
             .replace("gl_FragData[0]", "fragColor");
         out.push_str(&l);
         out.push('\n');
@@ -412,9 +463,14 @@ fn preprocess_vert(glsl: &str) -> String {
         let t = line.trim();
         let tok: Vec<&str> = t.split_whitespace().collect();
         if tok.len() >= 3 && tok[0] == "uniform" && !tok[1].starts_with("sampler") {
-            let ty   = tok[1];
+            let ty = tok[1];
             let decl = t.split("//").next().unwrap_or(t);
-            let name = decl.split_whitespace().nth(2).unwrap_or("").trim_end_matches(';').trim();
+            let name = decl
+                .split_whitespace()
+                .nth(2)
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .trim();
             scalars.push((ty.to_string(), name.to_string()));
         }
     }
@@ -433,22 +489,34 @@ fn preprocess_vert(glsl: &str) -> String {
         }
         let tok: Vec<&str> = t.split_whitespace().collect();
         if tok.len() >= 3 && tok[0] == "attribute" {
-            let ty   = tok[1];
+            let ty = tok[1];
             let decl = t.split("//").next().unwrap_or(t);
-            let name = decl.split_whitespace().nth(2).unwrap_or("").trim_end_matches(';').trim();
+            let name = decl
+                .split_whitespace()
+                .nth(2)
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .trim();
             out.push_str(&format!("layout(location={attr_count}) in {ty} {name};\n"));
             attr_count += 1;
             continue;
         }
         if tok.len() >= 3 && tok[0] == "varying" {
-            let ty   = tok[1];
+            let ty = tok[1];
             let decl = t.split("//").next().unwrap_or(t);
-            let name = decl.split_whitespace().nth(2).unwrap_or("").trim_end_matches(';').trim();
+            let name = decl
+                .split_whitespace()
+                .nth(2)
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .trim();
             out.push_str(&format!("layout(location={vary_count}) out {ty} {name};\n"));
             vary_count += 1;
             continue;
         }
-        if tok.first() == Some(&"uniform") { continue; } // already in UBO
+        if tok.first() == Some(&"uniform") {
+            continue;
+        } // already in UBO
         out.push_str(line);
         out.push('\n');
     }
@@ -462,12 +530,24 @@ fn frag_inputs(frag_glsl: &str) -> Vec<(String, String)> {
     let mut inputs = Vec::new();
     for line in frag_glsl.lines() {
         let t = line.trim();
-        if !t.starts_with("varying ") && !t.starts_with("attribute ") { continue; }
+        if !t.starts_with("varying ") && !t.starts_with("attribute ") {
+            continue;
+        }
         let tok: Vec<&str> = t.split_whitespace().collect();
-        if tok.len() < 3 { continue; }
-        let name_raw = t.split("//").next().unwrap_or(t)
-            .split_whitespace().nth(2).unwrap_or("").trim_end_matches(';');
-        if name_raw.contains('[') { continue; }  // array varyings already rejected upstream
+        if tok.len() < 3 {
+            continue;
+        }
+        let name_raw = t
+            .split("//")
+            .next()
+            .unwrap_or(t)
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("")
+            .trim_end_matches(';');
+        if name_raw.contains('[') {
+            continue;
+        } // array varyings already rejected upstream
         inputs.push((tok[1].to_string(), name_raw.to_string()));
     }
     inputs
@@ -480,7 +560,7 @@ fn needs_custom_vs(inputs: &[(String, String)]) -> bool {
         [] => false,
         [(t0, _)] => t0 != "vec4",
         [(t0, _), (t1, _)] => t0 != "vec4" || t1 != "vec2",
-        _ => true,  // more than 2 varyings → vs_we_effect definitely can't match
+        _ => true, // more than 2 varyings → vs_we_effect definitely can't match
     }
 }
 
@@ -502,10 +582,10 @@ fn synthetic_vs_glsl(inputs: &[(String, String)]) -> String {
     for (ty, name) in inputs {
         let val = match ty.as_str() {
             "float" => "u".to_string(),
-            "vec2"  => "vec2(u, v)".to_string(),
-            "vec3"  => "vec3(u, v, 0.0)".to_string(),
-            "vec4"  => "vec4(u, v, u, v)".to_string(),
-            _       => format!("{ty}(0.0)"),
+            "vec2" => "vec2(u, v)".to_string(),
+            "vec3" => "vec3(u, v, 0.0)".to_string(),
+            "vec4" => "vec4(u, v, u, v)".to_string(),
+            _ => format!("{ty}(0.0)"),
         };
         out.push_str(&format!("    {name} = {val};\n"));
     }
@@ -514,7 +594,8 @@ fn synthetic_vs_glsl(inputs: &[(String, String)]) -> String {
 }
 
 pub fn combo_defines(combos: &HashMap<String, i32>) -> String {
-    combos.iter()
+    combos
+        .iter()
         .map(|(name, value)| format!("#define {} {}\n", name, value))
         .collect()
 }
@@ -530,7 +611,7 @@ fn rename_reserved_word(src: &str, keyword: &str, replacement: &str) -> String {
     while i < sbytes.len() {
         if sbytes[i..].starts_with(kbytes) {
             let before_ok = i == 0 || !is_word_char(sbytes[i - 1]);
-            let after_ok  = i + klen >= sbytes.len() || !is_word_char(sbytes[i + klen]);
+            let after_ok = i + klen >= sbytes.len() || !is_word_char(sbytes[i + klen]);
             if before_ok && after_ok {
                 out.push_str(replacement);
                 i += klen;

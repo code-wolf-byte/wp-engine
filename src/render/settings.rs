@@ -10,6 +10,9 @@ pub struct RenderSettings {
 
 impl Default for RenderSettings {
     fn default() -> Self {
-        Self { quality: RenderQuality::Ultra, volume: 1.0 }
+        Self {
+            quality: RenderQuality::Ultra,
+            volume: 1.0,
+        }
     }
 }

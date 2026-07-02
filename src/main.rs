@@ -31,17 +31,11 @@ enum Command {
         r#type: Option<String>,
     },
     /// Apply a wallpaper by Steam Workshop ID (CLI, blocks until Ctrl-C)
-    Set {
-        id: String,
-    },
+    Set { id: String },
     /// Apply any image file as wallpaper (CLI, blocks until Ctrl-C)
-    SetFile {
-        path: PathBuf,
-    },
+    SetFile { path: PathBuf },
     /// Show metadata for a Workshop item (CLI)
-    Info {
-        id: String,
-    },
+    Info { id: String },
     /// List available GPU adapters (PAL probe)
     Probe,
     /// Inspect (and optionally extract) a Wallpaper Engine PKG archive
@@ -65,6 +59,9 @@ enum Command {
         /// Output PNG path
         #[arg(long, default_value = "scene_output.png")]
         output: PathBuf,
+        /// Exercise the new WGPU scene renderer instead of the CPU fallback
+        #[arg(long)]
+        gpu: bool,
     },
     /// Preview an animated scene wallpaper in a window (for testing animation)
     PreviewScene {
@@ -97,11 +94,19 @@ fn main() {
         Some(Command::Set { id }) => cmd_set(&id),
         Some(Command::SetFile { path }) => cmd_set_file(&path),
         Some(Command::Info { id }) => cmd_info(&id),
-        Some(Command::Probe)       => cmd_probe(),
+        Some(Command::Probe) => cmd_probe(),
         Some(Command::PkgInfo { path, dump }) => cmd_pkg_info(&path, dump.as_deref()),
         Some(Command::TexInfo { path, save }) => cmd_tex_info(&path, save.as_deref()),
-        Some(Command::RenderScene { id_or_path, output }) => cmd_render_scene(&id_or_path, &output),
-        Some(Command::PreviewScene { id_or_path, width, height }) => cmd_preview_scene(&id_or_path, width, height),
+        Some(Command::RenderScene {
+            id_or_path,
+            output,
+            gpu,
+        }) => cmd_render_scene(&id_or_path, &output, gpu),
+        Some(Command::PreviewScene {
+            id_or_path,
+            width,
+            height,
+        }) => cmd_preview_scene(&id_or_path, width, height),
         Some(Command::TestScene { id_or_path, frames }) => cmd_test_scene(&id_or_path, frames),
     };
 
@@ -158,34 +163,51 @@ fn cmd_list(type_filter: Option<String>) -> Result<()> {
     println!("{:<20} {:<12} {}", "ID", "Type", "Title");
     println!("{}", "─".repeat(64));
     for w in &items {
-        println!("{:<20} {:<12} {}", w.workshop_id, w.wallpaper_type(), w.title());
+        println!(
+            "{:<20} {:<12} {}",
+            w.workshop_id,
+            w.wallpaper_type(),
+            w.title()
+        );
     }
     println!("\n{} wallpaper(s)", items.len());
     Ok(())
 }
 
 fn cmd_info(id: &str) -> Result<()> {
-    let w = workshop::find_by_id(id)
-        .ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
+    let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
     println!("ID:          {}", w.workshop_id);
     println!("Title:       {}", w.title());
     println!("Type:        {}", w.wallpaper_type());
     println!("Path:        {}", w.path.display());
     if let Some(f) = w.wallpaper_file() {
-        println!("File:        {} {}", f.display(), if f.exists() { "" } else { "(MISSING)" });
+        println!(
+            "File:        {} {}",
+            f.display(),
+            if f.exists() { "" } else { "(MISSING)" }
+        );
     }
     if let Some(tags) = &w.project.tags {
         if !tags.is_empty() {
             println!("Tags:        {}", tags.join(", "));
         }
     }
+    if let Some(rating) = &w.project.contentrating {
+        if !rating.is_empty() {
+            println!("Rating:      {rating}");
+        }
+    }
+    if let Some(description) = &w.project.description {
+        if !description.is_empty() {
+            println!("Description: {}", description.replace('\n', " "));
+        }
+    }
     Ok(())
 }
 
 fn cmd_set(id: &str) -> Result<()> {
-    let w = workshop::find_by_id(id)
-        .ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
+    let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
     // Type support is checked inside from_wallpaper; unsupported types return Err.
     let content = WallpaperContent::from_wallpaper(&w)?;
@@ -209,7 +231,10 @@ fn cmd_probe() -> Result<()> {
         println!("No GPU adapters found.");
         return Ok(());
     }
-    println!("{:<40} {:<10} {:<12} {}", "Name", "Backend", "Type", "PCI IDs");
+    println!(
+        "{:<40} {:<10} {:<12} {}",
+        "Name", "Backend", "Type", "PCI IDs"
+    );
     println!("{}", "─".repeat(74));
     for a in &adapters {
         println!(
@@ -251,6 +276,15 @@ fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Resul
     let pkg = engine::Package::from_file(path)?;
 
     println!("Files   : {}", pkg.len());
+    println!("Empty   : {}", pkg.is_empty());
+    println!(
+        "Scene   : {}",
+        if pkg.contains("scene.json") {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     println!();
 
     // Collect and sort paths for a stable, readable table.
@@ -300,7 +334,7 @@ fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Resul
     Ok(())
 }
 
-fn cmd_render_scene(id_or_path: &str, output: &std::path::Path) -> Result<()> {
+fn cmd_render_scene(id_or_path: &str, output: &std::path::Path, gpu: bool) -> Result<()> {
     let dir = std::path::PathBuf::from(id_or_path);
     let dir = if dir.exists() {
         dir
@@ -310,8 +344,55 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path) -> Result<()> {
             .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
     };
     println!("Loading scene from {}...", dir.display());
+    let graph = engine::SceneGraph::from_directory(&dir)?;
+    println!("Scene graph: {}", graph.stats().summary());
+
+    if gpu {
+        let result = render::wgpu_scene::render_first_image_layer_to_rgba(&dir)?;
+        println!(
+            "WGPU graph: {} objects, {} passes, {} targets, {} diagnostics",
+            result.graph.objects.len(),
+            result.graph.passes.len(),
+            result.graph.targets.len(),
+            result.graph.diagnostics.len()
+        );
+        println!(
+            "WGPU rendered {}x{} first image layer",
+            result.image.width(),
+            result.image.height()
+        );
+        for diagnostic in result.diagnostics.iter().take(8) {
+            println!("WGPU:        {diagnostic}");
+        }
+        result.image.save(output)?;
+        println!("Saved to {}", output.display());
+        return Ok(());
+    }
+
     let scene = engine::ResolvedScene::from_directory(&dir)?;
-    println!("Rendering {}x{} with {} layers...", scene.width, scene.height, scene.layers.len());
+    println!(
+        "Rendering {}x{} with {} layers...",
+        scene.width,
+        scene.height,
+        scene.layers.len()
+    );
+    for layer in scene.layers.iter().take(3) {
+        println!(
+            "Layer:       {} origin={:.1},{:.1},{:.1} size={:.1},{:.1},{:.1} parallax={:.3}",
+            if layer.name.is_empty() {
+                "<unnamed>"
+            } else {
+                &layer.name
+            },
+            layer.origin[0],
+            layer.origin[1],
+            layer.origin[2],
+            layer.size[0],
+            layer.size[1],
+            layer.size[2],
+            layer.parallax_depth,
+        );
+    }
     let img = scene.render();
     img.save(output)?;
     println!("Saved to {}", output.display());
@@ -319,7 +400,7 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path) -> Result<()> {
 }
 
 fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
-    use std::sync::{Arc, mpsc::sync_channel};
+    use std::sync::{mpsc::sync_channel, Arc};
 
     let dir = std::path::PathBuf::from(id_or_path);
     let dir = if dir.exists() {
@@ -330,7 +411,10 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
             .ok_or_else(|| anyhow!("not a directory and workshop item '{id_or_path}' not found"))?
     };
 
-    println!("GPU scene animation test: collecting {num_frames} frames from {}", dir.display());
+    println!(
+        "GPU scene animation test: collecting {num_frames} frames from {}",
+        dir.display()
+    );
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     std::thread::spawn(move || {
@@ -367,7 +451,8 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     let total_pixels = (first.width() * first.height()) as usize;
 
     fn count_changed(a: &[u8], b: &[u8]) -> usize {
-        a.chunks(4).zip(b.chunks(4))
+        a.chunks(4)
+            .zip(b.chunks(4))
             .filter(|(a, b)| {
                 let dr = (a[0] as i32 - b[0] as i32).abs();
                 let dg = (a[1] as i32 - b[1] as i32).abs();
@@ -377,19 +462,28 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
             .count()
     }
 
-    let (best_frame, changed_pixels) = collected.iter().enumerate().skip(1)
+    let (best_frame, changed_pixels) = collected
+        .iter()
+        .enumerate()
+        .skip(1)
         .map(|(i, f)| (i, count_changed(first_bytes, f.as_raw())))
         .max_by_key(|(_, n)| *n)
         .unwrap_or((0, 0));
 
     let pct = changed_pixels as f64 / total_pixels as f64 * 100.0;
-    println!("\nCollected {} frames at 30fps (~{:.1}s)", collected.len(), collected.len() as f64 / 30.0);
+    println!(
+        "\nCollected {} frames at 30fps (~{:.1}s)",
+        collected.len(),
+        collected.len() as f64 / 30.0
+    );
     println!("Changed pixels (frame[0] vs frame[{best_frame}]): {changed_pixels}/{total_pixels} ({pct:.1}%)");
 
     if pct > 0.1 {
         println!("PASS: scene IS animating ({pct:.1}% of pixels changed)");
     } else {
-        println!("FAIL: scene appears static (only {pct:.2}% changed — likely effect/rendering bug)");
+        println!(
+            "FAIL: scene appears static (only {pct:.2}% changed — likely effect/rendering bug)"
+        );
     }
 
     // Save first and best-changed frames for visual inspection
@@ -402,9 +496,9 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
 }
 
 fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
-    use minifb::{Key, Window, WindowOptions};
     use image::imageops::FilterType;
-    use std::sync::{Arc, mpsc::sync_channel};
+    use minifb::{Key, Window, WindowOptions};
+    use std::sync::{mpsc::sync_channel, Arc};
 
     let dir = std::path::PathBuf::from(id_or_path);
     let dir = if dir.exists() {
@@ -426,7 +520,10 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
 
     println!("Waiting for first frame...");
     let mut current = rx.recv()?;
-    println!("First frame received — opening {}x{} preview window. Press Esc to quit.", width, height);
+    println!(
+        "First frame received — opening {}x{} preview window. Press Esc to quit.",
+        width, height
+    );
 
     let mut window = Window::new(
         "wp-engine preview",
@@ -441,12 +538,17 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
         }
 
         let scaled = image::imageops::resize(&*current, width, height, FilterType::Nearest);
-        let buf: Vec<u32> = scaled.pixels().map(|p| {
-            let [r, g, b, _a] = p.0;
-            (r as u32) << 16 | (g as u32) << 8 | b as u32
-        }).collect();
+        let buf: Vec<u32> = scaled
+            .pixels()
+            .map(|p| {
+                let [r, g, b, _a] = p.0;
+                (r as u32) << 16 | (g as u32) << 8 | b as u32
+            })
+            .collect();
 
-        window.update_with_buffer(&buf, width as usize, height as usize).unwrap_or(());
+        window
+            .update_with_buffer(&buf, width as usize, height as usize)
+            .unwrap_or(());
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 

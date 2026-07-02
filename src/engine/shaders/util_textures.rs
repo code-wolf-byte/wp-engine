@@ -25,19 +25,26 @@ pub fn load_utility_textures(assets_dir: &Path) -> HashMap<String, RgbaImage> {
             "tex" => {
                 let data = match std::fs::read(&path) {
                     Ok(d) => d,
-                    Err(e) => { eprintln!("warn: reading {}: {e}", path.display()); continue; }
+                    Err(e) => {
+                        eprintln!("warn: reading {}: {e}", path.display());
+                        continue;
+                    }
                 };
                 match TexFile::parse(&data).and_then(|t| t.to_rgba()) {
                     Ok(img) => img,
-                    Err(e) => { eprintln!("warn: decoding {}: {e}", path.display()); continue; }
+                    Err(e) => {
+                        eprintln!("warn: decoding {}: {e}", path.display());
+                        continue;
+                    }
                 }
             }
-            "png" | "jpg" | "jpeg" => {
-                match image::open(&path) {
-                    Ok(img) => img.into_rgba8(),
-                    Err(e) => { eprintln!("warn: loading {}: {e}", path.display()); continue; }
+            "png" | "jpg" | "jpeg" => match image::open(&path) {
+                Ok(img) => img.into_rgba8(),
+                Err(e) => {
+                    eprintln!("warn: loading {}: {e}", path.display());
+                    continue;
                 }
-            }
+            },
             _ => continue,
         };
 

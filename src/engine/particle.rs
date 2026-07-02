@@ -74,31 +74,59 @@ pub struct ParticleSystem {
     max_count: usize,
     width: u32,
     height: u32,
+    life_min: f32,
+    life_max: f32,
+    size_min: f32,
+    size_max: f32,
+    drag: f32,
+    renderer_count: usize,
+    flags: u32,
 }
 
 struct EmitterState {
+    id: u32,
+    kind: EmitterKind,
     rate: f32,
     origin: [f32; 3],
     directions: [f32; 3],
+    sign: [f32; 3],
     speed_min: f32,
     speed_max: f32,
     accumulator: f32,
 }
 
+#[derive(Clone, Copy)]
+enum EmitterKind {
+    Box,
+    Sphere,
+}
+
 impl ParticleSystem {
     pub fn from_config(config: &ParticleConfig, width: u32, height: u32) -> Self {
-        let emitters = config.emitter.iter().map(|e| {
-            let origin = parse_f32_vec3(e.origin.as_deref());
-            let directions = parse_f32_vec3(e.directions.as_deref());
-            EmitterState {
-                rate: e.rate as f32,
-                origin,
-                directions,
-                speed_min: e.distancemin.unwrap_or(10.0) as f32,
-                speed_max: e.distancemax.unwrap_or(100.0) as f32,
-                accumulator: 0.0,
-            }
-        }).collect();
+        let emitters = config
+            .emitter
+            .iter()
+            .map(|e| {
+                let origin = parse_f32_vec3(e.origin.as_deref());
+                let directions = parse_f32_vec3(e.directions.as_deref());
+                let sign = parse_f32_vec3(e.sign.as_deref());
+                EmitterState {
+                    id: e.id,
+                    kind: if e.name.contains("sphere") {
+                        EmitterKind::Sphere
+                    } else {
+                        EmitterKind::Box
+                    },
+                    rate: e.rate as f32,
+                    origin,
+                    directions,
+                    sign,
+                    speed_min: e.distancemin.unwrap_or(10.0) as f32,
+                    speed_max: e.distancemax.unwrap_or(100.0) as f32,
+                    accumulator: 0.0,
+                }
+            })
+            .collect();
 
         let max_count = if config.maxcount > 0 {
             config.maxcount as usize
@@ -106,12 +134,30 @@ impl ParticleSystem {
             500
         };
 
+        let (life_min, life_max) =
+            random_range_from_initializers(&config.initializer, "lifetime", 2.0, 6.0);
+        let (size_min, size_max) =
+            random_range_from_initializers(&config.initializer, "size", 2.0, 6.0);
+        let drag = config
+            .operator
+            .iter()
+            .find(|op| op.name.contains("movement"))
+            .and_then(|op| op.value)
+            .unwrap_or(0.0) as f32;
+
         Self {
             particles: Vec::with_capacity(max_count),
             emitters,
             max_count,
             width,
             height,
+            life_min,
+            life_max,
+            size_min,
+            size_max,
+            drag,
+            renderer_count: config.renderer.len(),
+            flags: config.flags,
         }
     }
 
@@ -120,6 +166,11 @@ impl ParticleSystem {
         let h = self.height as f32;
 
         for p in &mut self.particles {
+            if self.drag > 0.0 {
+                let drag = (1.0 - self.drag * dt).clamp(0.0, 1.0);
+                p.vx *= drag;
+                p.vy *= drag;
+            }
             p.x += p.vx * dt;
             p.y += p.vy * dt;
             p.life -= dt;
@@ -132,25 +183,51 @@ impl ParticleSystem {
             emitter.accumulator += emitter.rate * dt;
             while emitter.accumulator >= 1.0 && self.particles.len() < self.max_count {
                 emitter.accumulator -= 1.0;
-                let speed = emitter.speed_min
-                    + fastrand::f32() * (emitter.speed_max - emitter.speed_min);
+                let speed =
+                    emitter.speed_min + fastrand::f32() * (emitter.speed_max - emitter.speed_min);
                 let angle = fastrand::f32() * std::f32::consts::TAU;
-                let life = 2.0 + fastrand::f32() * 4.0;
+                let life =
+                    self.life_min + fastrand::f32() * (self.life_max - self.life_min).max(0.0);
+                let size =
+                    self.size_min + fastrand::f32() * (self.size_max - self.size_min).max(0.0);
 
-                let ox = if emitter.origin[0] > 0.0 { emitter.origin[0] } else { w * 0.5 };
-                let oy = if emitter.origin[1] > 0.0 { emitter.origin[1] } else { h * 0.5 };
+                let ox = if emitter.origin[0] > 0.0 {
+                    emitter.origin[0]
+                } else {
+                    w * 0.5
+                };
+                let oy = if emitter.origin[1] > 0.0 {
+                    emitter.origin[1]
+                } else {
+                    h * 0.5
+                };
 
-                let vx = angle.cos() * speed * emitter.directions[0].max(0.1);
-                let vy = angle.sin() * speed * emitter.directions[1].max(0.1);
+                let sign_x = if emitter.sign[0] == 0.0 {
+                    1.0
+                } else {
+                    emitter.sign[0].signum()
+                };
+                let sign_y = if emitter.sign[1] == 0.0 {
+                    1.0
+                } else {
+                    emitter.sign[1].signum()
+                };
+                let (spread_x, spread_y) = match emitter.kind {
+                    EmitterKind::Box => (w * 0.2, h * 0.2),
+                    EmitterKind::Sphere => (w * 0.1, h * 0.1),
+                };
+                let id_phase = emitter.id as f32 * 0.173;
+                let vx = (angle + id_phase).cos() * speed * emitter.directions[0].max(0.1) * sign_x;
+                let vy = (angle + id_phase).sin() * speed * emitter.directions[1].max(0.1) * sign_y;
 
                 self.particles.push(Particle {
-                    x: ox + (fastrand::f32() - 0.5) * w * 0.2,
-                    y: oy + (fastrand::f32() - 0.5) * h * 0.2,
+                    x: ox + (fastrand::f32() - 0.5) * spread_x,
+                    y: oy + (fastrand::f32() - 0.5) * spread_y,
                     vx,
                     vy,
                     life,
                     max_life: life,
-                    size: 2.0 + fastrand::f32() * 4.0,
+                    size,
                     alpha: 1.0,
                     color: [255, 255, 255],
                 });
@@ -163,7 +240,9 @@ impl ParticleSystem {
         let h = canvas.height() as i32;
 
         for p in &self.particles {
-            let alpha = (p.alpha * 180.0) as u8;
+            let renderer_boost = if self.renderer_count > 1 { 1.1 } else { 1.0 };
+            let flag_boost = if self.flags & 1 != 0 { 1.15 } else { 1.0 };
+            let alpha = (p.alpha * 180.0 * renderer_boost * flag_boost).clamp(0.0, 255.0) as u8;
             if alpha == 0 {
                 continue;
             }
@@ -193,9 +272,28 @@ impl ParticleSystem {
     }
 }
 
+fn random_range_from_initializers(
+    initializers: &[Initializer],
+    needle: &str,
+    default_min: f32,
+    default_max: f32,
+) -> (f32, f32) {
+    let Some(init) = initializers.iter().find(|init| init.name.contains(needle)) else {
+        return (default_min, default_max);
+    };
+
+    (
+        init.min.unwrap_or(default_min as f64) as f32,
+        init.max.unwrap_or(default_max as f64) as f32,
+    )
+}
+
 fn parse_f32_vec3(s: Option<&str>) -> [f32; 3] {
     let Some(s) = s else { return [0.0; 3] };
-    let parts: Vec<f32> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+    let parts: Vec<f32> = s
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect();
     [
         parts.first().copied().unwrap_or(0.0),
         parts.get(1).copied().unwrap_or(0.0),

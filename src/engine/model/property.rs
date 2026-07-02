@@ -40,7 +40,8 @@ impl Property {
             "color" => PropertyKind::Color,
             "bool" => PropertyKind::Bool,
             "combo" => {
-                let options = v.get("options")?
+                let options = v
+                    .get("options")?
                     .as_array()?
                     .iter()
                     .map(|o| o.as_str().unwrap_or("").to_string())
@@ -58,7 +59,8 @@ impl Property {
             }
             PropertyKind::Color => {
                 let s = raw.as_str()?;
-                let parts: Vec<f32> = s.split_whitespace()
+                let parts: Vec<f32> = s
+                    .split_whitespace()
                     .filter_map(|p| p.parse().ok())
                     .collect();
                 let rgb = if parts.len() >= 3 {
@@ -68,9 +70,7 @@ impl Property {
                 };
                 AnimatedValue::static_val(DynamicValue::Vec3(rgb))
             }
-            PropertyKind::Bool => {
-                AnimatedValue::static_val(DynamicValue::Bool(raw.as_bool()?))
-            }
+            PropertyKind::Bool => AnimatedValue::static_val(DynamicValue::Bool(raw.as_bool()?)),
             PropertyKind::Combo { .. } => {
                 AnimatedValue::static_val(DynamicValue::Int(raw.as_i64()? as i32))
             }
@@ -80,7 +80,12 @@ impl Property {
             PropertyKind::Unknown => AnimatedValue::default(),
         };
 
-        Some(Property { key: key.to_string(), text, value, kind })
+        Some(Property {
+            key: key.to_string(),
+            text,
+            value,
+            kind,
+        })
     }
 }
 

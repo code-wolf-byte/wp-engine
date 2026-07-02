@@ -3,7 +3,6 @@ use calloop::LoopSignal;
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    shell::WaylandSurface,
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -11,9 +10,10 @@ use smithay_client_toolkit::{
     shell::wlr_layer::{
         Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
     },
+    shell::WaylandSurface,
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::sync::{Arc, Mutex, mpsc::SyncSender};
+use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use std::thread;
 use wayland_client::{
     globals::registry_queue_init,
@@ -21,8 +21,11 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
-use crate::{platform, render::{FrameSource, RenderSettings}};
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
+use crate::{
+    platform,
+    render::{FrameSource, RenderSettings},
+};
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -43,7 +46,7 @@ impl DisplayPlatform for WaylandPlatform {
 
 struct WaylandHandle {
     stop_signal: LoopSignal,
-    thread:      thread::JoinHandle<()>,
+    thread: thread::JoinHandle<()>,
 }
 
 impl WallpaperHandleInner for WaylandHandle {
@@ -74,7 +77,10 @@ fn spawn_wayland_wallpaper(
         .recv()
         .map_err(|_| anyhow!("wallpaper thread exited before sending the loop signal"))?;
 
-    Ok(WaylandHandle { stop_signal, thread })
+    Ok(WaylandHandle {
+        stop_signal,
+        thread,
+    })
 }
 
 // ── Internal renderer ─────────────────────────────────────────────────────────
@@ -88,17 +94,17 @@ struct WallpaperSurface {
 }
 
 struct WallpaperState {
-    registry_state:    RegistryState,
-    output_state:      OutputState,
-    compositor_state:  CompositorState,
-    shm:               Shm,
-    layer_shell:       LayerShell,
-    surfaces:          Vec<WallpaperSurface>,
-    frame_source:      FrameSource,
-    gpu_scaler:        platform::GpuScaler,
-    settings:          Arc<Mutex<RenderSettings>>,
+    registry_state: RegistryState,
+    output_state: OutputState,
+    compositor_state: CompositorState,
+    shm: Shm,
+    layer_shell: LayerShell,
+    surfaces: Vec<WallpaperSurface>,
+    frame_source: FrameSource,
+    gpu_scaler: platform::GpuScaler,
+    settings: Arc<Mutex<RenderSettings>>,
     /// Queue handle stored so draw_at can request wl_surface_frame callbacks.
-    qh:                Option<QueueHandle<WallpaperState>>,
+    qh: Option<QueueHandle<WallpaperState>>,
 }
 
 impl WallpaperState {
@@ -134,7 +140,9 @@ impl WallpaperState {
         };
 
         let quality = self.settings.lock().unwrap().quality;
-        let pixels = self.gpu_scaler.scale(frame.as_ref(), width, height, quality);
+        let pixels = self
+            .gpu_scaler
+            .scale(frame.as_ref(), width, height, quality);
         canvas.copy_from_slice(&pixels);
 
         let wl_surf = self.surfaces[idx].layer.wl_surface();
@@ -180,8 +188,8 @@ fn wallpaper_loop(
 
     let compositor_state = CompositorState::bind(&globals, &qh)
         .map_err(|_| anyhow!("compositor does not advertise wl_compositor"))?;
-    let shm = Shm::bind(&globals, &qh)
-        .map_err(|_| anyhow!("compositor does not advertise wl_shm"))?;
+    let shm =
+        Shm::bind(&globals, &qh).map_err(|_| anyhow!("compositor does not advertise wl_shm"))?;
     let output_state = OutputState::new(&globals, &qh);
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| {
         anyhow!("compositor does not support zwlr_layer_shell_v1 (wlr-layer-shell)")
@@ -234,20 +242,34 @@ fn wallpaper_loop(
 
 impl CompositorHandler for WallpaperState {
     fn scale_factor_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: i32,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
     fn transform_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: wl_output::Transform,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
     fn frame(
-        &mut self, _: &Connection, qh: &QueueHandle<Self>,
-        surface: &wl_surface::WlSurface, _time: u32,
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _time: u32,
     ) {
         // Compositor has presented the previous frame and is ready for the next.
         // This mirrors linux-wallpaperengine's surfaceFrameCallback pattern.
-        let idx = self.surfaces.iter().position(|s| s.layer.wl_surface() == surface);
+        let idx = self
+            .surfaces
+            .iter()
+            .position(|s| s.layer.wl_surface() == surface);
         if let Some(idx) = idx {
             self.qh = Some(qh.clone());
             self.frame_source.try_advance();
@@ -281,16 +303,17 @@ impl OutputHandler for WallpaperState {
         layer.set_size(0, 0);
         layer.commit();
 
-        self.surfaces.push(WallpaperSurface { layer, width: 0, height: 0, pool: None });
+        self.surfaces.push(WallpaperSurface {
+            layer,
+            width: 0,
+            height: 0,
+            pool: None,
+        });
     }
 
-    fn update_output(
-        &mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput,
-    ) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-    fn output_destroyed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput,
-    ) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
 impl LayerShellHandler for WallpaperState {

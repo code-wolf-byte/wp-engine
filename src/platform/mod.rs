@@ -27,19 +27,19 @@ impl RenderQuality {
     /// Lower values reduce GPU memory bandwidth at the cost of quality.
     pub fn source_scale(self) -> f32 {
         match self {
-            Self::Ultra  => 1.0,
-            Self::High   => 0.75,
+            Self::Ultra => 1.0,
+            Self::High => 0.75,
             Self::Medium => 0.5,
-            Self::Low    => 0.25,
+            Self::Low => 0.25,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Ultra  => "Ultra",
-            Self::High   => "High",
+            Self::Ultra => "Ultra",
+            Self::High => "High",
             Self::Medium => "Medium",
-            Self::Low    => "Low",
+            Self::Low => "Low",
         }
     }
 
@@ -61,10 +61,10 @@ pub enum BackendType {
 impl std::fmt::Display for BackendType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendType::Vulkan  => write!(f, "Vulkan"),
-            BackendType::Metal   => write!(f, "Metal"),
-            BackendType::Dx12    => write!(f, "D3D12"),
-            BackendType::OpenGl  => write!(f, "OpenGL"),
+            BackendType::Vulkan => write!(f, "Vulkan"),
+            BackendType::Metal => write!(f, "Metal"),
+            BackendType::Dx12 => write!(f, "D3D12"),
+            BackendType::OpenGl => write!(f, "OpenGL"),
             BackendType::Unknown => write!(f, "Unknown"),
         }
     }
@@ -89,11 +89,11 @@ pub enum GpuDeviceType {
 impl std::fmt::Display for GpuDeviceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GpuDeviceType::Discrete   => write!(f, "Discrete"),
+            GpuDeviceType::Discrete => write!(f, "Discrete"),
             GpuDeviceType::Integrated => write!(f, "Integrated"),
-            GpuDeviceType::Virtual    => write!(f, "Virtual"),
-            GpuDeviceType::Software   => write!(f, "Software"),
-            GpuDeviceType::Unknown    => write!(f, "Unknown"),
+            GpuDeviceType::Virtual => write!(f, "Virtual"),
+            GpuDeviceType::Software => write!(f, "Software"),
+            GpuDeviceType::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -130,12 +130,4 @@ pub fn probe_adapters() -> Vec<GpuAdapter> {
 /// Prefers a discrete GPU; falls back to integrated, then software.
 pub fn open_device() -> anyhow::Result<GpuDevice> {
     GpuDevice::open_best()
-}
-
-/// Open the lowest-power GPU device available.
-///
-/// Prefer this for background tasks that should not compete with foreground
-/// 3-D applications for the discrete GPU.
-pub fn open_low_power_device() -> anyhow::Result<GpuDevice> {
-    GpuDevice::open_low_power()
 }

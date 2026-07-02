@@ -4,20 +4,23 @@
 //   Pass has no combos field → empty HashMap
 //   json_to_animated scripted branch: inner_value.value, not inner_value directly
 //   camera is Option<Camera>, must use as_ref()
-use crate::engine::scene;
 use super::dynamic_value::{AnimatedValue, DynamicValue};
-use super::objects::{SceneModel, ObjectModel, EffectModel, PassModel};
+use super::objects::{EffectModel, ObjectModel, PassModel, SceneModel};
+use crate::engine::scene;
 use anyhow::Result;
 use std::collections::HashMap;
 
 pub fn scene_to_model(scene: &scene::Scene) -> Result<SceneModel> {
-    let camera_eye = scene.camera
+    let camera_eye = scene
+        .camera
         .as_ref()
         .and_then(|c| c.parsed_eye())
         .map(|e| [e[0] as f32, e[1] as f32, e[2] as f32])
         .unwrap_or([0.0; 3]);
 
-    let objects = scene.objects.iter()
+    let objects = scene
+        .objects
+        .iter()
         .enumerate()
         .map(|(i, obj)| object_to_model(i, obj))
         .collect();
@@ -34,14 +37,38 @@ fn object_to_model(index: usize, obj: &scene::SceneObject) -> ObjectModel {
         index,
         name: obj.name.clone().unwrap_or_default(),
         image: obj.image.clone(),
-        origin: obj.origin.as_ref().map(json_to_animated).unwrap_or_default(),
+        origin: obj
+            .origin
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or_default(),
         // WE "scale" is a vec3 multiplier applied to the layer's native texture dimensions.
         // "size" is an optional pixel-dimension override (rarely set; texture size takes precedence).
-        scale: obj.scale.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
-        angles: obj.angles.as_ref().map(json_to_animated).unwrap_or_default(),
-        alpha: obj.alpha.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from(1.0f32)),
-        color: obj.color.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
-        visible: obj.visible.as_ref().map(json_to_animated).unwrap_or(AnimatedValue::from(true)),
+        scale: obj
+            .scale
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
+        angles: obj
+            .angles
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or_default(),
+        alpha: obj
+            .alpha
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or(AnimatedValue::from(1.0f32)),
+        color: obj
+            .color
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
+        visible: obj
+            .visible
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or(AnimatedValue::from(true)),
         blend_mode: obj.color_blend_mode,
         effects: obj.effects.iter().map(effect_to_model).collect(),
         particle: obj.particle.clone(),
@@ -58,12 +85,15 @@ fn effect_to_model(eff: &scene::Effect) -> EffectModel {
 }
 
 fn pass_to_model(pass: &scene::Pass) -> PassModel {
-    let shader_values: HashMap<String, AnimatedValue> = pass.constantshadervalues
+    let shader_values: HashMap<String, AnimatedValue> = pass
+        .constantshadervalues
         .iter()
         .map(|(k, v)| (k.clone(), json_to_animated(v)))
         .collect();
 
-    let textures: Vec<String> = pass.textures.iter()
+    let textures: Vec<String> = pass
+        .textures
+        .iter()
         .filter_map(|t| t.file.clone())
         .collect();
 
@@ -93,7 +123,8 @@ fn json_to_animated(v: &serde_json::Value) -> AnimatedValue {
         }
         serde_json::Value::Array(arr) => {
             // [r, g, b] arrays used for Vec3 color values
-            let floats: Vec<f32> = arr.iter()
+            let floats: Vec<f32> = arr
+                .iter()
                 .filter_map(|x| x.as_f64().map(|f| f as f32))
                 .collect();
             if floats.len() == 3 {
@@ -105,11 +136,10 @@ fn json_to_animated(v: &serde_json::Value) -> AnimatedValue {
         serde_json::Value::Number(n) => {
             AnimatedValue::static_val(DynamicValue::Float(n.as_f64().unwrap_or(0.0) as f32))
         }
-        serde_json::Value::Bool(b) => {
-            AnimatedValue::static_val(DynamicValue::Bool(*b))
-        }
+        serde_json::Value::Bool(b) => AnimatedValue::static_val(DynamicValue::Bool(*b)),
         serde_json::Value::String(s) => {
-            let parts: Vec<f32> = s.split_whitespace()
+            let parts: Vec<f32> = s
+                .split_whitespace()
                 .filter_map(|p| p.parse().ok())
                 .collect();
             if parts.len() >= 3 {

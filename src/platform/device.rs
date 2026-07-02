@@ -66,6 +66,10 @@ impl GpuDevice {
             .await
             .map_err(|e| anyhow!("failed to open GPU device '{}': {e}", info.name))?;
 
-        Ok(Self { info, device, queue })
+        Ok(Self {
+            info,
+            device,
+            queue,
+        })
     }
 }

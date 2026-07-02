@@ -23,7 +23,7 @@ pub struct Layer {
     pub frame_duration_ms: u32,
     pub origin: [f64; 3],
     pub size: [f64; 3],
-    pub scale: [f64; 3],   // WE scale multiplier (default 1.0), separate from size
+    pub scale: [f64; 3], // WE scale multiplier (default 1.0), separate from size
     pub parallax_depth: f64,
     pub blend_mode: u32,
     /// True for WE "copybackground" layers — source is the rendered canvas so far.
@@ -39,7 +39,6 @@ impl ResolvedScene {
         let scene_json_path = dir.join("scene.json");
         let scene_pkg_path = dir.join("scene.pkg");
 
-        // If assets are packed in scene.pkg, load via the PKG path.
         if scene_pkg_path.exists() {
             let pkg = Package::from_file(&scene_pkg_path)?;
 
@@ -56,14 +55,15 @@ impl ResolvedScene {
             return Self::from_package_with_dir(&pkg, &scene_json, dir);
         }
 
-        // Loose-file scene: scene.json + textures alongside it.
         let scene_json = std::fs::read_to_string(&scene_json_path)
             .with_context(|| format!("reading {}", scene_json_path.display()))?;
         let scene = Scene::from_json(&scene_json)?;
 
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
-            if obj.particle.is_some() { continue; }
+            if obj.particle.is_some() {
+                continue;
+            }
             if obj.copybackground {
                 if !obj.effects.is_empty() {
                     layers.push(layer_from_object(obj, placeholder_for(obj)));
@@ -72,15 +72,21 @@ impl ResolvedScene {
             }
             let img = match obj.image.as_deref() {
                 None => {
-                    if obj.effects.is_empty() { continue; }
+                    if obj.effects.is_empty() {
+                        continue;
+                    }
                     placeholder_for(obj)
                 }
                 Some(path) => {
-                    if is_special_layer(path) { continue; }
+                    if is_special_layer(path) {
+                        continue;
+                    }
                     match load_texture_from_dir(dir, path) {
                         Ok(img) => img,
                         Err(_) => {
-                            if obj.effects.is_empty() { continue; }
+                            if obj.effects.is_empty() {
+                                continue;
+                            }
                             placeholder_for(obj)
                         }
                     }
@@ -90,7 +96,12 @@ impl ResolvedScene {
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-        Ok(Self { width, height, layers, scene })
+        Ok(Self {
+            width,
+            height,
+            layers,
+            scene,
+        })
     }
 
     /// Load from a PKG archive, falling back to the directory for loose files.
@@ -99,33 +110,36 @@ impl ResolvedScene {
 
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
-            if obj.particle.is_some() { continue; }
-            // copybackground layers use a transparent desktop capture we can't render.
-            // Use an opaque placeholder so screen-space effects have a visible base.
+            if obj.particle.is_some() {
+                continue;
+            }
             if obj.copybackground {
                 if !obj.effects.is_empty() {
                     let ph = placeholder_for(obj);
-                    eprintln!("[DEBUG] copybackground layer '{}' → placeholder {}×{}", obj.name.as_deref().unwrap_or("?"), ph.width(), ph.height());
                     layers.push(layer_from_object(obj, ph));
                 }
                 continue;
             }
             let img = match obj.image.as_deref() {
                 None => {
-                    if obj.effects.is_empty() { continue; }
+                    if obj.effects.is_empty() {
+                        continue;
+                    }
                     placeholder_for(obj)
                 }
                 Some(path) => {
-                    if is_special_layer(path) { continue; }
-                    match load_texture_from_pkg(pkg, path)
-                        .or_else(|pkg_err| {
-                            load_texture_from_dir(dir, path)
-                                .map_err(|dir_err| anyhow::anyhow!("pkg: {pkg_err}; dir: {dir_err}"))
-                        })
-                    {
+                    if is_special_layer(path) {
+                        continue;
+                    }
+                    match load_texture_from_pkg(pkg, path).or_else(|pkg_err| {
+                        load_texture_from_dir(dir, path)
+                            .map_err(|dir_err| anyhow::anyhow!("pkg: {pkg_err}; dir: {dir_err}"))
+                    }) {
                         Ok(img) => img,
                         Err(_) => {
-                            if obj.effects.is_empty() { continue; }
+                            if obj.effects.is_empty() {
+                                continue;
+                            }
                             placeholder_for(obj)
                         }
                     }
@@ -135,7 +149,12 @@ impl ResolvedScene {
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-        Ok(Self { width, height, layers, scene })
+        Ok(Self {
+            width,
+            height,
+            layers,
+            scene,
+        })
     }
 
     /// Load a scene wallpaper from a PKG archive + scene.json string.
@@ -144,7 +163,9 @@ impl ResolvedScene {
 
         let mut layers = Vec::new();
         for obj in scene.visible_objects() {
-            if obj.particle.is_some() { continue; }
+            if obj.particle.is_some() {
+                continue;
+            }
             if obj.copybackground {
                 if !obj.effects.is_empty() {
                     layers.push(layer_from_object(obj, placeholder_for(obj)));
@@ -153,15 +174,21 @@ impl ResolvedScene {
             }
             let img = match obj.image.as_deref() {
                 None => {
-                    if obj.effects.is_empty() { continue; }
+                    if obj.effects.is_empty() {
+                        continue;
+                    }
                     placeholder_for(obj)
                 }
                 Some(path) => {
-                    if is_special_layer(path) { continue; }
+                    if is_special_layer(path) {
+                        continue;
+                    }
                     match load_texture_from_pkg(pkg, path) {
                         Ok(img) => img,
                         Err(_) => {
-                            if obj.effects.is_empty() { continue; }
+                            if obj.effects.is_empty() {
+                                continue;
+                            }
                             placeholder_for(obj)
                         }
                     }
@@ -171,7 +198,12 @@ impl ResolvedScene {
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
-        Ok(Self { width, height, layers, scene })
+        Ok(Self {
+            width,
+            height,
+            layers,
+            scene,
+        })
     }
 
     /// Composite all layers into a single RGBA image.
@@ -194,7 +226,12 @@ impl ResolvedScene {
             }
 
             let resized = if layer.image.width() != draw_w || layer.image.height() != draw_h {
-                image::imageops::resize(&layer.image, draw_w, draw_h, image::imageops::FilterType::Lanczos3)
+                image::imageops::resize(
+                    &layer.image,
+                    draw_w,
+                    draw_h,
+                    image::imageops::FilterType::Lanczos3,
+                )
             } else {
                 layer.image.clone()
             };
@@ -315,21 +352,19 @@ fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<RgbaImage> {
     // Try as .tex first
     let tex_path = full_path.with_extension("tex");
     if tex_path.exists() {
-        let data = std::fs::read(&tex_path)
-            .with_context(|| format!("reading {}", tex_path.display()))?;
-        let tex = TexFile::parse(&data)
-            .with_context(|| format!("parsing {}", tex_path.display()))?;
+        let data =
+            std::fs::read(&tex_path).with_context(|| format!("reading {}", tex_path.display()))?;
+        let tex =
+            TexFile::parse(&data).with_context(|| format!("parsing {}", tex_path.display()))?;
         return tex.to_rgba();
     }
 
-    // Try the path as-is (png, jpg, etc.)
     if full_path.exists() {
         return image::open(&full_path)
             .map(|i| i.into_rgba8())
             .with_context(|| format!("loading {}", full_path.display()));
     }
 
-    // Try with .tex extension appended
     let tex_path_str = format!("{}.tex", full_path.display());
     let tex_appended = Path::new(&tex_path_str);
     if tex_appended.exists() {
@@ -356,8 +391,8 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<RgbaImage> {
     };
 
     if let Some(data) = pkg.get(&tex_name) {
-        let tex = TexFile::parse(data)
-            .with_context(|| format!("parsing .tex from pkg: {tex_name}"))?;
+        let tex =
+            TexFile::parse(data).with_context(|| format!("parsing .tex from pkg: {tex_name}"))?;
         return tex.to_rgba();
     }
 
@@ -365,12 +400,16 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<RgbaImage> {
     if let Some(data) = pkg.get(image_path) {
         if is_video_path(image_path) {
             let ext = std::path::Path::new(image_path)
-                .extension().and_then(|e| e.to_str()).unwrap_or("mp4");
-            let tmp = std::env::temp_dir().join(format!("we_vidtex_{}.{ext}",
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("mp4");
+            let tmp = std::env::temp_dir().join(format!(
+                "we_vidtex_{}.{ext}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.subsec_nanos())
-                    .unwrap_or(0)));
+                    .unwrap_or(0)
+            ));
             std::fs::write(&tmp, data)
                 .with_context(|| format!("writing video temp file: {}", tmp.display()))?;
             let result = crate::render::ffmpeg::decode_first_frame(&tmp);
@@ -385,19 +424,18 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<RgbaImage> {
     anyhow::bail!("texture not found in package: {image_path}")
 }
 
-/// Follow the model → material → texture reference chain in a PKG archive.
+/// Follow the model -> material -> texture reference chain in a PKG archive.
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
-    let data = pkg.get(json_path)
+    let data = pkg
+        .get(json_path)
         .with_context(|| format!("model/material not found in pkg: {json_path}"))?;
-    let val: serde_json::Value = serde_json::from_slice(data)
-        .with_context(|| format!("parsing {json_path}"))?;
+    let val: serde_json::Value =
+        serde_json::from_slice(data).with_context(|| format!("parsing {json_path}"))?;
 
-    // Model file: { "material": "materials/X.json" }
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
         return resolve_model_chain_pkg(pkg, mat_path);
     }
 
-    // Material file: { "passes": [{ "textures": ["name"] }] }
     if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
         for pass in passes {
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
@@ -409,7 +447,7 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
                                 .with_context(|| format!("parsing {tex_path}"))?;
                             return tex.to_rgba();
                         }
-                        // Try without materials/ prefix
+
                         let alt_path = format!("{tex_name}.tex");
                         if let Some(tex_data) = pkg.get(&alt_path) {
                             let tex = TexFile::parse(tex_data)?;
@@ -424,13 +462,13 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
     anyhow::bail!("could not resolve texture from {json_path}")
 }
 
-/// Follow the model → material → texture chain for loose files on disk.
+/// Follow the model -> material -> texture chain for loose files on disk.
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
     let full = dir.join(json_path);
-    let data = std::fs::read_to_string(&full)
-        .with_context(|| format!("reading {}", full.display()))?;
-    let val: serde_json::Value = serde_json::from_str(&data)
-        .with_context(|| format!("parsing {}", full.display()))?;
+    let data =
+        std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&data).with_context(|| format!("parsing {}", full.display()))?;
 
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
         return resolve_model_chain_dir(dir, mat_path);

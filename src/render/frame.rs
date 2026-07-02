@@ -19,7 +19,6 @@ pub enum FrameSource {
         current: Arc<RgbaImage>,
         /// Receive end of the bounded channel from the decoder thread.
         rx: Receiver<Arc<RgbaImage>>,
-        fps: f64,
     },
 }
 
@@ -43,16 +42,22 @@ impl FrameSource {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             eprintln!("GPU scene render failed, falling back to CPU: {e}");
-                            if let Err(e2) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
+                            if let Err(e2) =
+                                crate::engine::animated::scene_render_loop(&dir, &tx, target_fps)
+                            {
                                 eprintln!("CPU scene render error: {e2}");
                             }
                         }
                         Err(panic_val) => {
-                            let msg = panic_val.downcast_ref::<String>().cloned()
+                            let msg = panic_val
+                                .downcast_ref::<String>()
+                                .cloned()
                                 .or_else(|| panic_val.downcast_ref::<&str>().map(|s| s.to_string()))
                                 .unwrap_or_else(|| "(unknown panic)".into());
                             eprintln!("GPU render thread panicked: {msg} — falling back to CPU");
-                            if let Err(e2) = crate::engine::animated::scene_render_loop(&dir, &tx, target_fps) {
+                            if let Err(e2) =
+                                crate::engine::animated::scene_render_loop(&dir, &tx, target_fps)
+                            {
                                 eprintln!("CPU scene render error: {e2}");
                             }
                         }
@@ -63,9 +68,9 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("scene renderer exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx, fps: target_fps })
+                Ok(FrameSource::Video { current: first, rx })
             }
-            WallpaperContent::Video { path, fps } => {
+            WallpaperContent::Video { path } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
 
                 thread::spawn(move || {
@@ -80,7 +85,7 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("video decoder exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx, fps })
+                Ok(FrameSource::Video { current: first, rx })
             }
         }
     }
@@ -104,7 +109,7 @@ impl FrameSource {
     pub fn try_advance(&mut self) -> bool {
         match self {
             FrameSource::Static(_) => false,
-            FrameSource::Video { current, rx, .. } => {
+            FrameSource::Video { current, rx } => {
                 if let Ok(frame) = rx.try_recv() {
                     *current = frame;
                     true
@@ -119,14 +124,5 @@ impl FrameSource {
     #[inline]
     pub fn is_animated(&self) -> bool {
         matches!(self, FrameSource::Video { .. })
-    }
-
-    /// Native frame rate. Returns `0.0` for static sources.
-    #[inline]
-    pub fn fps(&self) -> f64 {
-        match self {
-            FrameSource::Static(_) => 0.0,
-            FrameSource::Video { fps, .. } => *fps,
-        }
     }
 }

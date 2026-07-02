@@ -19,7 +19,11 @@ pub fn load_glsl_shader(assets_dir: &Path, shader_name: &str) -> Result<(String,
 
 /// Load a GLSL shader, checking the effect bundle dir first if effect_name is given.
 /// WE bundles effect shaders inside assets/effects/{effect_name}/shaders/.
-pub fn load_glsl_shader_for_effect(assets_dir: &Path, shader_name: &str, effect_name: Option<&str>) -> Result<(String, String)> {
+pub fn load_glsl_shader_for_effect(
+    assets_dir: &Path,
+    shader_name: &str,
+    effect_name: Option<&str>,
+) -> Result<(String, String)> {
     let main_shader_dir = assets_dir.join("shaders");
 
     if let Some(eff) = effect_name {

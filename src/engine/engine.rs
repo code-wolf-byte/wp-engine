@@ -20,8 +20,8 @@ pub struct SceneEngine {
     pub resource_manager: Arc<ResourceManager>,
     camera: SceneCamera,
     fbo_pool: RenderTargetPool,
-    objects: Vec<SceneObject>,    // sorted by render_order ascending
-    scene_fbo: RenderTarget,      // final composited output
+    objects: Vec<SceneObject>, // sorted by render_order ascending
+    scene_fbo: RenderTarget,   // final composited output
     clear_color: [f64; 3],
     global_time_secs: f64,
     scene_width: u32,
@@ -49,7 +49,7 @@ impl SceneEngine {
         for (i, layer) in resolved.layers.iter().enumerate() {
             let mut builder = SceneObjectBuilder::new(i as i32, layer.name.clone());
             builder.render_order = i as i32;
-            builder.blend_mode   = layer.blend_mode;
+            builder.blend_mode = layer.blend_mode;
             builder.copybackground = layer.copybackground;
             builder.world_origin = [
                 layer.origin[0] as f32,
@@ -59,7 +59,9 @@ impl SceneEngine {
             builder.world_size = [layer.size[0] as f32, layer.size[1] as f32];
 
             // Upload base texture + animation frames.
-            builder.base_frames.push(Arc::new(rm.upload_rgba(&layer.image)));
+            builder
+                .base_frames
+                .push(Arc::new(rm.upload_rgba(&layer.image)));
             for frame in &layer.extra_frames {
                 builder.base_frames.push(Arc::new(rm.upload_rgba(frame)));
             }
@@ -67,9 +69,12 @@ impl SceneEngine {
 
             // Map scene effects to ScenePass descriptors.
             // Match by name to find the corresponding scene object's effects.
-            if let Some(scene_obj) = resolved.scene.objects.iter().find(|o| {
-                o.name.as_deref() == Some(layer.name.as_str())
-            }) {
+            if let Some(scene_obj) = resolved
+                .scene
+                .objects
+                .iter()
+                .find(|o| o.name.as_deref() == Some(layer.name.as_str()))
+            {
                 for eff in &scene_obj.effects {
                     let effect_key = eff.file.as_deref().unwrap_or("unknown");
                     let pass = ScenePass::new(effect_key, vec![0u8; 16], vec![]);
@@ -139,7 +144,9 @@ impl SceneEngine {
         // TODO (Phase 7): blit current_texture() → primary_fbo, run effect passes
         // (ping-pong primary_fbo ↔ sub_fbo), composite primary_fbo → scene_fbo.
         for obj in &self.objects {
-            if !obj.is_visible { continue; }
+            if !obj.is_visible {
+                continue;
+            }
             let view = obj.primary_fbo.view();
             let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("obj_primary_clear"),
@@ -157,11 +164,21 @@ impl SceneEngine {
         }
     }
 
-    pub fn output_texture(&self) -> &wgpu::Texture { &self.scene_fbo.texture }
-    pub fn scene_width(&self)  -> u32  { self.scene_width }
-    pub fn scene_height(&self) -> u32  { self.scene_height }
-    pub fn global_time(&self)  -> f64  { self.global_time_secs }
-    pub fn object_count(&self) -> usize { self.objects.len() }
+    pub fn output_texture(&self) -> &wgpu::Texture {
+        &self.scene_fbo.texture
+    }
+    pub fn scene_width(&self) -> u32 {
+        self.scene_width
+    }
+    pub fn scene_height(&self) -> u32 {
+        self.scene_height
+    }
+    pub fn global_time(&self) -> f64 {
+        self.global_time_secs
+    }
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
 
     /// Quad transform for a scene object: (offset_norm, size_norm).
     pub fn object_quad(&self, obj: &SceneObject) -> ([f32; 2], [f32; 2]) {
@@ -172,7 +189,8 @@ impl SceneEngine {
 fn parse_clear_color(scene: &crate::engine::scene::Scene) -> [f64; 3] {
     if let Some(cc) = scene.general.as_ref().and_then(|g| g.clear_color.as_ref()) {
         if let Some(s) = cc.as_str() {
-            let parts: Vec<f64> = s.split_whitespace()
+            let parts: Vec<f64> = s
+                .split_whitespace()
                 .filter_map(|t| t.parse().ok())
                 .collect();
             if parts.len() >= 3 {

@@ -26,7 +26,10 @@ pub fn parse_uniform_metadata(glsl_source: &str) -> Vec<UniformMeta> {
         };
         let json_str = &trimmed[json_start..];
 
-        let parts: Vec<&str> = trimmed[..json_start - 3].trim().split_whitespace().collect();
+        let parts: Vec<&str> = trimmed[..json_start - 3]
+            .trim()
+            .split_whitespace()
+            .collect();
         if parts.len() < 3 {
             continue;
         }
@@ -38,7 +41,8 @@ pub fn parse_uniform_metadata(glsl_source: &str) -> Vec<UniformMeta> {
             Err(_) => continue,
         };
 
-        let range = json_val.get("range")
+        let range = json_val
+            .get("range")
             .and_then(|v| v.as_array())
             .and_then(|a| {
                 let min = a.first()?.as_f64()?;
@@ -49,13 +53,28 @@ pub fn parse_uniform_metadata(glsl_source: &str) -> Vec<UniformMeta> {
         uniforms.push(UniformMeta {
             uniform_name,
             uniform_type,
-            material_key: json_val.get("material").and_then(|v| v.as_str()).map(String::from),
-            label: json_val.get("label").and_then(|v| v.as_str()).map(String::from),
+            material_key: json_val
+                .get("material")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            label: json_val
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             default_value: json_val.get("default").cloned(),
             range,
-            hidden: json_val.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false),
-            combo: json_val.get("combo").and_then(|v| v.as_str()).map(String::from),
-            mode: json_val.get("mode").and_then(|v| v.as_str()).map(String::from),
+            hidden: json_val
+                .get("hidden")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            combo: json_val
+                .get("combo")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            mode: json_val
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         });
     }
 

@@ -15,12 +15,20 @@ impl SceneCamera {
     /// Derive dimensions from scene.json, falling back to `fallback_wh`.
     /// Priority: camera.orthogonal_projection → general.orthogonal_projection → fallback.
     pub fn from_scene(scene: &crate::engine::scene::Scene, fallback_wh: (u32, u32)) -> Self {
-        if let Some(proj) = scene.camera.as_ref().and_then(|c| c.orthogonal_projection.as_ref()) {
+        if let Some(proj) = scene
+            .camera
+            .as_ref()
+            .and_then(|c| c.orthogonal_projection.as_ref())
+        {
             if let (Some(w), Some(h)) = (proj.width, proj.height) {
                 return Self::new(w as f32, h as f32);
             }
         }
-        if let Some(proj) = scene.general.as_ref().and_then(|g| g.orthogonal_projection.as_ref()) {
+        if let Some(proj) = scene
+            .general
+            .as_ref()
+            .and_then(|g| g.orthogonal_projection.as_ref())
+        {
             if let (Some(w), Some(h)) = (proj.width, proj.height) {
                 return Self::new(w as f32, h as f32);
             }
@@ -38,23 +46,23 @@ impl SceneCamera {
         world_origin: [f32; 3],
         world_size: [f32; 2],
     ) -> ([f32; 2], [f32; 2]) {
-        let left_px = self.width  / 2.0 + world_origin[0] - world_size[0] / 2.0;
-        let top_px  = self.height / 2.0 - world_origin[1] - world_size[1] / 2.0;
+        let left_px = self.width / 2.0 + world_origin[0] - world_size[0] / 2.0;
+        let top_px = self.height / 2.0 - world_origin[1] - world_size[1] / 2.0;
         let offset_norm = [left_px / self.width, top_px / self.height];
-        let size_norm   = [world_size[0] / self.width, world_size[1] / self.height];
+        let size_norm = [world_size[0] / self.width, world_size[1] / self.height];
         (offset_norm, size_norm)
     }
 
     /// Column-major orthogonal projection matrix mapping world coords to NDC.
     /// Maps x∈[0,w], y∈[0,h] → NDC [-1,1].
     pub fn mvp_matrix(&self) -> [f32; 16] {
-        let sx =  2.0 / self.width;
+        let sx = 2.0 / self.width;
         let sy = -2.0 / self.height;
         [
-            sx,   0.0, 0.0, 0.0,   // col 0
-            0.0,  sy,  0.0, 0.0,   // col 1
-            0.0,  0.0, 1.0, 0.0,   // col 2
-           -1.0,  1.0, 0.0, 1.0,   // col 3
+            sx, 0.0, 0.0, 0.0, // col 0
+            0.0, sy, 0.0, 0.0, // col 1
+            0.0, 0.0, 1.0, 0.0, // col 2
+            -1.0, 1.0, 0.0, 1.0, // col 3
         ]
     }
 }
@@ -67,8 +75,13 @@ mod tests {
     fn scene_with_camera_proj(w: u32, h: u32) -> Scene {
         Scene {
             camera: Some(Camera {
-                center: None, eye: None, parallax_amount: None,
-                orthogonal_projection: Some(OrthogonalProjection { width: Some(w), height: Some(h) }),
+                center: None,
+                eye: None,
+                parallax_amount: None,
+                orthogonal_projection: Some(OrthogonalProjection {
+                    width: Some(w),
+                    height: Some(h),
+                }),
             }),
             general: None,
             objects: vec![],
@@ -79,15 +92,24 @@ mod tests {
         Scene {
             camera: None,
             general: Some(General {
-                supports_audio_processing: None, speed: None, clear_color: None,
-                orthogonal_projection: Some(OrthogonalProjection { width: Some(w), height: Some(h) }),
+                supports_audio_processing: None,
+                speed: None,
+                clear_color: None,
+                orthogonal_projection: Some(OrthogonalProjection {
+                    width: Some(w),
+                    height: Some(h),
+                }),
             }),
             objects: vec![],
         }
     }
 
     fn empty_scene() -> Scene {
-        Scene { camera: None, general: None, objects: vec![] }
+        Scene {
+            camera: None,
+            general: None,
+            objects: vec![],
+        }
     }
 
     #[test]
@@ -125,11 +147,11 @@ mod tests {
     fn mvp_matrix_column_major() {
         let cam = SceneCamera::new(1920.0, 1080.0);
         let m = cam.mvp_matrix();
-        assert!((m[0]  -  2.0/1920.0).abs() < 1e-7);
-        assert!((m[5]  - -2.0/1080.0).abs() < 1e-7);
+        assert!((m[0] - 2.0 / 1920.0).abs() < 1e-7);
+        assert!((m[5] - -2.0 / 1080.0).abs() < 1e-7);
         assert_eq!(m[10], 1.0);
         assert_eq!(m[12], -1.0);
-        assert_eq!(m[13],  1.0);
-        assert_eq!(m[15],  1.0);
+        assert_eq!(m[13], 1.0);
+        assert_eq!(m[15], 1.0);
     }
 }

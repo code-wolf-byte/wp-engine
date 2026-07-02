@@ -14,7 +14,12 @@ impl SceneEffect {
             let alpha = extract_f32(values, "alpha").unwrap_or(1.0);
             let color = extract_string(values, "tintcolor").unwrap_or_default();
             let rgb = parse_color(&color);
-            Some(SceneEffect::Tint { r: rgb[0], g: rgb[1], b: rgb[2], alpha })
+            Some(SceneEffect::Tint {
+                r: rgb[0],
+                g: rgb[1],
+                b: rgb[2],
+                alpha,
+            })
         } else if name_lower.contains("opacity") {
             let alpha = extract_f32(values, "alpha").unwrap_or(1.0);
             Some(SceneEffect::Opacity { alpha })
@@ -103,9 +108,7 @@ fn extract_f32(v: &serde_json::Value, key: &str) -> Option<f32> {
     let val = v.get(key)?;
     match val {
         serde_json::Value::Number(n) => n.as_f64().map(|f| f as f32),
-        serde_json::Value::Object(m) => {
-            m.get("value").and_then(|v| v.as_f64()).map(|f| f as f32)
-        }
+        serde_json::Value::Object(m) => m.get("value").and_then(|v| v.as_f64()).map(|f| f as f32),
         _ => None,
     }
 }
@@ -115,7 +118,10 @@ fn extract_string(v: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 fn parse_color(s: &str) -> [f32; 3] {
-    let parts: Vec<f32> = s.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+    let parts: Vec<f32> = s
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect();
     [
         parts.first().copied().unwrap_or(1.0),
         parts.get(1).copied().unwrap_or(1.0),

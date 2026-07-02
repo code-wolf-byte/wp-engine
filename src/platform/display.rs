@@ -17,16 +17,14 @@ pub(crate) trait WallpaperHandleInner: Send {
 /// Drop or call `stop()` to remove the wallpaper.
 pub struct WallpaperHandle {
     inner: Box<dyn WallpaperHandleInner>,
-    /// Live render settings shared with the wallpaper thread.
-    pub settings: Arc<Mutex<RenderSettings>>,
 }
 
 impl WallpaperHandle {
     pub(crate) fn new(
         inner: Box<dyn WallpaperHandleInner>,
-        settings: Arc<Mutex<RenderSettings>>,
+        _settings: Arc<Mutex<RenderSettings>>,
     ) -> Self {
-        Self { inner, settings }
+        Self { inner }
     }
 
     /// Stop the renderer and wait for its thread to exit.

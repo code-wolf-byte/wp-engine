@@ -1,6 +1,6 @@
 // Agent output (qwen3-coder) — lightly corrected for field alignment with scene.rs.
-use std::collections::HashMap;
 use super::dynamic_value::AnimatedValue;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct SceneModel {
@@ -14,12 +14,12 @@ pub struct ObjectModel {
     pub index: usize,
     pub name: String,
     pub image: Option<String>,
-    pub origin: AnimatedValue,   // Vec3
-    pub scale: AnimatedValue,    // Vec3
-    pub angles: AnimatedValue,   // Vec3
-    pub alpha: AnimatedValue,    // Float
-    pub color: AnimatedValue,    // Vec3
-    pub visible: AnimatedValue,  // Bool
+    pub origin: AnimatedValue,  // Vec3
+    pub scale: AnimatedValue,   // Vec3
+    pub angles: AnimatedValue,  // Vec3
+    pub alpha: AnimatedValue,   // Float
+    pub color: AnimatedValue,   // Vec3
+    pub visible: AnimatedValue, // Bool
     pub blend_mode: u32,
     pub effects: Vec<EffectModel>,
     pub particle: Option<serde_json::Value>,

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::engine::pkg::Package;
-use crate::engine::tex::TexFile;
 use crate::engine::shaders::loader;
+use crate::engine::tex::TexFile;
 
 pub struct ResourceManager {
     device: Arc<wgpu::Device>,
@@ -36,7 +36,13 @@ impl ResourceManager {
             ..Default::default()
         });
         let dummy_texture = Arc::new(Self::create_white_1x1(&device, &queue));
-        Self { device, queue, sampler, dummy_texture, texture_cache: Mutex::new(HashMap::new()) }
+        Self {
+            device,
+            queue,
+            sampler,
+            dummy_texture,
+            texture_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Return a cached texture or load it on demand.
@@ -60,14 +66,22 @@ impl ResourceManager {
                     .to_rgba()
                     .with_context(|| format!("decoding RGBA from pkg tex: {key}"))?;
                 let tex = Arc::new(self.upload_rgba(&img));
-                self.texture_cache.lock().unwrap().insert(key.to_owned(), Arc::clone(&tex));
+                self.texture_cache
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_owned(), Arc::clone(&tex));
                 return Ok(tex);
             }
         }
 
-        let tex = Arc::new(self.load_from_disk(key)
-            .with_context(|| format!("loading texture from disk: {key}"))?);
-        self.texture_cache.lock().unwrap().insert(key.to_owned(), Arc::clone(&tex));
+        let tex = Arc::new(
+            self.load_from_disk(key)
+                .with_context(|| format!("loading texture from disk: {key}"))?,
+        );
+        self.texture_cache
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), Arc::clone(&tex));
         Ok(tex)
     }
 
@@ -81,7 +95,11 @@ impl ResourceManager {
         let (w, h) = img.dimensions();
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("rm_rgba_tex"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -91,35 +109,59 @@ impl ResourceManager {
         });
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &tex, mip_level: 0,
-                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
             },
             img.as_raw(),
             wgpu::TexelCopyBufferLayout {
-                offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h),
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         tex
     }
 
     /// Upload multiple animation frames. Returns Vec in frame order. Not cached.
     pub fn upload_frames(&self, frames: Vec<RgbaImage>) -> Vec<Arc<wgpu::Texture>> {
-        frames.iter().map(|img| Arc::new(self.upload_rgba(img))).collect()
+        frames
+            .iter()
+            .map(|img| Arc::new(self.upload_rgba(img)))
+            .collect()
     }
 
-    pub fn device(&self) -> &wgpu::Device { &self.device }
-    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
-    pub fn sampler(&self) -> &wgpu::Sampler { &self.sampler }
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+    pub fn sampler(&self) -> &wgpu::Sampler {
+        &self.sampler
+    }
 
     /// 1×1 opaque-white texture for unbound texture slots.
-    pub fn dummy_texture(&self) -> Arc<wgpu::Texture> { Arc::clone(&self.dummy_texture) }
+    pub fn dummy_texture(&self) -> Arc<wgpu::Texture> {
+        Arc::clone(&self.dummy_texture)
+    }
 
     fn create_white_1x1(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dummy_white_1x1"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
@@ -128,8 +170,16 @@ impl ResourceManager {
         queue.write_texture(
             tex.as_image_copy(),
             &[255u8, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
         tex
     }
@@ -138,7 +188,8 @@ impl ResourceManager {
         let assets_dir = loader::find_we_assets_dir()
             .with_context(|| format!("WE assets dir not found while loading '{key}'"))?;
         let candidates = [assets_dir.join(key), assets_dir.join(format!("{key}.tex"))];
-        let bytes = candidates.iter()
+        let bytes = candidates
+            .iter()
             .find_map(|p| std::fs::read(p).ok())
             .with_context(|| format!("texture '{key}' not found in WE assets dir"))?;
         let img = TexFile::parse(&bytes)

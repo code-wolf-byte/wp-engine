@@ -22,7 +22,11 @@ impl ScenePass {
         while data.len() < 16 || data.len() % 16 != 0 {
             data.push(0);
         }
-        Self { pipeline_key: pipeline_key.into(), uniform_data: data, extra_texture_keys }
+        Self {
+            pipeline_key: pipeline_key.into(),
+            uniform_data: data,
+            extra_texture_keys,
+        }
     }
 
     /// Pack f32 values into a 16-byte-aligned UBO byte vec.
@@ -37,8 +41,14 @@ impl ScenePass {
     /// True if this is one of the hardcoded built-in WGSL effects.
     pub fn is_builtin(&self) -> bool {
         const BUILTIN: &[&str] = &[
-            "pulse", "scroll", "shake", "tint", "opacity",
-            "waterripple", "waterwaves", "spin",
+            "pulse",
+            "scroll",
+            "shake",
+            "tint",
+            "opacity",
+            "waterripple",
+            "waterwaves",
+            "spin",
         ];
         BUILTIN.contains(&self.pipeline_key.as_str())
     }
@@ -52,6 +62,9 @@ pub struct UniformValue {
 
 impl UniformValue {
     pub fn new(name: impl Into<String>, value: f32) -> Self {
-        Self { name: name.into(), value }
+        Self {
+            name: name.into(),
+            value,
+        }
     }
 }

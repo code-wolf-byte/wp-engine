@@ -17,11 +17,13 @@ impl GlslCompiler for ShadercCompiler {
     fn compile(&self, glsl: &str, stage: naga::ShaderStage, name: &str) -> Result<Vec<u8>> {
         let kind = stage_to_kind(stage);
 
-        let compiler = shaderc::Compiler::new()
-            .context("failed to create shaderc compiler")?;
-        let mut options = shaderc::CompileOptions::new()
-            .context("failed to create shaderc options")?;
-        options.set_target_env(shaderc::TargetEnv::Vulkan, shaderc::EnvVersion::Vulkan1_1 as u32);
+        let compiler = shaderc::Compiler::new().context("failed to create shaderc compiler")?;
+        let mut options =
+            shaderc::CompileOptions::new().context("failed to create shaderc options")?;
+        options.set_target_env(
+            shaderc::TargetEnv::Vulkan,
+            shaderc::EnvVersion::Vulkan1_1 as u32,
+        );
         options.set_source_language(shaderc::SourceLanguage::GLSL);
         options.set_optimization_level(shaderc::OptimizationLevel::Performance);
 
@@ -53,9 +55,9 @@ pub fn default_compiler() -> Box<dyn GlslCompiler> {
 
 fn stage_to_kind(stage: naga::ShaderStage) -> shaderc::ShaderKind {
     match stage {
-        naga::ShaderStage::Vertex   => shaderc::ShaderKind::Vertex,
+        naga::ShaderStage::Vertex => shaderc::ShaderKind::Vertex,
         naga::ShaderStage::Fragment => shaderc::ShaderKind::Fragment,
-        naga::ShaderStage::Compute  => shaderc::ShaderKind::Compute,
-        _                           => shaderc::ShaderKind::InferFromSource,
+        naga::ShaderStage::Compute => shaderc::ShaderKind::Compute,
+        _ => shaderc::ShaderKind::InferFromSource,
     }
 }

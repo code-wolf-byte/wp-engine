@@ -19,7 +19,11 @@ impl RenderTarget {
         let name = name.into();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&name),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -30,15 +34,29 @@ impl RenderTarget {
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        Self { name, texture, width: w, height: h }
+        Self {
+            name,
+            texture,
+            width: w,
+            height: h,
+        }
     }
 
     pub fn view(&self) -> wgpu::TextureView {
-        self.texture.create_view(&wgpu::TextureViewDescriptor::default())
+        self.texture
+            .create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     /// Clear the render target immediately (creates and submits its own encoder).
-    pub fn clear(&self, device: &wgpu::Device, queue: &wgpu::Queue, r: f64, g: f64, b: f64, a: f64) {
+    pub fn clear(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+    ) {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("fbo_clear"),
         });
@@ -69,14 +87,27 @@ pub struct RenderTargetPool {
 }
 
 impl RenderTargetPool {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Get or create a named target at the given dimensions.
-    pub fn get_or_create(&mut self, device: &wgpu::Device, name: &str, w: u32, h: u32) -> &RenderTarget {
-        self.targets.entry(name.to_string())
+    pub fn get_or_create(
+        &mut self,
+        device: &wgpu::Device,
+        name: &str,
+        w: u32,
+        h: u32,
+    ) -> &RenderTarget {
+        self.targets
+            .entry(name.to_string())
             .or_insert_with(|| RenderTarget::new(device, name, w, h))
     }
 
-    pub fn get(&self, name: &str) -> Option<&RenderTarget> { self.targets.get(name) }
-    pub fn get_mut(&mut self, name: &str) -> Option<&mut RenderTarget> { self.targets.get_mut(name) }
+    pub fn get(&self, name: &str) -> Option<&RenderTarget> {
+        self.targets.get(name)
+    }
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut RenderTarget> {
+        self.targets.get_mut(name)
+    }
 }

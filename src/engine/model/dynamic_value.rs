@@ -21,11 +21,17 @@ pub struct AnimatedValue {
 
 impl AnimatedValue {
     pub fn static_val(value: DynamicValue) -> Self {
-        AnimatedValue { value, script: None }
+        AnimatedValue {
+            value,
+            script: None,
+        }
     }
 
     pub fn scripted(value: DynamicValue, script: String) -> Self {
-        AnimatedValue { value, script: Some(script) }
+        AnimatedValue {
+            value,
+            script: Some(script),
+        }
     }
 
     pub fn is_animated(&self) -> bool {
@@ -63,25 +69,37 @@ impl AnimatedValue {
 }
 
 impl From<f32> for AnimatedValue {
-    fn from(v: f32) -> Self { Self::static_val(DynamicValue::Float(v)) }
+    fn from(v: f32) -> Self {
+        Self::static_val(DynamicValue::Float(v))
+    }
 }
 
 impl From<bool> for AnimatedValue {
-    fn from(v: bool) -> Self { Self::static_val(DynamicValue::Bool(v)) }
+    fn from(v: bool) -> Self {
+        Self::static_val(DynamicValue::Bool(v))
+    }
 }
 
 impl From<[f32; 3]> for AnimatedValue {
-    fn from(v: [f32; 3]) -> Self { Self::static_val(DynamicValue::Vec3(v)) }
+    fn from(v: [f32; 3]) -> Self {
+        Self::static_val(DynamicValue::Vec3(v))
+    }
 }
 
 impl From<String> for AnimatedValue {
-    fn from(v: String) -> Self { Self::static_val(DynamicValue::Str(v)) }
+    fn from(v: String) -> Self {
+        Self::static_val(DynamicValue::Str(v))
+    }
 }
 
 impl Default for DynamicValue {
-    fn default() -> Self { DynamicValue::Null }
+    fn default() -> Self {
+        DynamicValue::Null
+    }
 }
 
 impl Default for AnimatedValue {
-    fn default() -> Self { Self::static_val(DynamicValue::Null) }
+    fn default() -> Self {
+        Self::static_val(DynamicValue::Null)
+    }
 }
