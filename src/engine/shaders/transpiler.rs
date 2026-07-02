@@ -104,7 +104,7 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
     // because naga's SPIR-V reader rejects array-typed entry-point I/O.
     for line in model.frag_glsl.lines() {
         let t = line.trim();
-        if (t.starts_with("varying ") || t.starts_with("attribute ")) {
+        if t.starts_with("varying ") || t.starts_with("attribute ") {
             let tok: Vec<&str> = t.split_whitespace().collect();
             if tok.len() >= 3 {
                 let name_raw = t

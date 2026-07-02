@@ -323,6 +323,27 @@ fn fs_effect_shake(input: VertexOutput) -> @location(0) vec4<f32> {
     let offset = vec2<f32>(sin(time * 19.0), cos(time * 17.0)) * px * 4.0;
     return textureSample(base_texture, base_sampler, input.uv + offset);
 }
+
+@fragment
+fn fs_effect_scroll(input: VertexOutput) -> @location(0) vec4<f32> {
+    let time = frame.resolution_time_delta.z;
+    let offset = vec2<f32>(time * 0.05, 0.0);
+    return textureSample(base_texture, base_sampler, fract(input.uv + offset));
+}
+
+@fragment
+fn fs_effect_spin(input: VertexOutput) -> @location(0) vec4<f32> {
+    let time = frame.resolution_time_delta.z;
+    let angle = time * 0.5;
+    let s = sin(angle);
+    let c = cos(angle);
+    let centered = input.uv - vec2<f32>(0.5, 0.5);
+    let rotated = vec2<f32>(
+        centered.x * c - centered.y * s,
+        centered.x * s + centered.y * c,
+    );
+    return textureSample(base_texture, base_sampler, rotated + vec2<f32>(0.5, 0.5));
+}
 "#
 }
 

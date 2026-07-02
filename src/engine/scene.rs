@@ -204,7 +204,7 @@ impl Scene {
             .collect()
     }
 
-    pub fn topological_render_order(&self) -> Vec<&SceneObject> {
+    pub fn topological_render_order_indices(&self) -> Vec<usize> {
         let mut name_to_index = std::collections::HashMap::new();
         for (i, obj) in self.objects.iter().enumerate() {
             if let Some(name) = &obj.name {
@@ -215,17 +215,24 @@ impl Scene {
         let mut result = Vec::with_capacity(self.objects.len());
         for i in 0..self.objects.len() {
             if !visited[i] {
-                Self::topo_dfs(i, &self.objects, &mut visited, &mut result, &name_to_index);
+                Self::topo_dfs_indices(i, &self.objects, &mut visited, &mut result, &name_to_index);
             }
         }
         result
     }
 
-    fn topo_dfs<'a>(
+    pub fn topological_render_order(&self) -> Vec<&SceneObject> {
+        self.topological_render_order_indices()
+            .into_iter()
+            .map(|index| &self.objects[index])
+            .collect()
+    }
+
+    fn topo_dfs_indices(
         index: usize,
-        objects: &'a [SceneObject],
+        objects: &[SceneObject],
         visited: &mut Vec<bool>,
-        result: &mut Vec<&'a SceneObject>,
+        result: &mut Vec<usize>,
         name_to_index: &std::collections::HashMap<String, usize>,
     ) {
         if visited[index] {
@@ -244,7 +251,7 @@ impl Scene {
                 None
             };
             if let Some(di) = di {
-                Self::topo_dfs(di, objects, visited, result, name_to_index);
+                Self::topo_dfs_indices(di, objects, visited, result, name_to_index);
             }
         }
         if let Some(parent) = &obj.parent {
@@ -256,10 +263,10 @@ impl Scene {
                 None
             };
             if let Some(pi) = pi {
-                Self::topo_dfs(pi, objects, visited, result, name_to_index);
+                Self::topo_dfs_indices(pi, objects, visited, result, name_to_index);
             }
         }
-        result.push(obj);
+        result.push(index);
     }
 
     pub fn texture_paths(&self) -> Vec<&str> {

@@ -162,6 +162,8 @@ impl RenderGraphBuilder {
             base_texture: node.base_texture.clone(),
             fullscreen: node.is_fullscreen_layer(),
             render_target_layer: node.is_render_target_layer(),
+            blend_mode: object.color_blend_mode,
+            copy_background: object.copybackground,
         });
 
         if node.base_texture.is_none() {
@@ -266,6 +268,8 @@ pub struct RenderObjectNode {
     pub base_texture: Option<String>,
     pub fullscreen: bool,
     pub render_target_layer: bool,
+    pub blend_mode: u32,
+    pub copy_background: bool,
 }
 
 #[derive(Debug, Clone)]

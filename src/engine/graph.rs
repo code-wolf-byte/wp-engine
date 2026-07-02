@@ -22,7 +22,8 @@ impl SceneGraph {
     pub fn from_scene(assets: AssetStore, scene: Scene) -> Result<Self> {
         let mut images = Vec::new();
 
-        for (object_index, object) in scene.objects.iter().enumerate() {
+        for object_index in scene.topological_render_order_indices() {
+            let object = &scene.objects[object_index];
             if !object.is_visible() {
                 continue;
             }

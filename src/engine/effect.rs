@@ -5,6 +5,8 @@ pub enum SceneEffect {
     Opacity { alpha: f32 },
     Shake { strength: f32, time: f32 },
     Pulse { strength: f32, time: f32 },
+    Scroll { speed: f32, time: f32 },
+    Spin { speed: f32, time: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +15,8 @@ pub enum HandwrittenEffectFallback {
     Opacity,
     Pulse,
     Shake,
+    Scroll,
+    Spin,
 }
 
 impl HandwrittenEffectFallback {
@@ -26,6 +30,10 @@ impl HandwrittenEffectFallback {
             Some(Self::Pulse)
         } else if label.contains("shake") {
             Some(Self::Shake)
+        } else if label.contains("scroll") {
+            Some(Self::Scroll)
+        } else if label.contains("spin") {
+            Some(Self::Spin)
         } else {
             None
         }
@@ -37,6 +45,8 @@ impl HandwrittenEffectFallback {
             Self::Opacity => "opacity",
             Self::Pulse => "pulse",
             Self::Shake => "shake",
+            Self::Scroll => "scroll",
+            Self::Spin => "spin",
         }
     }
 
@@ -46,6 +56,8 @@ impl HandwrittenEffectFallback {
             Self::Opacity => "fs_effect_opacity",
             Self::Pulse => "fs_effect_pulse",
             Self::Shake => "fs_effect_shake",
+            Self::Scroll => "fs_effect_scroll",
+            Self::Spin => "fs_effect_spin",
         }
     }
 }
@@ -76,6 +88,16 @@ impl SceneEffect {
                 .or_else(|| extract_f32(values, "strength"))
                 .unwrap_or(0.1);
             Some(SceneEffect::Pulse { strength, time })
+        } else if name_lower.contains("scroll") {
+            let speed = extract_f32(values, "speed")
+                .or_else(|| extract_f32(values, "strength"))
+                .unwrap_or(0.02);
+            Some(SceneEffect::Scroll { speed, time })
+        } else if name_lower.contains("spin") {
+            let speed = extract_f32(values, "speed")
+                .or_else(|| extract_f32(values, "strength"))
+                .unwrap_or(0.5);
+            Some(SceneEffect::Spin { speed, time })
         } else {
             None
         }
@@ -87,6 +109,8 @@ impl SceneEffect {
             SceneEffect::Opacity { alpha } => apply_opacity(img, *alpha),
             SceneEffect::Shake { strength, time } => apply_shake(img, *strength, *time),
             SceneEffect::Pulse { strength, time } => apply_pulse(img, *strength, *time),
+            SceneEffect::Scroll { speed, time } => apply_scroll(img, *speed, *time),
+            SceneEffect::Spin { speed, time } => apply_spin(img, *speed, *time),
         }
     }
 }
@@ -144,6 +168,42 @@ fn apply_pulse(img: &mut RgbaImage, strength: f32, time: f32) {
         pixel[0] = (pixel[0] as f32 * factor).clamp(0.0, 255.0) as u8;
         pixel[1] = (pixel[1] as f32 * factor).clamp(0.0, 255.0) as u8;
         pixel[2] = (pixel[2] as f32 * factor).clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn apply_scroll(img: &mut RgbaImage, speed: f32, time: f32) {
+    let shift = (time * speed * img.width() as f32) as i32;
+    if shift == 0 {
+        return;
+    }
+
+    let clone = img.clone();
+    let width = img.width() as i32;
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            let sx = (x as i32 - shift).rem_euclid(width) as u32;
+            *img.get_pixel_mut(x, y) = *clone.get_pixel(sx, y);
+        }
+    }
+}
+
+fn apply_spin(img: &mut RgbaImage, speed: f32, time: f32) {
+    let angle = time * speed;
+    let (sin, cos) = angle.sin_cos();
+    let cx = (img.width() as f32 - 1.0) * 0.5;
+    let cy = (img.height() as f32 - 1.0) * 0.5;
+    let clone = img.clone();
+
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let sx = dx * cos + dy * sin + cx;
+            let sy = -dx * sin + dy * cos + cy;
+            let sx = sx.round().clamp(0.0, img.width() as f32 - 1.0) as u32;
+            let sy = sy.round().clamp(0.0, img.height() as f32 - 1.0) as u32;
+            *img.get_pixel_mut(x, y) = *clone.get_pixel(sx, sy);
+        }
     }
 }
 

@@ -353,7 +353,7 @@ impl WgpuSceneRenderer {
                 pass.label
             ));
         }
-        let pipeline = self.pipeline_for_blend(pass.blending.as_deref());
+        let pipeline = self.pipeline_for_blend(pass.blending.as_deref(), object.blend_mode);
         let clear = mark_target_for_load(cleared_targets, &pass.target);
 
         self.draw_textured_quad(
@@ -537,28 +537,6 @@ impl WgpuSceneRenderer {
         targets: &GpuRenderTargets,
         cleared_targets: &mut BTreeSet<String>,
     ) {
-        let source_ref = render_graph
-            .final_pass
-            .inputs
-            .first()
-            .cloned()
-            .unwrap_or(RenderTargetRef::Backbuffer);
-
-        if target_key(&source_ref) == target_key(&render_graph.final_pass.target) {
-            self.diagnostics.push(format!(
-                "final composite skipped: source and target are both {}",
-                describe_target(&source_ref)
-            ));
-            return;
-        }
-
-        let Some(source) = targets.texture(&source_ref) else {
-            self.diagnostics.push(format!(
-                "final composite skipped: source {} is not allocated",
-                describe_target(&source_ref)
-            ));
-            return;
-        };
         let Some(target) = targets.texture(&render_graph.final_pass.target) else {
             self.diagnostics.push(format!(
                 "final composite skipped: target {} is not allocated",
@@ -567,8 +545,6 @@ impl WgpuSceneRenderer {
             return;
         };
 
-        let frame_bind_group = self.create_default_frame_bind_group(source.size);
-        let texture_bind_group = self.create_texture_bind_group(&source.view);
         let vertices = fullscreen_quad_vertices();
         let vertex_buffer = create_buffer_init(
             &self.gpu.device,
@@ -576,19 +552,53 @@ impl WgpuSceneRenderer {
             wgpu::BufferUsages::VERTEX,
             &vertices,
         );
-        let clear = mark_target_for_load(cleared_targets, &render_graph.final_pass.target);
+        let mut drew_any = false;
 
-        self.draw_textured_quad(
-            encoder,
-            &target.view,
-            &self.pipelines.replace,
-            &frame_bind_group,
-            &texture_bind_group,
-            &vertex_buffer,
-            vertices.len() as u32,
-            clear,
-            "wp-engine final composite",
-        );
+        for source_ref in render_graph.final_pass.inputs.iter().cloned() {
+            if target_key(&source_ref) == target_key(&render_graph.final_pass.target) {
+                self.diagnostics.push(format!(
+                    "final composite skipped input: source and target are both {}",
+                    describe_target(&source_ref)
+                ));
+                continue;
+            }
+
+            let Some(source) = targets.texture(&source_ref) else {
+                self.diagnostics.push(format!(
+                    "final composite skipped input: source {} is not allocated",
+                    describe_target(&source_ref)
+                ));
+                continue;
+            };
+
+            let frame_bind_group = self.create_default_frame_bind_group(source.size);
+            let texture_bind_group = self.create_texture_bind_group(&source.view);
+            let clear = if drew_any {
+                false
+            } else {
+                mark_target_for_load(cleared_targets, &render_graph.final_pass.target)
+            };
+
+            self.draw_textured_quad(
+                encoder,
+                &target.view,
+                &self.pipelines.replace,
+                &frame_bind_group,
+                &texture_bind_group,
+                &vertex_buffer,
+                vertices.len() as u32,
+                clear,
+                "wp-engine final composite",
+            );
+            drew_any = true;
+        }
+
+        if !drew_any {
+            self.diagnostics.push(format!(
+                "final composite skipped: no valid inputs were available for {}",
+                describe_target(&render_graph.final_pass.target)
+            ));
+        }
     }
 
     fn draw_textured_quad(
@@ -684,14 +694,24 @@ impl WgpuSceneRenderer {
             })
     }
 
-    fn pipeline_for_blend(&self, blend: Option<&str>) -> &wgpu::RenderPipeline {
+    fn pipeline_for_blend(&self, blend: Option<&str>, blend_mode: u32) -> &wgpu::RenderPipeline {
         match blend.unwrap_or("normal").to_ascii_lowercase().as_str() {
             "disabled" | "none" | "replace" => &self.pipelines.replace,
             "add" | "additive" => &self.pipelines.additive,
             "multiply" | "mul" => &self.pipelines.multiply,
             "max" | "lighten" => &self.pipelines.max,
-            "normal" | "alpha" | "translucent" | "premultiplied" => &self.pipelines.alpha,
-            _ => &self.pipelines.alpha,
+            "normal" | "alpha" | "translucent" | "premultiplied" => match blend_mode {
+                2 => &self.pipelines.additive,
+                4 => &self.pipelines.multiply,
+                5 => &self.pipelines.max,
+                _ => &self.pipelines.alpha,
+            },
+            _ => match blend_mode {
+                2 => &self.pipelines.additive,
+                4 => &self.pipelines.multiply,
+                5 => &self.pipelines.max,
+                _ => &self.pipelines.alpha,
+            },
         }
     }
 
@@ -770,6 +790,8 @@ struct BuiltinPipelines {
     effect_opacity: wgpu::RenderPipeline,
     effect_pulse: wgpu::RenderPipeline,
     effect_shake: wgpu::RenderPipeline,
+    effect_scroll: wgpu::RenderPipeline,
+    effect_spin: wgpu::RenderPipeline,
 }
 
 impl BuiltinPipelines {
@@ -872,6 +894,22 @@ impl BuiltinPipelines {
                 HandwrittenEffectFallback::Shake.fragment_entry_point(),
                 None,
             ),
+            effect_scroll: create_pipeline(
+                device,
+                layout,
+                shader,
+                "wp-engine scroll fallback pipeline",
+                HandwrittenEffectFallback::Scroll.fragment_entry_point(),
+                None,
+            ),
+            effect_spin: create_pipeline(
+                device,
+                layout,
+                shader,
+                "wp-engine spin fallback pipeline",
+                HandwrittenEffectFallback::Spin.fragment_entry_point(),
+                None,
+            ),
         }
     }
 
@@ -881,6 +919,8 @@ impl BuiltinPipelines {
             HandwrittenEffectFallback::Opacity => &self.effect_opacity,
             HandwrittenEffectFallback::Pulse => &self.effect_pulse,
             HandwrittenEffectFallback::Shake => &self.effect_shake,
+            HandwrittenEffectFallback::Scroll => &self.effect_scroll,
+            HandwrittenEffectFallback::Spin => &self.effect_spin,
         }
     }
 }
@@ -1092,7 +1132,7 @@ impl GpuFrameUniforms {
                 })
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
             object_size_flags: object
-                .map(|state| [state.size[0], state.size[1], state.size[2], state.scale[0]])
+                .map(|state| [state.size[0], state.size[1], state.scale[0], state.scale[1]])
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
             object_color_tint: object
                 .map(|state| [state.color[0], state.color[1], state.color[2], state.alpha])
@@ -1214,13 +1254,57 @@ fn image_layer_vertices(
     }
 
     let object = graph.object(node);
-    let origin = object.parsed_origin();
-    let object_size = object.parsed_size();
-    let scale = object
-        .scale
-        .as_ref()
-        .and_then(crate::engine::scene::parse_value_vec3)
-        .unwrap_or([1.0, 1.0, 1.0]);
+    let state = context.object_state(node.object_index);
+    let origin = state
+        .map(|state| {
+            [
+                state.origin[0] as f64,
+                state.origin[1] as f64,
+                state.origin[2] as f64,
+            ]
+        })
+        .unwrap_or_else(|| {
+            let origin = object.parsed_origin();
+            [origin[0], origin[1], origin[2]]
+        });
+    let object_size = state
+        .map(|state| {
+            [
+                state.size[0] as f64,
+                state.size[1] as f64,
+                state.size[2] as f64,
+            ]
+        })
+        .unwrap_or_else(|| {
+            let size = object.parsed_size();
+            [size[0], size[1], size[2]]
+        });
+    let scale = state
+        .map(|state| {
+            [
+                state.scale[0] as f64,
+                state.scale[1] as f64,
+                state.scale[2] as f64,
+            ]
+        })
+        .unwrap_or_else(|| {
+            let scale = object
+                .scale
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_vec3)
+                .unwrap_or([1.0, 1.0, 1.0]);
+            [scale[0] as f64, scale[1] as f64, scale[2] as f64]
+        });
+    let rotation_z = state
+        .map(|state| state.rotation_z as f64)
+        .unwrap_or_else(|| {
+            object
+                .angles
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_vec3)
+                .map(|rotation| rotation[2] as f64)
+                .unwrap_or(0.0)
+        });
     let model_size = node
         .model
         .as_ref()
@@ -1247,19 +1331,62 @@ fn image_layer_vertices(
 
     let width = context.resolution[0] as f64;
     let height = context.resolution[1] as f64;
-    let px = width / 2.0 + origin[0] - draw_w / 2.0;
-    let py = height / 2.0 - origin[1] - draw_h / 2.0;
+    let center_x = width / 2.0 + origin[0];
+    let center_y = height / 2.0 - origin[1];
+    let half_w = draw_w / 2.0;
+    let half_h = draw_h / 2.0;
+    let angle = rotation_z.to_radians();
+    let (sin, cos) = angle.sin_cos();
 
-    let left = (px / width * 2.0 - 1.0) as f32;
-    let right = ((px + draw_w) / width * 2.0 - 1.0) as f32;
-    let top = (1.0 - py / height * 2.0) as f32;
-    let bottom = (1.0 - (py + draw_h) / height * 2.0) as f32;
-
-    quad_vertices(left, right, bottom, top)
+    rotated_quad_vertices(center_x, center_y, half_w, half_h, cos, sin, width, height)
 }
 
 fn fullscreen_quad_vertices() -> [QuadVertex; 6] {
     quad_vertices(-1.0, 1.0, -1.0, 1.0)
+}
+
+fn rotated_quad_vertices(
+    center_x: f64,
+    center_y: f64,
+    half_w: f64,
+    half_h: f64,
+    cos: f64,
+    sin: f64,
+    width: f64,
+    height: f64,
+) -> [QuadVertex; 6] {
+    let corners = [
+        (-half_w, -half_h, [0.0, 1.0]),
+        (half_w, -half_h, [1.0, 1.0]),
+        (half_w, half_h, [1.0, 0.0]),
+        (-half_w, half_h, [0.0, 0.0]),
+    ];
+
+    let mut verts = [QuadVertex {
+        position: [0.0, 0.0],
+        uv: [0.0, 0.0],
+    }; 6];
+    let indices = [(0, 1, 2), (0, 2, 3)];
+
+    for (tri_index, (a, b, c)) in indices.into_iter().enumerate() {
+        for (local_index, corner_index) in [a, b, c].into_iter().enumerate() {
+            let (dx, dy, uv) = corners[corner_index];
+            let rx = dx * cos - dy * sin;
+            let ry = dx * sin + dy * cos;
+            let x = center_x + rx;
+            let y = center_y + ry;
+            let vertex = QuadVertex {
+                position: [
+                    (x / width * 2.0 - 1.0) as f32,
+                    (1.0 - y / height * 2.0) as f32,
+                ],
+                uv,
+            };
+            verts[tri_index * 3 + local_index] = vertex;
+        }
+    }
+
+    verts
 }
 
 fn quad_vertices(left: f32, right: f32, bottom: f32, top: f32) -> [QuadVertex; 6] {

@@ -158,3 +158,58 @@ fn reports_effect_passes_that_target_missing_fbos() -> Result<()> {
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
+
+#[test]
+fn respects_topological_object_order_for_image_layers() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "wp-engine-render-graph-topo-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("models"))?;
+    std::fs::create_dir_all(root.join("materials"))?;
+    std::fs::write(
+        root.join("scene.json"),
+        r#"{
+            "objects": [
+                {
+                    "id": 2,
+                    "name": "B",
+                    "visible": true,
+                    "dependencies": ["A"],
+                    "image": "models/b.json"
+                },
+                {
+                    "id": 1,
+                    "name": "A",
+                    "visible": true,
+                    "image": "models/a.json"
+                }
+            ]
+        }"#,
+    )?;
+    std::fs::write(
+        root.join("models/a.json"),
+        r#"{"material": "materials/a.json", "width": 32, "height": 16}"#,
+    )?;
+    std::fs::write(
+        root.join("models/b.json"),
+        r#"{"material": "materials/b.json", "width": 32, "height": 16}"#,
+    )?;
+    std::fs::write(
+        root.join("materials/a.json"),
+        r#"{"passes": [{"shader": "genericimage2", "textures": ["a.png"]}]}"#,
+    )?;
+    std::fs::write(
+        root.join("materials/b.json"),
+        r#"{"passes": [{"shader": "genericimage2", "textures": ["b.png"]}]}"#,
+    )?;
+
+    let graph = SceneGraph::from_directory(&root)?;
+    let names: Vec<_> = graph.images.iter().map(|node| node.name.as_str()).collect();
+
+    assert_eq!(names, vec!["A", "B"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
