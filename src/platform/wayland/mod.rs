@@ -117,8 +117,10 @@ impl WallpaperState {
 
         let frame = std::sync::Arc::clone(self.frame_source.current_frame());
 
-        let stride = width * 4;
-        let mut pool = match SlotPool::new((width * height * 4) as usize, &self.shm) {
+        let row_bytes = width as usize * 4;
+        let stride = row_bytes;
+        let active_len = stride * height as usize;
+        let mut pool = match SlotPool::new(active_len, &self.shm) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("wallpaper: failed to create shm pool: {e}");
@@ -143,7 +145,18 @@ impl WallpaperState {
         let pixels = self
             .gpu_scaler
             .scale(frame.as_ref(), width, height, quality);
-        canvas.copy_from_slice(&pixels);
+        if pixels.len() != active_len {
+            eprintln!(
+                "wallpaper: scaler returned {} bytes for {}x{} frame, expected {}",
+                pixels.len(),
+                width,
+                height,
+                active_len
+            );
+            return;
+        }
+
+        copy_frame_into_shm_canvas(canvas, &pixels, width as usize, height as usize, stride);
 
         let wl_surf = self.surfaces[idx].layer.wl_surface();
 
@@ -163,6 +176,31 @@ impl WallpaperState {
 
         // Keep the SHM pool alive until the compositor reads the buffer.
         self.surfaces[idx].pool = Some(pool);
+    }
+}
+
+fn copy_frame_into_shm_canvas(
+    canvas: &mut [u8],
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) {
+    let row_bytes = width * 4;
+    let active_len = stride * height;
+    let copy_len = active_len.min(canvas.len());
+
+    canvas.fill(0);
+    if copy_len < active_len || pixels.len() < row_bytes * height {
+        return;
+    }
+
+    for row in 0..height {
+        let src_start = row * row_bytes;
+        let src_end = src_start + row_bytes;
+        let dst_start = row * stride;
+        let dst_end = dst_start + row_bytes;
+        canvas[dst_start..dst_end].copy_from_slice(&pixels[src_start..src_end]);
     }
 }
 

@@ -7,6 +7,7 @@ pub mod animated;
 pub mod assets;
 pub mod camera;
 pub mod effect;
+pub mod effect_diagnostics;
 pub mod engine;
 pub mod engine_object;
 pub mod fbo;

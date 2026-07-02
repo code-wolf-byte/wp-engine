@@ -1,15 +1,10 @@
-mod engine;
-mod platform;
-mod render;
-mod ui;
-mod workshop;
-
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use render::{FrameSource, RenderSettings, WallpaperContent};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use workshop::Wallpaper;
+use wp_engine::render::{self, FrameSource, RenderSettings, WallpaperContent};
+use wp_engine::workshop::{self, Wallpaper};
+use wp_engine::{engine, platform, ui};
 
 #[derive(Parser)]
 #[command(
@@ -348,7 +343,7 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path, gpu: bool) -> Re
     println!("Scene graph: {}", graph.stats().summary());
 
     if gpu {
-        let result = render::wgpu_scene::render_first_image_layer_to_rgba(&dir)?;
+        let result = render::wgpu_scene::render_scene_graph_to_rgba(&dir)?;
         println!(
             "WGPU graph: {} objects, {} passes, {} targets, {} diagnostics",
             result.graph.objects.len(),
@@ -357,7 +352,7 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path, gpu: bool) -> Re
             result.graph.diagnostics.len()
         );
         println!(
-            "WGPU rendered {}x{} first image layer",
+            "WGPU rendered {}x{} scene graph",
             result.image.width(),
             result.image.height()
         );
@@ -418,7 +413,7 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     std::thread::spawn(move || {
-        if let Err(e) = crate::engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+        if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             eprintln!("gpu scene error: {e}");
         }
     });
@@ -513,7 +508,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
     std::thread::spawn(move || {
-        if let Err(e) = crate::engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
+        if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             eprintln!("gpu scene error: {e}");
         }
     });

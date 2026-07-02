@@ -7,6 +7,49 @@ pub enum SceneEffect {
     Pulse { strength: f32, time: f32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandwrittenEffectFallback {
+    Tint,
+    Opacity,
+    Pulse,
+    Shake,
+}
+
+impl HandwrittenEffectFallback {
+    pub fn from_label(label: &str) -> Option<Self> {
+        let label = label.to_ascii_lowercase();
+        if label.contains("tint") {
+            Some(Self::Tint)
+        } else if label.contains("opacity") || label.contains("alpha") {
+            Some(Self::Opacity)
+        } else if label.contains("pulse") {
+            Some(Self::Pulse)
+        } else if label.contains("shake") {
+            Some(Self::Shake)
+        } else {
+            None
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tint => "tint",
+            Self::Opacity => "opacity",
+            Self::Pulse => "pulse",
+            Self::Shake => "shake",
+        }
+    }
+
+    pub fn fragment_entry_point(self) -> &'static str {
+        match self {
+            Self::Tint => "fs_effect_tint",
+            Self::Opacity => "fs_effect_opacity",
+            Self::Pulse => "fs_effect_pulse",
+            Self::Shake => "fs_effect_shake",
+        }
+    }
+}
+
 impl SceneEffect {
     pub fn from_effect_name(name: &str, values: &serde_json::Value, time: f32) -> Option<Self> {
         let name_lower = name.to_lowercase();

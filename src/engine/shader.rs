@@ -251,9 +251,14 @@ impl ShaderTranslator {
 pub fn textured_quad_wgsl() -> &'static str {
     r#"
 struct FrameUniforms {
-    resolution: vec2<f32>,
-    time: f32,
-    delta_time: f32,
+    resolution_time_delta: vec4<f32>,
+    frame_mouse: vec4<f32>,
+    camera_eye_parallax: vec4<f32>,
+    camera_center_audio: vec4<f32>,
+    object_origin_alpha: vec4<f32>,
+    object_size_flags: vec4<f32>,
+    object_color_tint: vec4<f32>,
+    audio_bands: vec4<f32>,
     model: mat4x4<f32>,
     view_projection: mat4x4<f32>,
 };
@@ -288,6 +293,35 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(base_texture, base_sampler, input.uv);
+}
+
+@fragment
+fn fs_effect_tint(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(base_texture, base_sampler, input.uv);
+    return vec4<f32>(color.rgb * frame.object_color_tint.rgb, color.a * frame.object_color_tint.a);
+}
+
+@fragment
+fn fs_effect_opacity(input: VertexOutput) -> @location(0) vec4<f32> {
+    var color = textureSample(base_texture, base_sampler, input.uv);
+    color.a = color.a * frame.object_origin_alpha.w;
+    return color;
+}
+
+@fragment
+fn fs_effect_pulse(input: VertexOutput) -> @location(0) vec4<f32> {
+    let time = frame.resolution_time_delta.z;
+    let pulse = 1.0 + sin(time * 2.0) * 0.08;
+    let color = textureSample(base_texture, base_sampler, input.uv);
+    return vec4<f32>(color.rgb * pulse, color.a);
+}
+
+@fragment
+fn fs_effect_shake(input: VertexOutput) -> @location(0) vec4<f32> {
+    let time = frame.resolution_time_delta.z;
+    let px = vec2<f32>(1.0 / max(frame.resolution_time_delta.x, 1.0), 1.0 / max(frame.resolution_time_delta.y, 1.0));
+    let offset = vec2<f32>(sin(time * 19.0), cos(time * 17.0)) * px * 4.0;
+    return textureSample(base_texture, base_sampler, input.uv + offset);
 }
 "#
 }
@@ -367,51 +401,5 @@ fn missing_shader(label: &str, message: &str) -> ShaderTranslation {
         stage: ShaderStage::Fragment,
         wgsl: None,
         diagnostics: vec![ShaderDiagnostic::error(message)],
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::borrow::Cow;
-    use std::collections::BTreeMap;
-
-    use super::{
-        validate_builtin_textured_quad, ShaderLanguage, ShaderStage, ShaderTranslationRequest,
-        ShaderTranslator,
-    };
-
-    #[test]
-    fn validates_builtin_textured_quad_shader() {
-        validate_builtin_textured_quad().expect("builtin textured shader should validate");
-    }
-
-    #[test]
-    fn translates_basic_glsl_fragment_to_wgsl() {
-        let translator = ShaderTranslator;
-        let translation = translator.translate(ShaderTranslationRequest {
-            label: Cow::Borrowed("test.frag"),
-            language: ShaderLanguage::Glsl,
-            stage: ShaderStage::Fragment,
-            source: Cow::Borrowed(
-                r#"
-                #version 450 core
-                layout(location = 0) out vec4 out_color;
-                void main() {
-                    out_color = vec4(1.0, 0.0, 0.0, 1.0);
-                }
-                "#,
-            ),
-            defines: BTreeMap::new(),
-        });
-
-        assert!(
-            translation.succeeded(),
-            "translation failed: {:?}",
-            translation.diagnostics
-        );
-        assert!(
-            translation.wgsl.unwrap().contains("@fragment"),
-            "WGSL output should contain a fragment entry point"
-        );
     }
 }

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+ #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
@@ -11,6 +11,8 @@ pub struct FrameContext {
     pub delta_time: f32,
     pub resolution: [u32; 2],
     pub camera: CameraFrameState,
+    pub mouse: MouseFrameState,
+    pub audio: AudioFrameState,
     pub objects: Vec<ObjectFrameState>,
     pub effect_uniforms: BTreeMap<String, UniformValue>,
 }
@@ -26,11 +28,28 @@ impl FrameContext {
             .map(|(index, object)| {
                 let origin = object.parsed_origin();
                 let size = object.parsed_size();
+                let scale = object
+                    .scale
+                    .as_ref()
+                    .and_then(parse_value_vec3)
+                    .unwrap_or([1.0, 1.0, 1.0]);
+                let color = object
+                    .color
+                    .as_ref()
+                    .and_then(parse_value_vec3)
+                    .unwrap_or([1.0, 1.0, 1.0]);
                 ObjectFrameState {
                     object_index: index,
                     object_id: object.id,
                     origin: [origin[0] as f32, origin[1] as f32, origin[2] as f32],
                     size: [size[0] as f32, size[1] as f32, size[2] as f32],
+                    scale,
+                    color,
+                    alpha: object
+                        .alpha
+                        .as_ref()
+                        .and_then(parse_value_f32)
+                        .unwrap_or(1.0),
                     transform: translation_matrix(
                         origin[0] as f32,
                         origin[1] as f32,
@@ -46,6 +65,8 @@ impl FrameContext {
             delta_time,
             resolution: [width, height],
             camera: CameraFrameState::from_graph(graph),
+            mouse: MouseFrameState::default(),
+            audio: AudioFrameState::default(),
             objects,
             effect_uniforms: BTreeMap::new(),
         }
@@ -92,7 +113,22 @@ pub struct ObjectFrameState {
     pub object_id: Option<i64>,
     pub origin: [f32; 3],
     pub size: [f32; 3],
+    pub scale: [f32; 3],
+    pub color: [f32; 3],
+    pub alpha: f32,
     pub transform: [[f32; 4]; 4],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MouseFrameState {
+    pub position: [f32; 2],
+    pub buttons: [f32; 2],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AudioFrameState {
+    pub level: f32,
+    pub bands: [f32; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +177,16 @@ fn parse_value_vec3(value: &serde_json::Value) -> Option<[f32; 3]> {
             items[1].as_f64().unwrap_or(0.0) as f32,
             items[2].as_f64().unwrap_or(0.0) as f32,
         ]),
+        serde_json::Value::Object(map) => map.get("value").and_then(parse_value_vec3),
+        _ => None,
+    }
+}
+
+fn parse_value_f32(value: &serde_json::Value) -> Option<f32> {
+    match value {
+        serde_json::Value::Number(value) => value.as_f64().map(|value| value as f32),
+        serde_json::Value::String(value) => value.parse().ok(),
+        serde_json::Value::Object(map) => map.get("value").and_then(parse_value_f32),
         _ => None,
     }
 }

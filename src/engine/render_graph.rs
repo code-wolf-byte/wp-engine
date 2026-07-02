@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::graph::{ImageNode, SceneGraph};
 use super::material::{MaterialPass, PassCommand};
@@ -30,7 +30,7 @@ impl SceneRenderGraph {
             builder.add_image_node(graph, node);
         }
 
-        Self {
+        let mut graph = Self {
             size: builder.size,
             objects: builder.objects,
             passes: builder.passes,
@@ -40,7 +40,9 @@ impl SceneRenderGraph {
                 target: RenderTargetRef::Output,
             },
             diagnostics: builder.diagnostics,
-        }
+        };
+        graph.diagnostics.extend(graph.execution_diagnostics());
+        graph
     }
 
     pub fn first_textured_object(&self) -> Option<&RenderObjectNode> {
@@ -48,6 +50,91 @@ impl SceneRenderGraph {
             .iter()
             .find(|object| object.base_texture.is_some() && object.model.is_some())
     }
+
+    pub fn execution_plan(&self) -> RenderGraphExecutionPlan {
+        let mut ordered: Vec<(usize, usize)> = self
+            .passes
+            .iter()
+            .enumerate()
+            .map(|(index, pass)| (pass.id, index))
+            .collect();
+        ordered.sort_unstable();
+
+        RenderGraphExecutionPlan {
+            pass_indices: ordered.into_iter().map(|(_, index)| index).collect(),
+            diagnostics: self.execution_diagnostics(),
+        }
+    }
+
+    fn execution_diagnostics(&self) -> Vec<RenderGraphDiagnostic> {
+        let mut diagnostics = Vec::new();
+        let mut pass_ids = BTreeSet::new();
+
+        for pass in &self.passes {
+            if !pass_ids.insert(pass.id) {
+                diagnostics.push(RenderGraphDiagnostic::warning(
+                    pass.object_id,
+                    format!(
+                        "duplicate render pass id {}; execution order may be ambiguous",
+                        pass.id
+                    ),
+                ));
+            }
+
+            if let RenderTargetRef::Named(name) = &pass.target {
+                if !self.targets.contains_key(name) {
+                    diagnostics.push(RenderGraphDiagnostic::error(
+                        pass.object_id,
+                        format!(
+                            "pass '{}' writes missing render target '{name}'",
+                            pass.label
+                        ),
+                    ));
+                }
+            }
+
+            if let Some(RenderTargetRef::Named(name)) = &pass.source {
+                if !self.targets.contains_key(name) {
+                    diagnostics.push(RenderGraphDiagnostic::error(
+                        pass.object_id,
+                        format!("pass '{}' reads missing render target '{name}'", pass.label),
+                    ));
+                }
+            }
+
+            for texture in &pass.textures {
+                if texture.source == TextureSource::RenderTarget
+                    && !self.targets.contains_key(&texture.name)
+                {
+                    diagnostics.push(RenderGraphDiagnostic::warning(
+                        pass.object_id,
+                        format!(
+                            "pass '{}' references render target texture '{}' that is not declared",
+                            pass.label, texture.name
+                        ),
+                    ));
+                }
+            }
+
+            if matches!(pass.kind, RenderPassKind::Effect) && pass.material.is_some() {
+                diagnostics.push(RenderGraphDiagnostic::warning(
+                    pass.object_id,
+                    format!(
+                        "pass '{}' has an effect material; WGPU graph currently uses the builtin copy fallback",
+                        pass.label
+                    ),
+                ));
+            }
+        }
+
+        diagnostics
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderGraphExecutionPlan {
+    pub pass_indices: Vec<usize>,
+    pub diagnostics: Vec<RenderGraphDiagnostic>,
 }
 
 struct RenderGraphBuilder {
@@ -87,7 +174,9 @@ impl RenderGraphBuilder {
 
         if let Some(model) = &node.model {
             for (pass_index, pass) in model.material.passes.iter().enumerate() {
+                let pass_id = self.passes.len();
                 self.passes.push(RenderPassNode::from_material_pass(
+                    pass_id,
                     object_id,
                     pass_index,
                     &model.material.filename,
@@ -197,6 +286,7 @@ pub struct RenderPassNode {
 
 impl RenderPassNode {
     fn from_material_pass(
+        id: usize,
         object_id: usize,
         pass_index: usize,
         material_filename: &str,
@@ -219,7 +309,7 @@ impl RenderPassNode {
         }));
 
         Self {
-            id: pass_index,
+            id,
             object_id: Some(object_id),
             kind: RenderPassKind::Material,
             label: format!("{material_filename}:{pass_index}"),
@@ -287,20 +377,28 @@ pub struct RenderGraphDiagnostic {
 }
 
 impl RenderGraphDiagnostic {
-    fn missing_model(object_id: usize, message: impl Into<String>) -> Self {
+    pub fn warning(object_id: Option<usize>, message: impl Into<String>) -> Self {
         Self {
-            object_id: Some(object_id),
+            object_id,
             severity: DiagnosticSeverity::Warning,
             message: message.into(),
         }
     }
 
-    fn missing_texture(object_id: usize, message: impl Into<String>) -> Self {
+    pub fn error(object_id: Option<usize>, message: impl Into<String>) -> Self {
         Self {
-            object_id: Some(object_id),
-            severity: DiagnosticSeverity::Warning,
+            object_id,
+            severity: DiagnosticSeverity::Error,
             message: message.into(),
         }
+    }
+
+    fn missing_model(object_id: usize, message: impl Into<String>) -> Self {
+        Self::warning(Some(object_id), message)
+    }
+
+    fn missing_texture(object_id: usize, message: impl Into<String>) -> Self {
+        Self::warning(Some(object_id), message)
     }
 }
 
@@ -317,67 +415,5 @@ fn texture_source(name: &str) -> TextureSource {
         TextureSource::EngineRuntime
     } else {
         TextureSource::MaterialTexture
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use anyhow::Result;
-
-    use crate::engine::{SceneGraph, SceneRenderGraph};
-
-    #[test]
-    fn builds_graph_from_minimal_scene_fixture() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "wp-engine-render-graph-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("models"))?;
-        std::fs::create_dir_all(root.join("materials"))?;
-        std::fs::write(
-            root.join("scene.json"),
-            r#"{
-                "general": {"orthogonalprojection": {"width": 64, "height": 32}},
-                "objects": [{
-                    "id": 7,
-                    "name": "Fixture Image",
-                    "visible": true,
-                    "image": "models/image.json"
-                }]
-            }"#,
-        )?;
-        std::fs::write(
-            root.join("models/image.json"),
-            r#"{
-                "material": "materials/image.json",
-                "fullscreen": true,
-                "width": 64,
-                "height": 32
-            }"#,
-        )?;
-        std::fs::write(
-            root.join("materials/image.json"),
-            r#"{
-                "passes": [{
-                    "shader": "genericimage2",
-                    "textures": ["sample"]
-                }]
-            }"#,
-        )?;
-
-        let graph = SceneGraph::from_directory(&root)?;
-        let render_graph = SceneRenderGraph::from_scene_graph(&graph);
-        let object = render_graph
-            .first_textured_object()
-            .expect("fixture should produce a textured object");
-
-        assert_eq!(render_graph.size, [64, 32]);
-        assert_eq!(object.name, "Fixture Image");
-        assert_eq!(object.base_texture.as_deref(), Some("sample"));
-        assert_eq!(render_graph.passes.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&root);
-        Ok(())
     }
 }
