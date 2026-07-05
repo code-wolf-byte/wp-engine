@@ -20,7 +20,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::engine::camera_dynamics::CameraDynamics;
+use crate::engine::camera_dynamics::{CameraDynamics, CameraFrameDynamics};
 use crate::engine::fbo::RenderTargetPool;
 use crate::engine::model::{ShaderModel, WEBlending};
 use crate::engine::particle;
@@ -1083,6 +1083,9 @@ struct SceneLayerGpu {
     /// resolution). Effect-chain FBOs (ping-pong + named targets) are sized to
     /// this, not the scene resolution, per `CImage.cpp`/`FBOProvider::create`.
     object_size: (u32, u32),
+    /// This layer's position in `scene.visible_objects()` — lets `render()`
+    /// interleave with particle systems in true scene z-order.
+    order_index: usize,
 }
 
 // ── GpuSceneInstance ──────────────────────────────────────────────────────────
@@ -1117,6 +1120,14 @@ pub struct GpuSceneInstance {
     /// these always draw on top of images (before bloom, so bright particles
     /// still contribute to the bloom pass) — see [[wp_engine_project]] memory.
     particle_systems: Vec<particle::ParticleSystem>,
+    /// Parallel to `particle_systems`: each system's resolved sprite texture
+    /// (from its config's `material`, if any), sampled CPU-side by
+    /// `render_onto`'s textured path. `None` falls back to flat-color circles.
+    particle_sprites: Vec<Option<RgbaImage>>,
+    /// Parallel to `particle_systems`: each system's `order_index` (from its
+    /// source `ParticleLayer`), so `render()` can interleave particles with
+    /// image layers in true scene z-order.
+    particle_order: Vec<usize>,
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
@@ -1247,6 +1258,7 @@ impl GpuSceneInstance {
                     object_size,
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
+                    order_index: l.order_index,
                 }
             })
             .collect();
@@ -1310,6 +1322,16 @@ impl GpuSceneInstance {
                 )
             })
             .collect();
+        let particle_sprites: Vec<Option<RgbaImage>> = resolved
+            .particle_layers
+            .iter()
+            .map(|pl| pl.sprite_texture.clone())
+            .collect();
+        let particle_order: Vec<usize> = resolved
+            .particle_layers
+            .iter()
+            .map(|pl| pl.order_index)
+            .collect();
 
         Ok(Self {
             renderer,
@@ -1325,6 +1347,8 @@ impl GpuSceneInstance {
             dynamics,
             bloom,
             particle_systems,
+            particle_sprites,
+            particle_order,
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
@@ -1385,8 +1409,57 @@ impl GpuSceneInstance {
             });
         }
 
-        // 2. Per-layer: effect chain (ping-pong) then composite.
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        // 2/3. Image layers and particle systems, interleaved by
+        // `order_index` (true scene z-order, matching the reference's single
+        // shared per-object render order) instead of drawing all particles
+        // after all images.
+        enum DrawItem {
+            Image(usize),
+            Particle(usize),
+        }
+        let mut items: Vec<(usize, DrawItem)> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.order_index, DrawItem::Image(i)))
+            .chain(
+                self.particle_systems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| (self.particle_order[i], DrawItem::Particle(i))),
+            )
+            .collect();
+        items.sort_by_key(|(order, _)| *order);
+
+        for (_, item) in items {
+            match item {
+                DrawItem::Image(layer_idx) => {
+                    self.draw_image_layer_gpu(&mut encoder, &target_view, layer_idx, time, dynamics);
+                }
+                DrawItem::Particle(idx) => {
+                    self.draw_particle_layer_gpu(&mut encoder, &target_view, idx, delta);
+                }
+            }
+        }
+
+        // 4. Scene bloom chain.
+        if self.bloom.enabled {
+            self.record_bloom(&mut encoder, &target_view);
+        }
+
+        self.renderer.queue.submit(Some(encoder.finish()));
+    }
+
+    fn draw_image_layer_gpu(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        layer_idx: usize,
+        time: f32,
+        dynamics: CameraFrameDynamics,
+    ) {
+        {
+            let layer = &self.layers[layer_idx];
             let frame_idx = if layer.frames.len() > 1 && layer.frame_duration_ms > 0 {
                 ((time * 1000.0 / layer.frame_duration_ms as f32) as usize) % layer.frames.len()
             } else {
@@ -1463,7 +1536,7 @@ impl GpuSceneInstance {
                     &[],
                 );
                 self.renderer.run_pass(
-                    &mut encoder,
+                    encoder,
                     &self.renderer.base_pass_pipeline,
                     &base_pass_bg,
                     None,
@@ -1577,7 +1650,7 @@ impl GpuSceneInstance {
                     let vertex_count = if pass.vertex_buffers.is_empty() { 3 } else { 6 };
 
                     self.renderer.run_pass(
-                        &mut encoder,
+                        encoder,
                         pipeline,
                         &base_bg,
                         Some(&effect_bg),
@@ -1658,55 +1731,99 @@ impl GpuSceneInstance {
             );
             let pipeline = self.renderer.composite_pipeline(layer.blend_mode);
             self.renderer.run_pass(
-                &mut encoder,
+                encoder,
                 pipeline,
                 &base_bg,
                 None,
-                &target_view,
+                target_view,
                 wgpu::LoadOp::Load,
                 "composite_pass",
                 6,
                 &[],
             );
         }
+    }
 
-        // 3. Particle layers: step, CPU-render into a scene-sized RGBA buffer,
-        // upload, and composite like a normal fullscreen layer. Runs before
-        // bloom so bright particles (sparks, magic effects) still glow.
-        for system in &mut self.particle_systems {
-            system.step(delta);
-            let mut buf = RgbaImage::new(self.width, self.height);
-            system.render_onto(&mut buf);
-            let tex = self.renderer.upload_texture(&buf);
-            let view = tex.create_view(&Default::default());
-            let sampler = self.renderer.sampler_for(false, false);
-            let composite_buf = self
-                .renderer
-                .make_uniform_buffer(&passthrough_composite_params(), 64);
-            let base_bg = self
-                .renderer
-                .make_base_bind_group(&view, sampler, &composite_buf, &[]);
-            self.renderer.run_pass(
-                &mut encoder,
-                self.renderer.composite_pipeline(0),
-                &base_bg,
-                None,
-                &target_view,
-                wgpu::LoadOp::Load,
-                "particle_composite",
-                6,
-                &[],
-            );
+    /// Steps and CPU-renders one particle system into a scene-sized RGBA
+    /// buffer, uploads it, and composites it like a normal fullscreen layer.
+    /// Steps a particle system and, if anything is alive, CPU-rasters +
+    /// uploads only its bounding box (`ParticleSystem::bounds()`) instead of
+    /// a full scene-sized buffer, compositing it as a positioned quad (the
+    /// same `rect`/`CompositeParams` mechanism image layers use) rather than
+    /// a fullscreen passthrough. Systems with no living particles are
+    /// skipped entirely — no raster, no allocation, no upload, no draw call.
+    /// A further possible optimization (not done here): reusing one
+    /// persistent GPU texture per system across frames instead of a fresh
+    /// `upload_texture` each frame — deferred since safely doing that while
+    /// the bbox size changes frame-to-frame needs UV-subregion plumbing the
+    /// composite shader doesn't have today.
+    fn draw_particle_layer_gpu(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        idx: usize,
+        delta: f32,
+    ) {
+        let system = &mut self.particle_systems[idx];
+        system.step(delta);
+        let Some((min_x, min_y, max_x, max_y)) = system.bounds() else {
+            return;
+        };
+        let min_x = min_x.max(0.0);
+        let min_y = min_y.max(0.0);
+        let max_x = max_x.min(self.width as f32);
+        let max_y = max_y.min(self.height as f32);
+        if max_x <= min_x || max_y <= min_y {
+            return;
         }
+        let bw = (max_x - min_x).ceil().max(1.0) as u32;
+        let bh = (max_y - min_y).ceil().max(1.0) as u32;
 
-        // 4. Scene bloom chain.
-        if self.bloom.enabled {
-            self.record_bloom(&mut encoder, &target_view);
-        }
+        let mut buf = RgbaImage::new(bw, bh);
+        system.render_onto(&mut buf, self.particle_sprites[idx].as_ref(), [min_x, min_y]);
+        let tex = self.renderer.upload_texture(&buf);
+        let view = tex.create_view(&Default::default());
+        let sampler = self.renderer.sampler_for(false, false);
 
-        self.renderer
-            .queue
-            .submit(std::iter::once(encoder.finish()));
+        // Same NDC `rect` convention as image layers (`gpu_shaders.wgsl`'s
+        // `vs_composite_quad`): center + half-extent, Y-up — flip our
+        // pixel-space (Y-down) bbox center back into WE's Y-up scene
+        // convention first, matching `spawn_center`'s own flip.
+        let cx_px = min_x + bw as f32 / 2.0;
+        let cy_px = min_y + bh as f32 / 2.0;
+        let we_cy = self.height as f32 - cy_px;
+        let rect = [
+            2.0 * cx_px / self.width as f32 - 1.0,
+            2.0 * we_cy / self.height as f32 - 1.0,
+            bw as f32 / self.width as f32,
+            bh as f32 / self.height as f32,
+        ];
+        let composite_buf = self.renderer.make_uniform_buffer(
+            &composite_params(
+                1.0,
+                0,
+                [0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                0.0,
+                rect,
+                self.width as f32 / self.height as f32,
+            ),
+            64,
+        );
+        let base_bg = self
+            .renderer
+            .make_base_bind_group(&view, sampler, &composite_buf, &[]);
+        self.renderer.run_pass(
+            encoder,
+            self.renderer.composite_pipeline(0),
+            &base_bg,
+            None,
+            target_view,
+            wgpu::LoadOp::Load,
+            "particle_composite",
+            6,
+            &[],
+        );
     }
 
     /// Bloom: threshold at quarter res, gaussian blur at quarter and eighth
@@ -2052,12 +2169,24 @@ fn load_effect_instance(
             );
             continue;
         };
+        // Some WE downsample/blur shaders read a fixed-size array varying
+        // through a `for` loop (`v_TexCoord[i]`) rather than literal indices;
+        // unroll that loop into literal accesses first so the array-varying
+        // pass below (which only handles literal indices) can then unroll
+        // the declaration too.
+        let frag_glsl = transpiler::unroll_simple_for_loops(&frag_glsl);
+        let vert_glsl = transpiler::unroll_simple_for_loops(&vert_glsl);
         // WE's downsample/blur/bloom shaders declare literally-indexed array
         // varyings (`v_TexCoord[4]`) that naga's GLSL frontend can't accept
         // as entry-point I/O; unroll them to scalar varyings before anything
         // else touches the source.
         let frag_glsl = transpiler::unroll_array_varyings(&frag_glsl);
         let vert_glsl = transpiler::unroll_array_varyings(&vert_glsl);
+        // Some shaders call max/min/clamp with a bare integer literal where a
+        // float is expected (e.g. nitro.frag's `max(0, albedo.rgb)`) — legacy
+        // NVIDIA compilers implicitly promoted it, naga/shaderc don't.
+        let frag_glsl = transpiler::coerce_int_literal_builtin_args(&frag_glsl);
+        let vert_glsl = transpiler::coerce_int_literal_builtin_args(&vert_glsl);
 
         // Scene.json pass overrides align with effect.json pass indices
         // (the reference's ImageEffectPassOverride).

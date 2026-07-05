@@ -12,8 +12,15 @@ use super::render::ResolvedScene;
 use super::scene::SceneObject;
 
 struct SceneAnimState {
-    base_layers: Vec<Arc<RgbaImage>>,
-    particles: Vec<ParticleSystem>,
+    /// Paired with each layer's `order_index` (its position in
+    /// `scene.visible_objects()`) so `render_frame` can interleave with
+    /// particles in true scene z-order instead of drawing all particles
+    /// after all images.
+    base_layers: Vec<(usize, Arc<RgbaImage>)>,
+    /// Each system paired with its `order_index` and resolved sprite texture
+    /// (from the preset's `material` field, if any) — `None` sprite falls
+    /// back to `render_onto`'s flat-color circle draw.
+    particles: Vec<(usize, ParticleSystem, Option<RgbaImage>)>,
     effects: Vec<LayerEffect>,
     width: u32,
     height: u32,
@@ -30,10 +37,11 @@ impl SceneAnimState {
         let width = resolved.width;
         let height = resolved.height;
 
-        let base_layers: Vec<Arc<RgbaImage>> = resolved
+        let base_layers: Vec<(usize, Arc<RgbaImage>)> = resolved
             .layers
             .into_iter()
             .map(|l| {
+                let order_index = l.order_index;
                 let resized = if l.image.width() != width || l.image.height() != height {
                     image::imageops::resize(
                         &l.image,
@@ -44,7 +52,7 @@ impl SceneAnimState {
                 } else {
                     l.image
                 };
-                Arc::new(resized)
+                (order_index, Arc::new(resized))
             })
             .collect();
 
@@ -56,11 +64,11 @@ impl SceneAnimState {
         if let Ok(assets) = AssetStore::from_directory(dir) {
             if let Ok(scene_json) = assets.scene_json() {
                 if let Ok(scene) = super::scene::Scene::from_json(&scene_json) {
-                    for obj in &scene.objects {
-                        if !obj.is_visible() {
-                            continue;
-                        }
-                        load_particles(&assets, obj, height, &mut particles);
+                    // Same iteration order `ResolvedScene` uses for `layers`
+                    // (`scene.visible_objects()`), so `order_index` here is
+                    // directly comparable to `Layer::order_index` above.
+                    for (obj_index, obj) in scene.visible_objects().enumerate() {
+                        load_particles(&assets, obj, height, obj_index, &mut particles);
                         load_effects(obj, &mut effects);
                     }
                 }
@@ -79,8 +87,37 @@ impl SceneAnimState {
     fn render_frame(&mut self, time: f32, dt: f32) -> RgbaImage {
         let mut canvas = RgbaImage::new(self.width, self.height);
 
-        for layer in &self.base_layers {
-            image::imageops::overlay(&mut canvas, layer.as_ref(), 0, 0);
+        // Interleave images and particles by `order_index` (true scene
+        // z-order) instead of drawing all particles after all images.
+        enum DrawItem {
+            Image(usize),
+            Particle(usize),
+        }
+        let mut items: Vec<(usize, DrawItem)> = self
+            .base_layers
+            .iter()
+            .enumerate()
+            .map(|(i, (order, _))| (*order, DrawItem::Image(i)))
+            .chain(
+                self.particles
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (order, _, _))| (*order, DrawItem::Particle(i))),
+            )
+            .collect();
+        items.sort_by_key(|(order, _)| *order);
+
+        for (_, item) in items {
+            match item {
+                DrawItem::Image(i) => {
+                    image::imageops::overlay(&mut canvas, self.base_layers[i].1.as_ref(), 0, 0);
+                }
+                DrawItem::Particle(i) => {
+                    let (_, ps, sprite) = &mut self.particles[i];
+                    ps.step(dt);
+                    ps.render_onto(&mut canvas, sprite.as_ref(), [0.0, 0.0]);
+                }
+            }
         }
 
         for effect in &self.effects {
@@ -89,11 +126,6 @@ impl SceneAnimState {
             {
                 eff.apply(&mut canvas);
             }
-        }
-
-        for ps in &mut self.particles {
-            ps.step(dt);
-            ps.render_onto(&mut canvas);
         }
 
         canvas
@@ -136,7 +168,8 @@ fn load_particles(
     assets: &AssetStore,
     obj: &SceneObject,
     height: u32,
-    particles: &mut Vec<ParticleSystem>,
+    order_index: usize,
+    particles: &mut Vec<(usize, ParticleSystem, Option<RgbaImage>)>,
 ) {
     let particle_ref = match &obj.particle {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -160,12 +193,40 @@ fn load_particles(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     if let Ok(config) = serde_json::from_str::<ParticleConfig>(&data) {
-        particles.push(ParticleSystem::from_config(
-            &config,
-            spawn_center,
-            overrides.as_ref(),
-        ));
+        let sprite = config
+            .material
+            .as_deref()
+            .and_then(|mat_path| resolve_particle_sprite(assets, mat_path));
+        let system = ParticleSystem::from_config(&config, spawn_center, overrides.as_ref());
+        particles.push((order_index, system, sprite));
     }
+}
+
+/// Resolves a particle preset's `material` field (a material JSON path, e.g.
+/// `"materials/presets/water_faucet.json"`) to its first pass's base
+/// texture, following one level of `material`-field indirection in case the
+/// path points at a model JSON instead (mirrors `render.rs`'s
+/// `resolve_model_chain_dir`/`_pkg`, but via `AssetStore` since this loader
+/// doesn't have direct `dir`/`pkg` access).
+fn resolve_particle_sprite(assets: &AssetStore, material_path: &str) -> Option<RgbaImage> {
+    let mut val: serde_json::Value = assets.read_json(material_path).ok()?;
+    if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
+        val = assets.read_json(mat_path).ok()?;
+    }
+    let passes = val.get("passes")?.as_array()?;
+    for pass in passes {
+        let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for tex_ref in textures {
+            if let Some(tex_name) = tex_ref.as_str() {
+                if let Ok(img) = assets.read_texture_rgba(tex_name) {
+                    return Some(img);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn load_effects(obj: &SceneObject, effects: &mut Vec<LayerEffect>) {

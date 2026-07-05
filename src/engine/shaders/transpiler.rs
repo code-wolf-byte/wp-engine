@@ -123,14 +123,323 @@ fn collect_scalar_uniforms(src: &str) -> Vec<(String, String)> {
     scalars
 }
 
-/// Rewrite fixed-size, literally-indexed array varyings/attributes (WE's
-/// downsample/blur/bloom shaders all declare e.g. `varying vec2 v_TexCoord[4]`
-/// and only ever read/write it with literal indices `v_TexCoord[0]` etc.)
-/// into N separate scalar varyings (`v_TexCoord_0`, `v_TexCoord_1`, ...).
-/// naga's GLSL frontend rejects array-typed entry-point I/O outright, so this
-/// is the only way these shaders translate at all. Dynamically-indexed arrays
-/// (a variable or loop-counter index) aren't touched — they still hit the
-/// "array varying not supported" rejection further down the pipeline.
+/// True if every `name[...]` access in `src` has a plain non-negative-integer
+/// literal inside the brackets (no variables/expressions).
+fn all_indices_are_literal(src: &str, name: &str) -> bool {
+    let pattern = format!("{name}[");
+    let mut search_from = 0;
+    while let Some(rel) = src[search_from..].find(pattern.as_str()) {
+        let start = search_from + rel + pattern.len();
+        let Some(end_rel) = src[start..].find(']') else {
+            return false; // unterminated — be conservative
+        };
+        let content = src[start..start + end_rel].trim();
+        if content.parse::<usize>().is_err() {
+            return false;
+        }
+        search_from = start + end_rel + 1;
+    }
+    true
+}
+
+/// Finds the balanced-bracket span starting at `open_pos` (which must point
+/// at an `open` byte), skipping bracket-like bytes inside `//` line comments.
+/// Returns `(span including both brackets, index just past the closer)`.
+fn extract_balanced(s: &str, open_pos: usize, open: u8, close: u8) -> Option<(&str, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(open_pos).copied() != Some(open) {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = open_pos;
+    let mut in_line_comment = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some((&s[open_pos..=i], i + 1));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parses a `for` header's three `;`-separated clauses into
+/// `(loop_var_name, iteration_count)`, only recognizing the exact shape real
+/// WE shaders use: `int NAME = 0; NAME < N; NAME++` (or `++NAME`, or `<=`).
+/// Returns `None` for anything else — callers must leave the input untouched
+/// rather than guess.
+fn parse_simple_for_header(header_inner: &str) -> Option<(String, usize)> {
+    let clauses: Vec<&str> = header_inner.split(';').collect();
+    if clauses.len() != 3 {
+        return None;
+    }
+    let init = clauses[0].trim();
+    let init = init
+        .strip_prefix("int ")
+        .or_else(|| init.strip_prefix("uint "))?;
+    let (name, start_val) = init.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    if start_val.trim().parse::<i64>() != Ok(0) {
+        return None; // only handle the universal `= 0` starting point
+    }
+
+    let cond = clauses[1].trim();
+    let (cmp_name, op, end_str) = if let Some((n, v)) = cond.split_once("<=") {
+        (n.trim(), "<=", v.trim())
+    } else if let Some((n, v)) = cond.split_once('<') {
+        (n.trim(), "<", v.trim())
+    } else {
+        return None;
+    };
+    if cmp_name != name {
+        return None;
+    }
+    let end_val: i64 = end_str.parse().ok()?;
+    let count = match op {
+        "<" => end_val,
+        "<=" => end_val + 1,
+        _ => return None,
+    };
+    if count <= 0 || count > 64 {
+        return None; // sanity bound — real shaders use small fixed kernels
+    }
+
+    let incr = clauses[2].trim();
+    if incr != format!("{name}++") && incr != format!("++{name}") {
+        return None;
+    }
+
+    Some((name.to_string(), count as usize))
+}
+
+/// Unrolls simple, fixed-bound `for (int i = 0; i < N; i++) { BODY }` loops
+/// into N literal copies of `BODY` with `i` replaced by each literal index.
+///
+/// Needed alongside `unroll_array_varyings`: naga's GLSL frontend rejects
+/// array-typed varyings outright, and that pass only unrolls *literally*
+/// indexed arrays — but some real shaders (e.g. `blur_downsample4.frag`) read
+/// a fixed-size array varying through exactly this kind of loop
+/// (`for (i...) texSample2D(tex, v_TexCoord[i])`). Unrolling the loop first
+/// turns `v_TexCoord[i]` into `v_TexCoord[0]`, `v_TexCoord[1]`, ... so the
+/// array-varying pass can then unroll the declaration too, and the shader
+/// translates instead of being skipped.
+///
+/// Only ever touches text that matches this exact shape; anything else (a
+/// different loop form, a non-zero start, a non-literal bound, nested loops
+/// it can't balance) is left completely untouched — no partial rewrites.
+pub fn unroll_simple_for_loops(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(for_rel) = rest.find("for") else {
+            out.push_str(rest);
+            break;
+        };
+        let before_ok = for_rel == 0 || !is_word_char(rest.as_bytes()[for_rel - 1]);
+        let after_rel = for_rel + 3;
+        let after_ok = rest
+            .as_bytes()
+            .get(after_rel)
+            .is_none_or(|&b| !is_word_char(b));
+        if !before_ok || !after_ok {
+            out.push_str(&rest[..after_rel]);
+            rest = &rest[after_rel..];
+            continue;
+        }
+
+        let paren_start =
+            after_rel + rest[after_rel..].len() - rest[after_rel..].trim_start().len();
+        if rest.as_bytes().get(paren_start).copied() != Some(b'(') {
+            out.push_str(&rest[..after_rel]);
+            rest = &rest[after_rel..];
+            continue;
+        }
+        let Some((header, header_end)) = extract_balanced(rest, paren_start, b'(', b')') else {
+            out.push_str(&rest[..after_rel]);
+            rest = &rest[after_rel..];
+            continue;
+        };
+        let Some((name, count)) = parse_simple_for_header(&header[1..header.len() - 1]) else {
+            out.push_str(&rest[..header_end]);
+            rest = &rest[header_end..];
+            continue;
+        };
+
+        let after_header = &rest[header_end..];
+        let body_open_rel = after_header.len() - after_header.trim_start().len();
+        let body_open_abs = header_end + body_open_rel;
+        if rest.as_bytes().get(body_open_abs).copied() != Some(b'{') {
+            out.push_str(&rest[..header_end]);
+            rest = &rest[header_end..];
+            continue;
+        }
+        let Some((body, body_end)) = extract_balanced(rest, body_open_abs, b'{', b'}') else {
+            out.push_str(&rest[..header_end]);
+            rest = &rest[header_end..];
+            continue;
+        };
+        let body_inner = &body[1..body.len() - 1];
+
+        out.push_str(&rest[..for_rel]);
+        for i in 0..count {
+            // Each iteration gets its own `{}` scope, matching the original
+            // loop body's scoping — otherwise a variable declared inside the
+            // loop (e.g. `vec4 sample = ...`) becomes a flat redeclaration
+            // once concatenated N times into the same enclosing scope.
+            out.push_str("{\n");
+            out.push_str(&rename_reserved_word(body_inner, &name, &i.to_string()));
+            out.push_str("\n}\n");
+        }
+        rest = &rest[body_end..];
+    }
+    out
+}
+
+/// Splits a function-call argument list on *top-level* commas (not inside
+/// nested parens), returning each argument's `(text, start_offset)` within
+/// `args`.
+fn split_top_level_args(args: &str) -> Vec<(&str, usize)> {
+    let bytes = args.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut out = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push((&args[start..i], start));
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push((&args[start..], start));
+    out
+}
+
+/// True if `s` (already trimmed) is a bare numeric literal: an optional `-`,
+/// digits, and an optional `.` plus more digits — no identifiers, swizzles,
+/// or function calls.
+fn is_bare_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let s = s.strip_prefix('-').unwrap_or(s);
+    if s.is_empty() {
+        return false;
+    }
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    for c in s.chars() {
+        match c {
+            '0'..='9' => seen_digit = true,
+            '.' if !seen_dot => seen_dot = true,
+            _ => return false,
+        }
+    }
+    seen_digit
+}
+
+fn ensure_float_literal(trimmed: &str) -> String {
+    if trimmed.contains('.') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.0")
+    }
+}
+
+/// Legacy NVIDIA GLSL compilers tolerated `max`/`min` calls with a bare
+/// numeric literal as the *first* argument and a vector expression second
+/// (e.g. nitro.frag's `max(0, albedo.rgb)`), including when the literal was
+/// an integer where a float is needed. Strict Vulkan GLSL (naga/shaderc)
+/// requires both: the literal to be a genuine float, *and* the vector
+/// argument first — GLSL only defines `genType max(genType x, float y)`, not
+/// the reverse. `max`/`min` are commutative, so swapping is always safe (not
+/// just when the second argument turns out to be a vector). `clamp`'s
+/// numeric arguments are only ever coerced to float, never reordered, since
+/// `clamp(x, minVal, maxVal)` isn't commutative.
+pub fn coerce_int_literal_builtin_args(src: &str) -> String {
+    const COMMUTATIVE_FUNCS: &[&str] = &["max(", "min("];
+    const OTHER_FUNCS: &[&str] = &["clamp("];
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    'outer: loop {
+        let mut best: Option<(usize, usize, bool)> = None; // (rel_pos, fn_len, commutative)
+        for f in COMMUTATIVE_FUNCS {
+            if let Some(rel) = rest.find(f) {
+                if best.is_none_or(|(bp, ..)| rel < bp) {
+                    best = Some((rel, f.len(), true));
+                }
+            }
+        }
+        for f in OTHER_FUNCS {
+            if let Some(rel) = rest.find(f) {
+                if best.is_none_or(|(bp, ..)| rel < bp) {
+                    best = Some((rel, f.len(), false));
+                }
+            }
+        }
+        let Some((rel, flen, commutative)) = best else {
+            out.push_str(rest);
+            break 'outer;
+        };
+        let open_pos = rel + flen - 1; // index of the '('
+        out.push_str(&rest[..open_pos]);
+        let Some((call, call_end)) = extract_balanced(rest, open_pos, b'(', b')') else {
+            out.push_str(&rest[open_pos..open_pos + 1]);
+            rest = &rest[open_pos + 1..];
+            continue;
+        };
+        let inner = &call[1..call.len() - 1];
+        let args = split_top_level_args(inner);
+        let trimmed: Vec<&str> = args.iter().map(|(a, _)| a.trim()).collect();
+
+        let mut fixed_args: Vec<String> = trimmed.iter().map(|t| t.to_string()).collect();
+        for t in fixed_args.iter_mut() {
+            if is_bare_number(t) {
+                *t = ensure_float_literal(t);
+            }
+        }
+        // Only max/min, only the exact 2-arg "literal first, non-literal
+        // second" shape — swap so the literal ends up in the (required)
+        // second position.
+        if commutative
+            && fixed_args.len() == 2
+            && is_bare_number(trimmed[0])
+            && !is_bare_number(trimmed[1])
+        {
+            fixed_args.swap(0, 1);
+        }
+
+        out.push('(');
+        out.push_str(&fixed_args.join(", "));
+        out.push(')');
+        rest = &rest[call_end..];
+    }
+    out
+}
+
 pub fn unroll_array_varyings(src: &str) -> String {
     // name -> (qualifier, type, count)
     let mut arrays: Vec<(String, String, String, usize)> = Vec::new();
@@ -185,7 +494,18 @@ pub fn unroll_array_varyings(src: &str) -> String {
             merged.push((name, qualifier, ty, n));
         }
     }
-    let arrays = merged;
+    // Only unroll names indexed *exclusively* by literal integers everywhere
+    // in the shader. Some real shaders (e.g. blur_downsample4.frag) loop over
+    // the array with a variable index (`for (i...) tex[i]`); rewriting just
+    // the literal-looking declaration while leaving `tex[i]` untouched would
+    // unroll the declaration out from under a body reference that's still
+    // there, producing "undeclared identifier" instead of a clean bail-out.
+    // Leaving such names alone lets the existing "array varying not
+    // supported" check below reject the shader honestly instead.
+    let arrays: Vec<_> = merged
+        .into_iter()
+        .filter(|(name, ..)| all_indices_are_literal(src, name))
+        .collect();
 
     // Re-extract this line's declared array name (if any) the same way as the
     // collection pass, so the declaration line is matched precisely instead
@@ -1051,6 +1371,154 @@ mod tests {
         let src = "varying vec2 v_TexCoord[LIGHTS_POINT];\n";
         let out = unroll_array_varyings(src);
         assert_eq!(out, src);
+    }
+
+    /// blur_downsample4.frag: a *fixed*-size array (`[4]`) but indexed by a
+    /// loop variable (`v_TexCoord[i]`), not literals. Unrolling only the
+    /// declaration here previously left `v_TexCoord[i]` referring to a name
+    /// that no longer existed ("undeclared identifier"), instead of leaving
+    /// the whole thing untouched for the honest "array varying not
+    /// supported" bail-out.
+    #[test]
+    fn leaves_loop_indexed_fixed_size_arrays_alone() {
+        let src = "varying vec2 v_TexCoord[4];\n\
+                   void main() {\n\
+                   \tfor (int i = 0; i < 4; ++i) {\n\
+                   \t\tvec4 s = texSample2D(g_Texture0, v_TexCoord[i]);\n\
+                   \t}\n}\n";
+        let out = unroll_array_varyings(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn unroll_simple_for_loops_expands_fixed_bound_loop() {
+        let src = "void main() {\n\tfor (int i = 0; i < 3; ++i) {\n\t\tx += arr[i];\n\t}\n}\n";
+        let out = unroll_simple_for_loops(src);
+        assert!(!out.contains("for ("));
+        assert!(out.contains("x += arr[0];"));
+        assert!(out.contains("x += arr[1];"));
+        assert!(out.contains("x += arr[2];"));
+        assert!(!out.contains("arr[3]"));
+    }
+
+    #[test]
+    fn unroll_simple_for_loops_handles_post_increment_and_less_equal() {
+        let src = "for (int i = 0; i <= 2; i++) { y += a[i]; }";
+        let out = unroll_simple_for_loops(src);
+        assert!(out.contains("y += a[0];"));
+        assert!(out.contains("y += a[1];"));
+        assert!(out.contains("y += a[2];"));
+        assert!(!out.contains("a[3]"));
+    }
+
+    #[test]
+    fn unroll_simple_for_loops_leaves_non_zero_start_untouched() {
+        let src = "for (int i = 1; i < 4; ++i) { x += arr[i]; }";
+        assert_eq!(unroll_simple_for_loops(src), src);
+    }
+
+    #[test]
+    fn unroll_simple_for_loops_leaves_non_literal_bound_untouched() {
+        let src = "for (int i = 0; i < N; ++i) { x += arr[i]; }";
+        assert_eq!(unroll_simple_for_loops(src), src);
+    }
+
+    #[test]
+    fn unroll_simple_for_loops_leaves_mismatched_loop_var_untouched() {
+        let src = "for (int i = 0; j < 4; ++i) { x += arr[i]; }";
+        assert_eq!(unroll_simple_for_loops(src), src);
+    }
+
+    #[test]
+    fn unroll_simple_for_loops_ignores_braces_inside_line_comments() {
+        let src = "for (int i = 0; i < 2; ++i) {\n\t// a stray brace: }\n\tx += arr[i];\n}\n";
+        let out = unroll_simple_for_loops(src);
+        assert!(!out.contains("for ("));
+        assert!(out.contains("x += arr[0];"));
+        assert!(out.contains("x += arr[1];"));
+    }
+
+    /// The exact real-world shape from blur_downsample4.frag: loop-unroll
+    /// then array-varying-unroll together must fully eliminate the array.
+    #[test]
+    fn loop_then_array_unroll_fully_resolves_real_world_pattern() {
+        let src = "varying vec2 v_TexCoord[4];\n\
+                   uniform sampler2D g_Texture0;\n\
+                   void main() {\n\
+                   \tfloat weight = 0.0;\n\
+                   \tvec4 result = CAST4(0.0);\n\
+                   \tfor (int i = 0; i < 4; ++i)\n\
+                   \t{\n\
+                   \t\tvec4 sample = texSample2D(g_Texture0, v_TexCoord[i]);\n\
+                   \t\tresult += sample * sample.a;\n\
+                   \t\tweight += sample.a;\n\
+                   \t}\n\
+                   \tgl_FragColor.rgb = result.rgb / max(0.001, weight);\n\
+                   }\n";
+        let loop_unrolled = unroll_simple_for_loops(src);
+        let fully_unrolled = unroll_array_varyings(&loop_unrolled);
+        assert!(!fully_unrolled.contains('['));
+        assert!(fully_unrolled.contains("varying vec2 v_TexCoord_0;"));
+        assert!(fully_unrolled.contains("varying vec2 v_TexCoord_3;"));
+        assert!(fully_unrolled.contains("v_TexCoord_0"));
+        assert!(fully_unrolled.contains("v_TexCoord_3"));
+    }
+
+    /// The exact real-world case (nitro.frag): `max(0, albedo.rgb)` is wrong
+    /// two ways — GLSL only defines `genType max(genType, float)` (vector
+    /// first), and the literal must be a genuine float. Both need fixing.
+    #[test]
+    fn coerce_int_literal_fixes_bare_integer_and_swaps_order_in_max_call() {
+        let src = "gl_FragColor = vec4(max(0, albedo.rgb), albedo.a);";
+        let out = coerce_int_literal_builtin_args(src);
+        assert_eq!(out, "gl_FragColor = vec4(max(albedo.rgb, 0.0), albedo.a);");
+    }
+
+    #[test]
+    fn coerce_int_literal_handles_min_and_clamp_and_negative() {
+        assert_eq!(coerce_int_literal_builtin_args("min(0, x)"), "min(x, 0.0)");
+        assert_eq!(
+            coerce_int_literal_builtin_args("clamp(x, 0, 1)"),
+            "clamp(x, 0.0, 1.0)"
+        );
+        assert_eq!(
+            coerce_int_literal_builtin_args("max(-1, x)"),
+            "max(x, -1.0)"
+        );
+    }
+
+    /// A literal that's already a float still needs reordering if it's in
+    /// the (invalid) first position — order matters independently of type.
+    /// `clamp`'s args are never reordered (not commutative), and calls that
+    /// aren't max/min/clamp at all are left alone entirely.
+    #[test]
+    fn coerce_int_literal_reorders_already_float_literal_and_ignores_other_calls() {
+        assert_eq!(
+            coerce_int_literal_builtin_args("max(0.0, x)"),
+            "max(x, 0.0)"
+        );
+        assert_eq!(
+            coerce_int_literal_builtin_args("clamp(y, a, b)"),
+            "clamp(y, a, b)"
+        );
+        assert_eq!(coerce_int_literal_builtin_args("foo(0, 1)"), "foo(0, 1)");
+    }
+
+    #[test]
+    fn coerce_int_literal_leaves_correctly_ordered_call_untouched() {
+        assert_eq!(
+            coerce_int_literal_builtin_args("max(albedo.rgb, 0.0)"),
+            "max(albedo.rgb, 0.0)"
+        );
+    }
+
+    #[test]
+    fn coerce_int_literal_handles_nested_calls() {
+        let src = "max(0, texture(tex, uv).rgb)";
+        assert_eq!(
+            coerce_int_literal_builtin_args(src),
+            "max(texture(tex, uv).rgb, 0.0)"
+        );
     }
 
     /// godrays_gaussian.frag declares the same varying at three different

@@ -48,6 +48,15 @@ pub struct ParticleLayer {
     pub parallax_depth: [f64; 2],
     pub config: particle::ParticleConfig,
     pub overrides: Option<particle::InstanceOverride>,
+    /// Resolved once from `config.material` (if present) via the same
+    /// model/material→texture chain image layers use. `None` falls back to
+    /// `render_onto`'s flat-color circle draw.
+    pub sprite_texture: Option<RgbaImage>,
+    /// This object's position in `scene.visible_objects()` (already the
+    /// scene's topological/declaration render order) — lets render loops
+    /// interleave particle systems with image layers in true scene z-order
+    /// instead of drawing all particles after all images.
+    pub order_index: usize,
 }
 
 pub struct Layer {
@@ -73,6 +82,9 @@ pub struct Layer {
     pub no_interpolation: bool,
     /// `.tex` `ClampUVs`/`ClampUVsBorder` flag: clamp-to-edge instead of repeat.
     pub clamp_uvs: bool,
+    /// This object's position in `scene.visible_objects()` — see
+    /// `ParticleLayer::order_index`.
+    pub order_index: usize,
 }
 
 /// A loaded texture plus any additional animation frames (e.g. from a `.tex`
@@ -160,15 +172,17 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
-        for obj in scene.visible_objects() {
+        for (obj_index, obj) in scene.visible_objects().enumerate() {
             if obj.particle.is_some() {
-                if let Some(pl) = particle_layer_from_object(obj, Some(dir), None) {
+                if let Some(mut pl) = particle_layer_from_object(obj, Some(dir), None) {
+                    pl.order_index = obj_index;
                     particle_layers.push(pl);
                 }
                 continue;
             }
             if obj.text.is_some() {
-                if let Some(layer) = text_layer_from_object(obj, Some(dir), None) {
+                if let Some(mut layer) = text_layer_from_object(obj, Some(dir), None) {
+                    layer.order_index = obj_index;
                     layers.push(layer);
                 }
                 continue;
@@ -202,7 +216,9 @@ impl ResolvedScene {
                     }
                 }
             };
-            layers.push(layer_from_object(obj, loaded, None));
+            let mut layer = layer_from_object(obj, loaded, None);
+            layer.order_index = obj_index;
+            layers.push(layer);
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
@@ -223,15 +239,17 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
-        for obj in scene.visible_objects() {
+        for (obj_index, obj) in scene.visible_objects().enumerate() {
             if obj.particle.is_some() {
-                if let Some(pl) = particle_layer_from_object(obj, Some(dir), Some(pkg)) {
+                if let Some(mut pl) = particle_layer_from_object(obj, Some(dir), Some(pkg)) {
+                    pl.order_index = obj_index;
                     particle_layers.push(pl);
                 }
                 continue;
             }
             if obj.text.is_some() {
-                if let Some(layer) = text_layer_from_object(obj, Some(dir), Some(pkg)) {
+                if let Some(mut layer) = text_layer_from_object(obj, Some(dir), Some(pkg)) {
+                    layer.order_index = obj_index;
                     layers.push(layer);
                 }
                 continue;
@@ -266,7 +284,9 @@ impl ResolvedScene {
                     }
                 }
             };
-            layers.push(layer_from_object(obj, loaded, None));
+            let mut layer = layer_from_object(obj, loaded, None);
+            layer.order_index = obj_index;
+            layers.push(layer);
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
@@ -288,15 +308,17 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
-        for obj in scene.visible_objects() {
+        for (obj_index, obj) in scene.visible_objects().enumerate() {
             if obj.particle.is_some() {
-                if let Some(pl) = particle_layer_from_object(obj, None, Some(pkg)) {
+                if let Some(mut pl) = particle_layer_from_object(obj, None, Some(pkg)) {
+                    pl.order_index = obj_index;
                     particle_layers.push(pl);
                 }
                 continue;
             }
             if obj.text.is_some() {
-                if let Some(layer) = text_layer_from_object(obj, None, Some(pkg)) {
+                if let Some(mut layer) = text_layer_from_object(obj, None, Some(pkg)) {
+                    layer.order_index = obj_index;
                     layers.push(layer);
                 }
                 continue;
@@ -327,7 +349,9 @@ impl ResolvedScene {
                     }
                 }
             };
-            layers.push(layer_from_object(obj, loaded, None));
+            let mut layer = layer_from_object(obj, loaded, None);
+            layer.order_index = obj_index;
+            layers.push(layer);
         }
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
@@ -341,135 +365,159 @@ impl ResolvedScene {
         })
     }
 
-    /// Composite all layers into a single RGBA image.
+    /// Composite all layers into a single RGBA image, in true scene z-order
+    /// (image and particle layers interleaved by `order_index`, matching the
+    /// reference's single shared per-object render order — CScene.cpp's
+    /// `m_objectsByRenderOrder` — instead of drawing all particles after all
+    /// images).
     pub fn render(&self) -> RgbaImage {
         let mut canvas = RgbaImage::new(self.width, self.height);
 
-        for layer in &self.layers {
-            let draw_w = if layer.size[0] != 0.0 {
-                (layer.size[0] * layer.scale[0]) as u32
-            } else {
-                layer.image.width()
-            };
-            let draw_h = if layer.size[1] != 0.0 {
-                (layer.size[1] * layer.scale[1]) as u32
-            } else {
-                layer.image.height()
-            };
-            if draw_w == 0 || draw_h == 0 {
-                continue;
-            }
-
-            let resized = if layer.image.width() != draw_w || layer.image.height() != draw_h {
-                image::imageops::resize(
-                    &layer.image,
-                    draw_w,
-                    draw_h,
-                    image::imageops::FilterType::Lanczos3,
-                )
-            } else {
-                layer.image.clone()
-            };
-
-            // WE origin is the object's center in absolute scene coordinates
-            // (Y-up, (0,0) at bottom-left); convert to top-left pixel coords.
-            let px = (layer.origin[0] - draw_w as f64 / 2.0) as i64;
-            let py = (self.height as f64 - layer.origin[1] - draw_h as f64 / 2.0) as i64;
-
-            let cw = canvas.width() as i64;
-            let ch = canvas.height() as i64;
-
-            let mut blend_pixel = |cx: i64, cy: i64, s: image::Rgba<u8>| {
-                if cx < 0 || cx >= cw || cy < 0 || cy >= ch {
-                    return;
-                }
-                let src_rgb = [
-                    (s[0] as f32 / 255.0) * layer.color[0] * layer.brightness,
-                    (s[1] as f32 / 255.0) * layer.color[1] * layer.brightness,
-                    (s[2] as f32 / 255.0) * layer.color[2] * layer.brightness,
-                ];
-                let src_a = (s[3] as f32 / 255.0) * layer.alpha;
-                if src_a <= 0.0 {
-                    return;
-                }
-                let dst = canvas.get_pixel_mut(cx as u32, cy as u32);
-                let dest_rgb = [
-                    dst[0] as f32 / 255.0,
-                    dst[1] as f32 / 255.0,
-                    dst[2] as f32 / 255.0,
-                ];
-                let out = crate::engine::blend::apply_blending(
-                    layer.blend_mode,
-                    dest_rgb,
-                    src_rgb,
-                    src_a,
-                );
-                dst[0] = (out[0].clamp(0.0, 1.0) * 255.0) as u8;
-                dst[1] = (out[1].clamp(0.0, 1.0) * 255.0) as u8;
-                dst[2] = (out[2].clamp(0.0, 1.0) * 255.0) as u8;
-                let dst_a = dst[3] as f32 / 255.0;
-                dst[3] = ((dst_a + src_a * (1.0 - dst_a)).clamp(0.0, 1.0) * 255.0) as u8;
-            };
-
-            if layer.angle == 0.0 {
-                for y in 0..draw_h {
-                    for x in 0..draw_w {
-                        blend_pixel(px + x as i64, py + y as i64, *resized.get_pixel(x, y));
-                    }
-                }
-            } else {
-                // Rotated layer: walk the canvas-space bounding box of the
-                // rotated rect and inverse-sample back into the unrotated
-                // `resized` image (nearest-neighbor).
-                let ccx = px as f64 + draw_w as f64 / 2.0;
-                let ccy = py as f64 + draw_h as f64 / 2.0;
-                let half_diag =
-                    ((draw_w as f64 / 2.0).powi(2) + (draw_h as f64 / 2.0).powi(2)).sqrt();
-                let (sin_a, cos_a) = (layer.angle as f64).sin_cos();
-                let x0 = ((ccx - half_diag).floor() as i64).max(0);
-                let x1 = ((ccx + half_diag).ceil() as i64).min(cw);
-                let y0 = ((ccy - half_diag).floor() as i64).max(0);
-                let y1 = ((ccy + half_diag).ceil() as i64).min(ch);
-                for cy in y0..y1 {
-                    for cx in x0..x1 {
-                        let fx = cx as f64 + 0.5 - ccx;
-                        let fy = cy as f64 + 0.5 - ccy;
-                        // Inverse rotation (screen → unrotated local space).
-                        let lx = cos_a * fx + sin_a * fy;
-                        let ly = -sin_a * fx + cos_a * fy;
-                        let sx = (lx + draw_w as f64 / 2.0).floor();
-                        let sy = (ly + draw_h as f64 / 2.0).floor();
-                        if sx < 0.0 || sy < 0.0 || sx >= draw_w as f64 || sy >= draw_h as f64 {
-                            continue;
-                        }
-                        blend_pixel(cx, cy, *resized.get_pixel(sx as u32, sy as u32));
-                    }
-                }
-            }
+        enum DrawItem {
+            Image(usize),
+            Particle(usize),
         }
+        let mut items: Vec<(usize, DrawItem)> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.order_index, DrawItem::Image(i)))
+            .chain(
+                self.particle_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pl)| (pl.order_index, DrawItem::Particle(i))),
+            )
+            .collect();
+        items.sort_by_key(|(order, _)| *order);
 
-        // Particle layers always draw on top of images (a known simplification —
-        // the reference interleaves particles into the scene's actual render
-        // order; see [[wp_engine_project]] memory). This is a single-shot
-        // preview render, so seed the simulation forward a few seconds instead
-        // of drawing an empty, freshly-spawned system.
-        for pl in &self.particle_layers {
-            let spawn_center = [
-                pl.origin[0] as f32,
-                self.height as f32 - pl.origin[1] as f32,
-            ];
-            let mut system = particle::ParticleSystem::from_config(
-                &pl.config,
-                spawn_center,
-                pl.overrides.as_ref(),
-            );
-            for _ in 0..150 {
-                system.step(1.0 / 30.0);
+        for (_, item) in items {
+            match item {
+                DrawItem::Image(i) => self.draw_image_layer(&self.layers[i], &mut canvas),
+                // This is a single-shot preview render, so seed the
+                // simulation forward a few seconds instead of drawing an
+                // empty, freshly-spawned system.
+                DrawItem::Particle(i) => {
+                    let pl = &self.particle_layers[i];
+                    let spawn_center =
+                        [pl.origin[0] as f32, self.height as f32 - pl.origin[1] as f32];
+                    let mut system = particle::ParticleSystem::from_config(
+                        &pl.config,
+                        spawn_center,
+                        pl.overrides.as_ref(),
+                    );
+                    for _ in 0..150 {
+                        system.step(1.0 / 30.0);
+                    }
+                    system.render_onto(&mut canvas, pl.sprite_texture.as_ref(), [0.0, 0.0]);
+                }
             }
-            system.render_onto(&mut canvas);
         }
 
         canvas
+    }
+
+    fn draw_image_layer(&self, layer: &Layer, canvas: &mut RgbaImage) {
+        let draw_w = if layer.size[0] != 0.0 {
+            (layer.size[0] * layer.scale[0]) as u32
+        } else {
+            layer.image.width()
+        };
+        let draw_h = if layer.size[1] != 0.0 {
+            (layer.size[1] * layer.scale[1]) as u32
+        } else {
+            layer.image.height()
+        };
+        if draw_w == 0 || draw_h == 0 {
+            return;
+        }
+
+        let resized = if layer.image.width() != draw_w || layer.image.height() != draw_h {
+            image::imageops::resize(
+                &layer.image,
+                draw_w,
+                draw_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            layer.image.clone()
+        };
+
+        // WE origin is the object's center in absolute scene coordinates
+        // (Y-up, (0,0) at bottom-left); convert to top-left pixel coords.
+        let px = (layer.origin[0] - draw_w as f64 / 2.0) as i64;
+        let py = (self.height as f64 - layer.origin[1] - draw_h as f64 / 2.0) as i64;
+
+        let cw = canvas.width() as i64;
+        let ch = canvas.height() as i64;
+
+        let mut blend_pixel = |cx: i64, cy: i64, s: image::Rgba<u8>| {
+            if cx < 0 || cx >= cw || cy < 0 || cy >= ch {
+                return;
+            }
+            let src_rgb = [
+                (s[0] as f32 / 255.0) * layer.color[0] * layer.brightness,
+                (s[1] as f32 / 255.0) * layer.color[1] * layer.brightness,
+                (s[2] as f32 / 255.0) * layer.color[2] * layer.brightness,
+            ];
+            let src_a = (s[3] as f32 / 255.0) * layer.alpha;
+            if src_a <= 0.0 {
+                return;
+            }
+            let dst = canvas.get_pixel_mut(cx as u32, cy as u32);
+            let dest_rgb = [
+                dst[0] as f32 / 255.0,
+                dst[1] as f32 / 255.0,
+                dst[2] as f32 / 255.0,
+            ];
+            let out = crate::engine::blend::apply_blending(
+                layer.blend_mode,
+                dest_rgb,
+                src_rgb,
+                src_a,
+            );
+            dst[0] = (out[0].clamp(0.0, 1.0) * 255.0) as u8;
+            dst[1] = (out[1].clamp(0.0, 1.0) * 255.0) as u8;
+            dst[2] = (out[2].clamp(0.0, 1.0) * 255.0) as u8;
+            let dst_a = dst[3] as f32 / 255.0;
+            dst[3] = ((dst_a + src_a * (1.0 - dst_a)).clamp(0.0, 1.0) * 255.0) as u8;
+        };
+
+        if layer.angle == 0.0 {
+            for y in 0..draw_h {
+                for x in 0..draw_w {
+                    blend_pixel(px + x as i64, py + y as i64, *resized.get_pixel(x, y));
+                }
+            }
+        } else {
+            // Rotated layer: walk the canvas-space bounding box of the
+            // rotated rect and inverse-sample back into the unrotated
+            // `resized` image (nearest-neighbor).
+            let ccx = px as f64 + draw_w as f64 / 2.0;
+            let ccy = py as f64 + draw_h as f64 / 2.0;
+            let half_diag =
+                ((draw_w as f64 / 2.0).powi(2) + (draw_h as f64 / 2.0).powi(2)).sqrt();
+            let (sin_a, cos_a) = (layer.angle as f64).sin_cos();
+            let x0 = ((ccx - half_diag).floor() as i64).max(0);
+            let x1 = ((ccx + half_diag).ceil() as i64).min(cw);
+            let y0 = ((ccy - half_diag).floor() as i64).max(0);
+            let y1 = ((ccy + half_diag).ceil() as i64).min(ch);
+            for cy in y0..y1 {
+                for cx in x0..x1 {
+                    let fx = cx as f64 + 0.5 - ccx;
+                    let fy = cy as f64 + 0.5 - ccy;
+                    // Inverse rotation (screen → unrotated local space).
+                    let lx = cos_a * fx + sin_a * fy;
+                    let ly = -sin_a * fx + cos_a * fy;
+                    let sx = (lx + draw_w as f64 / 2.0).floor();
+                    let sy = (ly + draw_h as f64 / 2.0).floor();
+                    if sx < 0.0 || sy < 0.0 || sx >= draw_w as f64 || sy >= draw_h as f64 {
+                        continue;
+                    }
+                    blend_pixel(cx, cy, *resized.get_pixel(sx as u32, sy as u32));
+                }
+            }
+        }
     }
 }
 
@@ -593,6 +641,7 @@ fn layer_from_object(
         copybackground: obj.copybackground,
         no_interpolation: loaded.no_interpolation,
         clamp_uvs: loaded.clamp_uvs,
+        order_index: 0,
     }
 }
 
@@ -653,12 +702,22 @@ fn particle_layer_from_object(
         .map(parse_parallax_depth)
         .unwrap_or([0.0, 0.0]);
 
+    let sprite_texture = config.material.as_deref().and_then(|mat_path| {
+        if let Some(pkg) = pkg {
+            resolve_model_chain_pkg(pkg, mat_path).ok()
+        } else {
+            dir.and_then(|dir| resolve_model_chain_dir(dir, mat_path).ok())
+        }
+    });
+
     Some(ParticleLayer {
         name: obj.name.clone().unwrap_or_default(),
         origin: obj.parsed_origin(),
         parallax_depth,
         config,
         overrides,
+        sprite_texture,
+        order_index: 0,
     })
 }
 
@@ -949,6 +1008,95 @@ fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid_particle_config(color: &str) -> particle::ParticleConfig {
+        let json = format!(
+            r#"{{
+                "maxcount": 2,
+                "emitter": [{{"name":"box","rate":1000}}],
+                "initializer": [
+                    {{"id":1,"name":"lifetimerandom","min":100,"max":100}},
+                    {{"id":2,"name":"sizerandom","min":300,"max":300}},
+                    {{"id":3,"name":"velocityrandom","min":"0 0 0","max":"0 0 0"}},
+                    {{"id":4,"name":"colorrandom","min":"{color}","max":"{color}"}},
+                    {{"id":5,"name":"alpharandom","min":1,"max":1}}
+                ]
+            }}"#
+        );
+        serde_json::from_str(&json).expect("should parse")
+    }
+
+    /// Particles should interleave with image layers by `order_index` in
+    /// true scene z-order, not always draw on top of every image — build a
+    /// scene with [particle(order 0, blue), image(order 1, opaque red),
+    /// particle(order 2, green)] and confirm the final canvas shows the
+    /// blue particle fully hidden under the opaque red layer, with the green
+    /// particle visible on top of it.
+    #[test]
+    fn particles_and_images_interleave_by_order_index() {
+        let scene: Scene = serde_json::from_str("{}").unwrap();
+        let red_image = RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
+
+        let layers = vec![Layer {
+            name: "red".to_string(),
+            image: red_image,
+            extra_frames: Vec::new(),
+            frame_duration_ms: 0,
+            origin: [50.0, 50.0, 0.0],
+            size: [100.0, 100.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            parallax_depth: [0.0, 0.0],
+            angle: 0.0,
+            blend_mode: 0,
+            alpha: 1.0,
+            color: [1.0, 1.0, 1.0],
+            brightness: 1.0,
+            copybackground: false,
+            no_interpolation: true,
+            clamp_uvs: false,
+            order_index: 1,
+        }];
+
+        let particle_layers = vec![
+            ParticleLayer {
+                name: "blue_particles".to_string(),
+                origin: [50.0, 50.0, 0.0],
+                parallax_depth: [0.0, 0.0],
+                config: solid_particle_config("0 0 255"),
+                overrides: None,
+                sprite_texture: None,
+                order_index: 0,
+            },
+            ParticleLayer {
+                name: "green_particles".to_string(),
+                origin: [50.0, 50.0, 0.0],
+                parallax_depth: [0.0, 0.0],
+                config: solid_particle_config("0 255 0"),
+                overrides: None,
+                sprite_texture: None,
+                order_index: 2,
+            },
+        ];
+
+        let resolved = ResolvedScene {
+            width: 100,
+            height: 100,
+            layers,
+            particle_layers,
+            scene,
+        };
+
+        let canvas = resolved.render();
+        let px = canvas.get_pixel(50, 50);
+        assert!(
+            px[2] < 20,
+            "blue particle (order 0) should be fully hidden under the opaque red layer (order 1), got {px:?}"
+        );
+        assert!(
+            px[1] > px[0],
+            "green particle (order 2) should be visible on top of the red layer, got {px:?}"
+        );
+    }
 
     #[test]
     fn parallax_depth_number_broadcasts_to_both_axes() {

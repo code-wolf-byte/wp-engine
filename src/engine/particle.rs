@@ -20,6 +20,26 @@ pub struct ParticleConfig {
     pub renderer: Vec<serde_json::Value>,
     #[serde(default)]
     pub flags: Option<u32>,
+    /// Real JSON key is singular `"controlpoint"` (an array), referenced by
+    /// index (not `id`-keyed lookup at use-site) from operators/emitters like
+    /// `controlpointattract` (CParticle.cpp/ObjectParser.cpp).
+    #[serde(default)]
+    pub controlpoint: Vec<ControlPointConfig>,
+    /// Path to the material JSON providing this system's sprite texture
+    /// (e.g. `"materials/presets/water_faucet.json"`). Resolved by callers
+    /// (this module stays asset-agnostic) and passed into `render_onto`.
+    #[serde(default)]
+    pub material: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ControlPointConfig {
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<serde_json::Value>,
+    #[serde(default)]
+    pub flags: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,15 +95,17 @@ pub struct Operator {
     pub fadeouttime: Option<f64>,
     /// `sizechange`/`alphachange`/`colorchange`: linear ramp from `startvalue`
     /// to `endvalue` over normalized-lifetime `[starttime, endtime]`
-    /// (CParticle.cpp's generic `fadeValue`).
+    /// (CParticle.cpp's generic `fadeValue`). `startvalue`/`endvalue` are
+    /// untyped because `sizechange`/`alphachange` use a plain number but
+    /// `colorchange` uses an `"r g b"` vector string (e.g. `"1 0.75 0"`).
     #[serde(default)]
     pub starttime: Option<f64>,
     #[serde(default)]
     pub endtime: Option<f64>,
     #[serde(default)]
-    pub startvalue: Option<f64>,
+    pub startvalue: Option<serde_json::Value>,
     #[serde(default)]
-    pub endvalue: Option<f64>,
+    pub endvalue: Option<serde_json::Value>,
     /// `oscillatealpha`/`oscillatesize`/`oscillateposition`: per-particle
     /// random frequency/scale/phase, resampled once at spawn.
     #[serde(default)]
@@ -98,6 +120,24 @@ pub struct Operator {
     pub phasemin: Option<f64>,
     #[serde(default)]
     pub phasemax: Option<f64>,
+    /// `controlpointattract`: pulls particles toward `controlpoint` (index
+    /// into the particle config's `controlpoint` array) whenever they're
+    /// within `threshold/2` of it (CParticle.cpp createControlPointAttractOperator).
+    #[serde(default)]
+    pub controlpoint: Option<i64>,
+    #[serde(default)]
+    pub origin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// `angularmovement`: integrates `rotation.z` from `angularvelocityrandom`'s
+    /// sampled `angular_velocity`, itself accelerated by `force.z` and decayed
+    /// by `drag` each step (CParticle.cpp createAngularMovementOperator).
+    #[serde(default)]
+    pub drag: Option<f64>,
+    #[serde(default)]
+    pub force: Option<serde_json::Value>,
 }
 
 /// Scene.json's per-instance `instanceoverride` on a particle object —
@@ -143,13 +183,20 @@ struct Particle {
     size: f32,
     alpha: f32,
     color: [u8; 3],
-    /// Alpha/size as set by the initializers at spawn — `alphafade`/
-    /// `sizechange` scale *this*, not the live (already-modified) value.
+    /// Alpha/size/color as set by the initializers at spawn — `alphafade`/
+    /// `sizechange`/`colorchange` scale *this*, not the live (already-modified)
+    /// value. `initial_color` is 0..1 (matching `colorchange`'s multiplier).
     initial_alpha: f32,
     initial_size: f32,
+    initial_color: [f32; 3],
     osc_alpha: Option<Oscillator1D>,
     osc_size: Option<Oscillator1D>,
     osc_pos: Option<OscillatorPos>,
+    /// Screen-space (Z-axis) rotation angle, radians. Only visually relevant
+    /// once a sprite texture is drawn (`render_onto`'s textured path) — a
+    /// flat-color circle is rotation-invariant.
+    rotation: f32,
+    angular_velocity: f32,
 }
 
 /// Parsed `oscillatealpha`/`oscillatesize`/`oscillateposition` operator
@@ -214,6 +261,10 @@ pub struct ParticleSystem {
     /// `sizechange`/`alphachange`: (starttime, endtime, startvalue, endvalue).
     sizechange: Option<(f32, f32, f32, f32)>,
     alphachange: Option<(f32, f32, f32, f32)>,
+    /// `colorchange`: (starttime, endtime, start_color, end_color), colors in
+    /// 0..1 (unlike `colorrandom`'s 0..255 — matches the real presets, e.g.
+    /// `"startvalue": "1 0.75 0"`).
+    colorchange: Option<(f32, f32, [f32; 3], [f32; 3])>,
     oscillate_alpha: Option<OscillateParams>,
     oscillate_size: Option<OscillateParams>,
     oscillate_position: Option<OscillateParams>,
@@ -222,6 +273,25 @@ pub struct ParticleSystem {
     speed_mult: f32,
     rate_mult: f32,
     color_override: Option<[u8; 3]>,
+    /// Resolved once at construction: `spawn_center + offset` per control
+    /// point, indexed positionally (falls back to declaration order when a
+    /// config omits `id`). Nested parent-space transforms and mouse-linked
+    /// (`locktopointer`)/world-space (`flags & 2`) control points are not
+    /// modeled — same simplification already accepted for emitter origins.
+    control_points: Vec<[f32; 3]>,
+    /// `controlpointattract`: (control point index, origin offset, scale, threshold).
+    control_point_attract: Option<(usize, [f32; 3], f32, f32)>,
+    /// True when `config.renderer` names a `"rope"`/`"ropetrail"` renderer —
+    /// draws a connected ribbon through living particles instead of
+    /// independent circles (CParticle::renderRope).
+    rope_mode: bool,
+    rope_subdivision: usize,
+    /// `angularvelocityrandom` initializer range (z-axis component only).
+    angular_velocity_min: f32,
+    angular_velocity_max: f32,
+    /// `angularmovement` operator (z-axis `force` component, plus `drag`).
+    angular_force: f32,
+    angular_drag: f32,
 }
 
 struct EmitterState {
@@ -351,13 +421,31 @@ impl ParticleSystem {
                     (
                         op.starttime.unwrap_or(0.0) as f32,
                         op.endtime.unwrap_or(1.0) as f32,
-                        op.startvalue.unwrap_or(0.0) as f32,
-                        op.endvalue.unwrap_or(1.0) as f32,
+                        op.startvalue.as_ref().and_then(value_as_f32).unwrap_or(0.0),
+                        op.endvalue.as_ref().and_then(value_as_f32).unwrap_or(1.0),
                     )
                 })
         };
         let sizechange = fade_range_op("sizechange");
         let alphachange = fade_range_op("alphachange");
+        let colorchange = config
+            .operator
+            .iter()
+            .find(|op| op.name.contains("colorchange"))
+            .map(|op| {
+                (
+                    op.starttime.unwrap_or(0.0) as f32,
+                    op.endtime.unwrap_or(1.0) as f32,
+                    op.startvalue
+                        .as_ref()
+                        .and_then(value_as_vec3)
+                        .unwrap_or([1.0; 3]),
+                    op.endvalue
+                        .as_ref()
+                        .and_then(value_as_vec3)
+                        .unwrap_or([1.0; 3]),
+                )
+            });
         let oscillate_op = |name: &str| -> Option<OscillateParams> {
             config
                 .operator
@@ -368,6 +456,82 @@ impl ParticleSystem {
         let oscillate_alpha = oscillate_op("oscillatealpha");
         let oscillate_size = oscillate_op("oscillatesize");
         let oscillate_position = oscillate_op("oscillateposition");
+
+        // Positional indexing (declaration order), not `id`-keyed slot
+        // placement — real presets declare control points in id order, and
+        // consumers (e.g. `controlpointattract`) reference them by a plain
+        // array index anyway.
+        let control_points: Vec<[f32; 3]> = config
+            .controlpoint
+            .iter()
+            .map(|cp| {
+                let offset = cp
+                    .offset
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0; 3]);
+                [
+                    spawn_center[0] + offset[0],
+                    spawn_center[1] + offset[1],
+                    offset[2],
+                ]
+            })
+            .collect();
+
+        let control_point_attract = config
+            .operator
+            .iter()
+            .find(|op| op.name.contains("controlpointattract"))
+            .map(|op| {
+                let idx = op.controlpoint.unwrap_or(0).max(0) as usize;
+                let origin = op
+                    .origin
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0; 3]);
+                let scale = op.scale.unwrap_or(100.0) as f32;
+                let threshold = op.threshold.unwrap_or(1000.0) as f32;
+                (idx, origin, scale, threshold)
+            });
+
+        let rope_renderer = config.renderer.iter().find(|r| {
+            r.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n == "rope" || n == "ropetrail")
+                .unwrap_or(false)
+        });
+        let rope_mode = rope_renderer.is_some();
+        let rope_subdivision = rope_renderer
+            .and_then(|r| r.get("subdivision"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+
+        // `angularvelocityrandom`'s min/max are vec3 (reference default
+        // `(0,0,-5)`/`(0,0,5)`) — we only model the z-axis (screen-space)
+        // component, matching how `rotation.z` is the only axis our flat
+        // 2D renderer can express.
+        let (angular_velocity_min, angular_velocity_max) = config
+            .initializer
+            .iter()
+            .find(|init| init.name.contains("angularvelocity"))
+            .map(|init| {
+                let min = init.min.as_ref().and_then(value_as_vec3).unwrap_or([0.0, 0.0, -5.0]);
+                let max = init.max.as_ref().and_then(value_as_vec3).unwrap_or([0.0, 0.0, 5.0]);
+                (min[2], max[2])
+            })
+            .unwrap_or((0.0, 0.0));
+
+        let angular_op = config
+            .operator
+            .iter()
+            .find(|op| op.name.contains("angularmovement"));
+        let angular_drag = angular_op.and_then(|op| op.drag).unwrap_or(0.0) as f32;
+        let angular_force = angular_op
+            .and_then(|op| op.force.as_ref())
+            .and_then(value_as_vec3)
+            .map(|v| v[2])
+            .unwrap_or(0.0);
 
         Self {
             particles: Vec::with_capacity(max_count),
@@ -385,6 +549,7 @@ impl ParticleSystem {
             alphafade,
             sizechange,
             alphachange,
+            colorchange,
             oscillate_alpha,
             oscillate_size,
             oscillate_position,
@@ -393,6 +558,14 @@ impl ParticleSystem {
             speed_mult: overrides.and_then(|o| o.speed).unwrap_or(1.0) as f32,
             rate_mult: overrides.and_then(|o| o.rate).unwrap_or(1.0) as f32,
             color_override,
+            control_points,
+            control_point_attract,
+            rope_mode,
+            rope_subdivision,
+            angular_velocity_min,
+            angular_velocity_max,
+            angular_force,
+            angular_drag,
         }
     }
 
@@ -417,9 +590,32 @@ impl ParticleSystem {
                 }
             }
 
+            if let Some((idx, origin, scale, threshold)) = self.control_point_attract {
+                if let Some(cp) = self.control_points.get(idx) {
+                    let center = [cp[0] + origin[0], cp[1] + origin[1]];
+                    let to_center = [center[0] - p.x, center[1] - p.y];
+                    let distance = (to_center[0] * to_center[0] + to_center[1] * to_center[1]).sqrt();
+                    let radius = threshold / 2.0;
+                    if distance > 0.001 && distance < radius {
+                        let force = scale * dt * self.speed_mult;
+                        p.vx += (to_center[0] / distance) * force;
+                        p.vy += (to_center[1] / distance) * force;
+                    }
+                }
+            }
+
             p.x += p.vx * dt;
             p.y += p.vy * dt;
             p.life -= dt;
+
+            // Reference order (CParticle.cpp createAngularMovementOperator):
+            // integrate rotation from the *current* angular velocity first,
+            // then accelerate angular velocity, then decay it by drag.
+            p.rotation += p.angular_velocity * dt;
+            p.angular_velocity += self.angular_force * dt;
+            let drag_factor = (1.0 - self.angular_drag * dt).max(0.0);
+            p.angular_velocity *= drag_factor;
+            p.rotation = wrap_angle(p.rotation);
 
             let age = p.max_life - p.life;
             let lifetime_pos = if p.max_life > 0.0 {
@@ -468,6 +664,19 @@ impl ParticleSystem {
                     .map(|o| o.scale_min + (o.scale_max - o.scale_min) * cos_val)
                     .unwrap_or(1.0);
                 size *= mult;
+            }
+
+            if let Some((start, end, start_color, end_color)) = self.colorchange {
+                let mult = [
+                    fade_value(lifetime_pos, start, end, start_color[0], end_color[0]),
+                    fade_value(lifetime_pos, start, end, start_color[1], end_color[1]),
+                    fade_value(lifetime_pos, start, end, start_color[2], end_color[2]),
+                ];
+                p.color = [
+                    (p.initial_color[0] * mult[0] * 255.0).clamp(0.0, 255.0) as u8,
+                    (p.initial_color[1] * mult[1] * 255.0).clamp(0.0, 255.0) as u8,
+                    (p.initial_color[2] * mult[2] * 255.0).clamp(0.0, 255.0) as u8,
+                ];
             }
 
             p.alpha = alpha * self.alpha_mult;
@@ -544,6 +753,11 @@ impl ParticleSystem {
                     color,
                     initial_alpha: self.alpha_mult,
                     initial_size: size,
+                    initial_color: [
+                        color[0] as f32 / 255.0,
+                        color[1] as f32 / 255.0,
+                        color[2] as f32 / 255.0,
+                    ],
                     osc_alpha: self.oscillate_alpha.map(|o| o.sample()),
                     osc_size: self.oscillate_size.map(|o| o.sample()),
                     osc_pos: self.oscillate_position.map(|o| {
@@ -555,12 +769,47 @@ impl ParticleSystem {
                             phase: [a.phase, b.phase],
                         }
                     }),
+                    rotation: 0.0,
+                    angular_velocity: self.angular_velocity_min
+                        + fastrand::f32() * (self.angular_velocity_max - self.angular_velocity_min),
                 });
             }
         }
     }
 
-    pub fn render_onto(&self, canvas: &mut RgbaImage) {
+    /// Bounding box (`min_x, min_y, max_x, max_y`) over all alive particles'
+    /// `position ± size` (with a small margin for the soft-falloff glow
+    /// radius) — `None` when nothing is alive, so callers can skip a wasted
+    /// raster/upload entirely. Lets `render_onto` be called with a canvas
+    /// sized to just this box instead of the full scene.
+    pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for p in &self.particles {
+            // `p.size` is a radius (see `sizerandom`'s halving comment) for
+            // both the circle and textured-quad draws; pad by a couple of
+            // pixels for the soft falloff's antialiasing.
+            let half = p.size.max(1.0) + 2.0;
+            min_x = min_x.min(p.x - half);
+            min_y = min_y.min(p.y - half);
+            max_x = max_x.max(p.x + half);
+            max_y = max_y.max(p.y + half);
+        }
+        (!self.particles.is_empty()).then_some((min_x, min_y, max_x, max_y))
+    }
+
+    /// `origin` shifts every particle's canvas-space position by `-origin` —
+    /// lets callers raster into a canvas sized to just a system's bounding
+    /// box (see `bounds()`) instead of the full scene. Existing full-canvas
+    /// callers pass `[0.0, 0.0]`.
+    pub fn render_onto(&self, canvas: &mut RgbaImage, sprite: Option<&RgbaImage>, origin: [f32; 2]) {
+        if self.rope_mode {
+            self.render_rope_onto(canvas, origin);
+            return;
+        }
+
         let w = canvas.width() as i32;
         let h = canvas.height() as i32;
 
@@ -573,8 +822,16 @@ impl ParticleSystem {
             if sz <= 0 {
                 continue;
             }
-            let cx = p.x as i32;
-            let cy = p.y as i32;
+            let px_pos = p.x - origin[0];
+            let py_pos = p.y - origin[1];
+
+            if let Some(tex) = sprite {
+                draw_textured_particle(canvas, px_pos, py_pos, p.size, p.rotation, p.color, alpha, tex);
+                continue;
+            }
+
+            let cx = px_pos as i32;
+            let cy = py_pos as i32;
 
             let sz2 = (sz * sz) as f32;
             for dy in -sz..=sz {
@@ -616,6 +873,312 @@ impl ParticleSystem {
             }
         }
     }
+
+    /// Draws a connected ribbon through living particles (oldest-first, since
+    /// `step()`'s retain preserves order and new spawns are appended) instead
+    /// of independent circles. Position is interpolated with the reference's
+    /// exact Catmull-Rom formula (CParticle.cpp:2124-2130); size/color/alpha
+    /// are linearly interpolated. The reference computes ribbon *width* in an
+    /// external, proprietary shader (not present in the open-source reference
+    /// repo) from a tangent/normal it derives per-vertex — this perpendicular-
+    /// offset quad approach is our own design for the same visual effect,
+    /// informed by, but not a line-for-line port of, that shader.
+    fn render_rope_onto(&self, canvas: &mut RgbaImage, origin: [f32; 2]) {
+        let n = self.particles.len();
+        if n < 2 {
+            return;
+        }
+
+        struct SubPoint {
+            pos: [f32; 2],
+            size: f32,
+            color: [u8; 3],
+            alpha: f32,
+        }
+
+        let subdiv = self.rope_subdivision;
+        let mut subpoints = Vec::with_capacity((n - 1) * subdiv + 1);
+        for i in 0..(n - 1) {
+            let idx0 = i.saturating_sub(1);
+            let p0 = &self.particles[idx0];
+            let p1 = &self.particles[i];
+            let p2 = &self.particles[i + 1];
+            let idx3 = (i + 2).min(n - 1);
+            let p3 = &self.particles[idx3];
+
+            for step in 0..subdiv {
+                let t = step as f32 / subdiv as f32;
+                let pos = catmull_rom_vec2(
+                    [p0.x, p0.y],
+                    [p1.x, p1.y],
+                    [p2.x, p2.y],
+                    [p3.x, p3.y],
+                    t,
+                );
+                subpoints.push(SubPoint {
+                    pos: [pos[0] - origin[0], pos[1] - origin[1]],
+                    size: lerp_f32(p1.size, p2.size, t),
+                    alpha: lerp_f32(p1.alpha, p2.alpha, t),
+                    color: [
+                        lerp_f32(p1.color[0] as f32, p2.color[0] as f32, t) as u8,
+                        lerp_f32(p1.color[1] as f32, p2.color[1] as f32, t) as u8,
+                        lerp_f32(p1.color[2] as f32, p2.color[2] as f32, t) as u8,
+                    ],
+                });
+            }
+        }
+        let last = &self.particles[n - 1];
+        subpoints.push(SubPoint {
+            pos: [last.x - origin[0], last.y - origin[1]],
+            size: last.size,
+            color: last.color,
+            alpha: last.alpha,
+        });
+
+        for pair in subpoints.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            fill_rope_segment(canvas, a.pos, b.pos, a.size, b.size, a.color, b.color, a.alpha, b.alpha);
+        }
+    }
+}
+
+/// Reference's exact Catmull-Rom formula (CParticle.cpp:2124-2130), applied
+/// per-axis.
+fn catmull_rom_vec2(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let mut out = [0.0; 2];
+    for axis in 0..2 {
+        let (p0, p1, p2, p3) = (p0[axis], p1[axis], p2[axis], p3[axis]);
+        out[axis] = 0.5
+            * ((2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+    }
+    out
+}
+
+fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Rasterizes one ribbon quad between two consecutive sub-points: offsets
+/// each endpoint by its half-size along the segment's perpendicular normal,
+/// then fills the resulting trapezoid with "over" alpha blending (same style
+/// as the per-particle circle draw).
+#[allow(clippy::too_many_arguments)]
+fn fill_rope_segment(
+    canvas: &mut RgbaImage,
+    a: [f32; 2],
+    b: [f32; 2],
+    size_a: f32,
+    size_b: f32,
+    color_a: [u8; 3],
+    color_b: [u8; 3],
+    alpha_a: f32,
+    alpha_b: f32,
+) {
+    let dir = [b[0] - a[0], b[1] - a[1]];
+    let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+    if len < 0.0001 {
+        return;
+    }
+    let dir = [dir[0] / len, dir[1] / len];
+    let normal = [-dir[1], dir[0]];
+    let (half_a, half_b) = (size_a.max(0.5) / 2.0, size_b.max(0.5) / 2.0);
+
+    let corners = [
+        [a[0] + normal[0] * half_a, a[1] + normal[1] * half_a],
+        [b[0] + normal[0] * half_b, b[1] + normal[1] * half_b],
+        [b[0] - normal[0] * half_b, b[1] - normal[1] * half_b],
+        [a[0] - normal[0] * half_a, a[1] - normal[1] * half_a],
+    ];
+
+    let min_x = corners.iter().map(|c| c[0]).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let max_x = corners
+        .iter()
+        .map(|c| c[0])
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(canvas.width() as f32 - 1.0) as i32;
+    let min_y = corners.iter().map(|c| c[1]).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let max_y = corners
+        .iter()
+        .map(|c| c[1])
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(canvas.height() as f32 - 1.0) as i32;
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+
+    let w = canvas.width() as i32;
+    let h = canvas.height() as i32;
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            if px < 0 || py < 0 || px >= w || py >= h {
+                continue;
+            }
+            let point = [px as f32 + 0.5, py as f32 + 0.5];
+            if !point_in_convex_quad(point, &corners) {
+                continue;
+            }
+            // Blend color/alpha by which endpoint the pixel is nearer along
+            // the segment (a cheap stand-in for true per-pixel interpolation).
+            let seg_t = ((point[0] - a[0]) * dir[0] + (point[1] - a[1]) * dir[1]) / len;
+            let seg_t = seg_t.clamp(0.0, 1.0);
+            let alpha = (lerp_f32(alpha_a, alpha_b, seg_t) * 180.0).clamp(0.0, 255.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let color = [
+                lerp_f32(color_a[0] as f32, color_b[0] as f32, seg_t) as u8,
+                lerp_f32(color_a[1] as f32, color_b[1] as f32, seg_t) as u8,
+                lerp_f32(color_a[2] as f32, color_b[2] as f32, seg_t) as u8,
+            ];
+
+            let dst = canvas.get_pixel_mut(px as u32, py as u32);
+            let src_a = alpha as f32 / 255.0;
+            let dst_a = dst[3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a > 0.0 {
+                for i in 0..3 {
+                    let src_c = color[i] as f32 / 255.0;
+                    let dst_c = dst[i] as f32 / 255.0;
+                    let out_c = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
+                    dst[i] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+            dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// Point-in-convex-quad test via consistent cross-product sign across all
+/// four edges. `corners` must be wound consistently (either all-CW or
+/// all-CCW) — true by construction here (two parallel perpendicular offsets).
+fn point_in_convex_quad(point: [f32; 2], corners: &[[f32; 2]; 4]) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..4 {
+        let a = corners[i];
+        let b = corners[(i + 1) % 4];
+        let edge = [b[0] - a[0], b[1] - a[1]];
+        let to_point = [point[0] - a[0], point[1] - a[1]];
+        let cross = edge[0] * to_point[1] - edge[1] * to_point[0];
+        if i == 0 {
+            sign = cross;
+        } else if cross * sign < 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Wraps an angle to `[-pi, pi]`, matching `createAngularMovementOperator`'s
+/// per-axis wrap (CParticle.cpp).
+fn wrap_angle(a: f32) -> f32 {
+    let mut a = a % std::f32::consts::TAU;
+    if a > std::f32::consts::PI {
+        a -= std::f32::consts::TAU;
+    } else if a < -std::f32::consts::PI {
+        a += std::f32::consts::TAU;
+    }
+    a
+}
+
+/// Draws one particle as a rotated, textured quad: inverse-rotates each
+/// destination pixel in the quad's bounding box back into texture space,
+/// bilinear-samples, and composites tinted-by-`color`/scaled-by-`alpha_byte`
+/// over the canvas. The reference hands rotation+size to an external,
+/// proprietary vertex shader to build the quad (not present in the
+/// open-source reference repo) — this CPU inverse-mapping is our own design
+/// for the same visual effect.
+#[allow(clippy::too_many_arguments)]
+fn draw_textured_particle(
+    canvas: &mut RgbaImage,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    rotation: f32,
+    color: [u8; 3],
+    alpha_byte: u8,
+    tex: &RgbaImage,
+) {
+    // `p.size` is already a radius, not a diameter (see `sizerandom`'s
+    // comment on the halving done at spawn) — matches the flat-color circle
+    // draw's `sz = p.size` convention, so a particle looks the same size
+    // whether or not it has a material/texture.
+    let half = size.max(0.5);
+    let cos_r = rotation.cos();
+    let sin_r = rotation.sin();
+
+    // Bounding box of the rotated quad: the diagonal half-extent covers any
+    // rotation angle.
+    let diag = half * std::f32::consts::SQRT_2;
+    let w = canvas.width() as i32;
+    let h = canvas.height() as i32;
+    let min_x = ((cx - diag).floor() as i32).max(0);
+    let max_x = ((cx + diag).ceil() as i32).min(w - 1);
+    let min_y = ((cy - diag).floor() as i32).max(0);
+    let max_y = ((cy + diag).ceil() as i32).min(h - 1);
+
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            let dx = px as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            // Inverse-rotate the destination offset back into the quad's own
+            // (unrotated) local space.
+            let lx = dx * cos_r + dy * sin_r;
+            let ly = -dx * sin_r + dy * cos_r;
+            if lx < -half || lx > half || ly < -half || ly > half {
+                continue;
+            }
+            let u = (lx + half) / (2.0 * half);
+            let v = (ly + half) / (2.0 * half);
+            let sample = sample_bilinear(tex, u, v);
+            let src_a = (sample[3] as f32 / 255.0) * (alpha_byte as f32 / 255.0);
+            if src_a <= 0.0 {
+                continue;
+            }
+            let dst = canvas.get_pixel_mut(px as u32, py as u32);
+            let dst_a = dst[3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a > 0.0 {
+                for i in 0..3 {
+                    let src_c = (sample[i] as f32 / 255.0) * (color[i] as f32 / 255.0);
+                    let dst_c = dst[i] as f32 / 255.0;
+                    let out_c = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
+                    dst[i] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+            dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn sample_bilinear(tex: &RgbaImage, u: f32, v: f32) -> [u8; 4] {
+    let (tw, th) = (tex.width(), tex.height());
+    let fx = (u.clamp(0.0, 1.0) * (tw as f32 - 1.0).max(0.0)).max(0.0);
+    let fy = (v.clamp(0.0, 1.0) * (th as f32 - 1.0).max(0.0)).max(0.0);
+    let x0 = fx.floor() as u32;
+    let y0 = fy.floor() as u32;
+    let x1 = (x0 + 1).min(tw - 1);
+    let y1 = (y0 + 1).min(th - 1);
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+
+    let p00 = tex.get_pixel(x0, y0);
+    let p10 = tex.get_pixel(x1, y0);
+    let p01 = tex.get_pixel(x0, y1);
+    let p11 = tex.get_pixel(x1, y1);
+
+    let mut out = [0u8; 4];
+    for i in 0..4 {
+        let top = p00[i] as f32 * (1.0 - tx) + p10[i] as f32 * tx;
+        let bottom = p01[i] as f32 * (1.0 - tx) + p11[i] as f32 * tx;
+        out[i] = (top * (1.0 - ty) + bottom * ty).clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 fn lerp_u8(min: f32, max: f32) -> u8 {
@@ -858,6 +1421,280 @@ mod tests {
         assert!((sys.particles[0].size - initial_size * 2.0).abs() < initial_size * 0.1);
     }
 
+    /// A real `colorchange` preset (torch.json): "r g b" 0..1 vector strings
+    /// for startvalue/endvalue — these previously broke parsing entirely
+    /// (Operator.startvalue/endvalue were typed as bare f64).
+    #[test]
+    fn colorchange_parses_and_multiplies_initial_color_over_lifetime() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"box","rate":1}],
+            "initializer": [{"id":1,"name":"colorrandom","min":"255 255 255","max":"255 255 255"}],
+            "operator": [{"id":1,"name":"colorchange","startvalue":"1 0.75 0","endvalue":"1 0 0","endtime":1}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.emitters[0].rate = 1000.0;
+        sys.step(0.001); // spawns the particle; fade math runs on existing particles first
+        assert_eq!(sys.particles.len(), 1);
+
+        sys.step(0.001); // age≈0 → at startvalue (1, 0.75, 0) * white
+        let c0 = sys.particles[0].color;
+        assert_eq!(c0[0], 255);
+        assert!((c0[1] as i32 - 191).abs() <= 2); // 0.75*255≈191
+        assert_eq!(c0[2], 0);
+
+        sys.step(9.99); // age≈10 → lifetime_pos=1.0 → at endvalue (1, 0, 0) * white
+        let c1 = sys.particles[0].color;
+        assert_eq!(c1, [255, 0, 0]);
+    }
+
+    /// A real `controlpointattract` preset pulls particles within `threshold/2`
+    /// of a control point toward it, and leaves particles outside that radius
+    /// untouched (CParticle.cpp createControlPointAttractOperator).
+    #[test]
+    fn controlpointattract_pulls_nearby_particles_toward_control_point() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"box","rate":1}],
+            "controlpoint": [{"id":0,"offset":"200 0 0"}],
+            "operator": [{"id":1,"name":"controlpointattract","controlpoint":0,"scale":500,"threshold":1000}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        // spawn_center [0,0] + control point offset "200 0 0" -> control point at [200, 0].
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        assert_eq!(sys.control_points, vec![[200.0, 0.0, 0.0]]);
+
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.emitters[0].rate = 1000.0;
+        sys.step(0.001); // spawns the particle at/near [0,0]
+        assert_eq!(sys.particles.len(), 1);
+        let start_dist = ((sys.particles[0].x - 200.0).powi(2) + sys.particles[0].y.powi(2)).sqrt();
+
+        for _ in 0..10 {
+            sys.step(0.05);
+        }
+        let end_dist = ((sys.particles[0].x - 200.0).powi(2) + sys.particles[0].y.powi(2)).sqrt();
+        assert!(
+            end_dist < start_dist,
+            "expected particle to be pulled toward control point: start={start_dist} end={end_dist}"
+        );
+    }
+
+    /// A particle outside the attract radius (`threshold/2`) should be left
+    /// alone entirely.
+    #[test]
+    fn controlpointattract_ignores_particles_outside_threshold() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"box","rate":1}],
+            "controlpoint": [{"id":0,"offset":"5000 0 0"}],
+            "operator": [{"id":1,"name":"controlpointattract","controlpoint":0,"scale":500,"threshold":10}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.emitters[0].rate = 1000.0;
+        sys.step(0.001);
+        assert_eq!(sys.particles.len(), 1);
+        // Capture the emitter-assigned spawn velocity (unrelated to the
+        // control point), then confirm a step leaves it untouched since the
+        // particle is well outside the attract radius.
+        let (vx0, vy0) = (sys.particles[0].vx, sys.particles[0].vy);
+        sys.step(0.05);
+        assert_eq!(sys.particles[0].vx, vx0);
+        assert_eq!(sys.particles[0].vy, vy0);
+    }
+
+    /// A `rope`/`ropetrail` renderer should draw a connected ribbon through
+    /// living particles rather than isolated circles — verify pixels are
+    /// filled *between* particle centers, not just at them.
+    #[test]
+    fn rope_renderer_fills_ribbon_between_particles() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"box","rate":1}],
+            "initializer": [{"id":1,"name":"sizerandom","min":40,"max":40}],
+            "renderer": [{"id":1,"name":"rope","subdivision":4}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        assert!(sys.rope_mode);
+        assert_eq!(sys.rope_subdivision, 4);
+
+        // Manually place three particles in a horizontal line, all alive.
+        let mut sys = sys;
+        for (i, x) in [0.0f32, 50.0, 100.0].into_iter().enumerate() {
+            sys.particles.push(Particle {
+                x,
+                y: 100.0,
+                vx: 0.0,
+                vy: 0.0,
+                life: 5.0,
+                max_life: 5.0,
+                size: 20.0,
+                alpha: 1.0,
+                color: [255, 0, 0],
+                initial_alpha: 1.0,
+                initial_size: 20.0,
+                initial_color: [1.0, 0.0, 0.0],
+                osc_alpha: None,
+                osc_size: None,
+                osc_pos: None,
+                rotation: 0.0,
+                angular_velocity: 0.0,
+            });
+            let _ = i;
+        }
+
+        let mut canvas = RgbaImage::new(200, 200);
+        sys.render_onto(&mut canvas, None, [0.0, 0.0]);
+
+        // Midpoint between the first two particles (25, 100) should be filled
+        // — a plain per-particle circle draw (radius 10) would leave this gap
+        // empty since it's 25px from the nearest particle center.
+        let mid_pixel = canvas.get_pixel(25, 100);
+        assert!(mid_pixel[3] > 0, "expected ribbon fill at midpoint, got {mid_pixel:?}");
+    }
+
+    fn make_particle(x: f32, y: f32, size: f32, rotation: f32) -> Particle {
+        Particle {
+            x,
+            y,
+            vx: 0.0,
+            vy: 0.0,
+            life: 5.0,
+            max_life: 5.0,
+            size,
+            alpha: 1.0,
+            color: [255, 255, 255],
+            initial_alpha: 1.0,
+            initial_size: size,
+            initial_color: [1.0, 1.0, 1.0],
+            osc_alpha: None,
+            osc_size: None,
+            osc_pos: None,
+            rotation,
+            angular_velocity: 0.0,
+        }
+    }
+
+    /// A textured particle's rotation should actually affect what's drawn —
+    /// sampling the same canvas location at two different rotation angles
+    /// must produce different colors, proving the quad (and the texture
+    /// sampled onto it) is genuinely rotated, not just passed through.
+    #[test]
+    fn textured_particle_rotation_changes_sampled_footprint() {
+        // 8x8 sprite: left half red, right half blue, fully opaque.
+        let mut tex = RgbaImage::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let color = if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+                tex.put_pixel(x, y, image::Rgba(color));
+            }
+        }
+
+        let config: ParticleConfig = serde_json::from_str(
+            r#"{"maxcount":1,"emitter":[{"name":"box","rate":1}]}"#,
+        )
+        .expect("should parse");
+
+        let render_at = |rotation: f32| -> image::Rgba<u8> {
+            let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+            sys.particles.push(make_particle(50.0, 50.0, 20.0, rotation));
+            let mut canvas = RgbaImage::new(100, 100);
+            sys.render_onto(&mut canvas, Some(&tex), [0.0, 0.0]);
+            *canvas.get_pixel(44, 50)
+        };
+
+        let unrotated = render_at(0.0);
+        let rotated = render_at(std::f32::consts::FRAC_PI_2);
+        assert_ne!(
+            unrotated, rotated,
+            "expected rotation to change the sampled footprint at a fixed canvas point"
+        );
+    }
+
+    #[test]
+    fn bounds_is_none_when_no_particles_alive() {
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":5,"emitter":[{"name":"box","rate":0}]}"#)
+                .expect("should parse");
+        let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        assert!(sys.bounds().is_none());
+    }
+
+    #[test]
+    fn bounds_covers_alive_particle_extents() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"box","rate":1,"distancemax":"0 0 0"}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":10,"max":10},
+                {"id":2,"name":"sizerandom","min":20,"max":20},
+                {"id":3,"name":"velocityrandom","min":"0 0 0","max":"0 0 0"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [100.0, 100.0], None);
+        sys.emitters[0].rate = 1000.0;
+        sys.step(0.001);
+        assert_eq!(sys.particles.len(), 1);
+
+        let (min_x, min_y, max_x, max_y) = sys.bounds().expect("should have bounds");
+        // Particle spawned at (100,100) (spread disabled via distancemax=0).
+        // `sizerandom`'s value is halved at spawn (diameter → radius, see
+        // the comment on that halving elsewhere in this file), so a
+        // `sizerandom` of 20 gives an actual radius of 10; `bounds()` adds a
+        // couple of pixels of margin on top of that.
+        assert!(min_x < 100.0 - 9.0 && min_x > 100.0 - 16.0, "min_x={min_x}");
+        assert!(max_x > 100.0 + 9.0 && max_x < 100.0 + 16.0, "max_x={max_x}");
+        assert!(min_y < 100.0 - 9.0 && min_y > 100.0 - 16.0, "min_y={min_y}");
+        assert!(max_y > 100.0 + 9.0 && max_y < 100.0 + 16.0, "max_y={max_y}");
+    }
+
+    /// `render_onto`'s `origin` param should shift particle canvas positions,
+    /// letting a caller raster into a canvas sized to just the bbox instead
+    /// of the full scene.
+    #[test]
+    fn render_onto_origin_shifts_particle_positions() {
+        let json = r#"{
+            "maxcount": 5,
+            "emitter": [{"name":"box","rate":1}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":10,"max":10},
+                {"id":2,"name":"sizerandom","min":10,"max":10},
+                {"id":3,"name":"velocityrandom","min":"0 0 0","max":"0 0 0"},
+                {"id":4,"name":"alpharandom","min":1,"max":1}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [50.0, 50.0], None);
+        sys.emitters[0].rate = 1000.0;
+        sys.step(0.001);
+        assert_eq!(sys.particles.len(), 1);
+
+        // A canvas the same size as the bbox, with origin shifted to the
+        // bbox's top-left, should show the particle rendered near its
+        // center rather than clipped at (0,0).
+        let (min_x, min_y, max_x, max_y) = sys.bounds().unwrap();
+        let w = (max_x - min_x).ceil() as u32;
+        let h = (max_y - min_y).ceil() as u32;
+        let mut canvas = RgbaImage::new(w, h);
+        sys.render_onto(&mut canvas, None, [min_x, min_y]);
+
+        let cx = (w / 2).min(w - 1);
+        let cy = (h / 2).min(h - 1);
+        assert!(
+            canvas.get_pixel(cx, cy)[3] > 0,
+            "expected particle to render near the shifted canvas center"
+        );
+    }
+
     #[test]
     fn oscillate_params_defaults_scale_min_from_scale_max_when_absent() {
         let op = Operator {
@@ -875,6 +1712,12 @@ mod tests {
             scalemax: Some(10.0),
             phasemin: None,
             phasemax: None,
+            controlpoint: None,
+            origin: None,
+            scale: None,
+            threshold: None,
+            drag: None,
+            force: None,
         };
         let params = OscillateParams::from_operator(&op);
         assert_eq!(params.scale_min, 10.0);
@@ -900,6 +1743,12 @@ mod tests {
             scalemax: Some(1.0),
             phasemin: None,
             phasemax: None,
+            controlpoint: None,
+            origin: None,
+            scale: None,
+            threshold: None,
+            drag: None,
+            force: None,
         };
         let params = OscillateParams::from_operator(&op);
         for _ in 0..50 {

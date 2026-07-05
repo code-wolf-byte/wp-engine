@@ -358,11 +358,13 @@ impl TexFile {
 
 fn decode_raw(format: TexFormat, data: &[u8], width: u32, height: u32) -> Vec<u8> {
     match format {
-        // WE stores ARGB8888 as BGRA in memory; swap R and B to produce RGBA.
-        TexFormat::Rgba8 => data
-            .chunks_exact(4)
-            .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
-            .collect(),
+        // Despite the reference's "ARGB8888" name, CTexture.cpp uploads raw
+        // (non-FreeImage-embedded) bytes for this format directly via
+        // `glTexImage2D(..., GL_RGBA, GL_UNSIGNED_BYTE, dataptr)` with no byte
+        // reordering — the data on disk is already straight RGBA. A previous
+        // R/B swap here was wrong and visibly shifted every wallpaper's hues
+        // (teal skies rendering yellow-green, blues rendering magenta/red).
+        TexFormat::Rgba8 => data.to_vec(),
         TexFormat::R8 => data.iter().flat_map(|&r| [r, r, r, 255]).collect(),
         TexFormat::Rg88 => data
             .chunks(2)
