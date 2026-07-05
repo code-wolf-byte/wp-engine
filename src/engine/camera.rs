@@ -38,7 +38,9 @@ impl SceneCamera {
 
     /// Convert WE world-space position+size to quad shader parameters.
     ///
-    /// WE world space: Y-up, origin at scene center. Returns:
+    /// WE world space: absolute scene coordinates with Y-up and (0,0) at the
+    /// bottom-left; `origin` is the object's center (a fullscreen object sits
+    /// at `(w/2, h/2)`). Returns:
     /// - `offset_norm`: top-left corner as fraction of scene size `[0,1]`
     /// - `size_norm`: object size as fraction of scene size
     pub fn object_to_quad(
@@ -46,8 +48,8 @@ impl SceneCamera {
         world_origin: [f32; 3],
         world_size: [f32; 2],
     ) -> ([f32; 2], [f32; 2]) {
-        let left_px = self.width / 2.0 + world_origin[0] - world_size[0] / 2.0;
-        let top_px = self.height / 2.0 - world_origin[1] - world_size[1] / 2.0;
+        let left_px = world_origin[0] - world_size[0] / 2.0;
+        let top_px = self.height - world_origin[1] - world_size[1] / 2.0;
         let offset_norm = [left_px / self.width, top_px / self.height];
         let size_norm = [world_size[0] / self.width, world_size[1] / self.height];
         (offset_norm, size_norm)

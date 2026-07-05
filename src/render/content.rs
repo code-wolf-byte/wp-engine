@@ -55,6 +55,33 @@ impl WallpaperContent {
         }
     }
 
+    /// Resolve content from any filesystem path: a wallpaper directory
+    /// (scene.json / scene.pkg / project.json) or a plain image/video file.
+    pub fn from_any_path(path: &Path) -> Result<Self> {
+        if path.is_dir() {
+            if path.join("scene.json").exists() || path.join("scene.pkg").exists() {
+                return Ok(WallpaperContent::Scene {
+                    dir: path.to_owned(),
+                });
+            }
+            // A wallpaper directory with project.json but no scene data:
+            // resolve the `file` entry (video/image wallpapers).
+            let project_path = path.join("project.json");
+            if project_path.exists() {
+                let data = std::fs::read_to_string(&project_path)?;
+                let project: serde_json::Value = serde_json::from_str(&data)?;
+                if let Some(file) = project.get("file").and_then(|f| f.as_str()) {
+                    return Self::from_path(&path.join(file));
+                }
+            }
+            return Err(anyhow!(
+                "directory {} contains no scene.json, scene.pkg, or project.json file entry",
+                path.display()
+            ));
+        }
+        Self::from_path(path)
+    }
+
     /// Detect content type from a raw file path, guessing by extension.
     ///
     /// Video extensions are decoded with FFmpeg; everything else is opened

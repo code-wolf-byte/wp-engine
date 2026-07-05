@@ -15,9 +15,16 @@ path = "src/tests/scan_wallpapers.rs"
 # Wayland renderer
 smithay-client-toolkit  = "0.18"
 wayland-client          = "0.31"
+# client_system: use libwayland so wl_display/wl_surface C pointers exist —
+# required to create wgpu (Vulkan) surfaces on the layer-shell surface.
+wayland-backend         = { version = "0.3", features = ["client_system"] }
 wayland-protocols-wlr   = "0.2"
 calloop                 = { version = "0.12", features = ["executor"] }
 calloop-wayland-source  = "0.2"
+raw-window-handle       = "0.6"
+
+# Graceful SIGINT/SIGTERM shutdown in WallpaperApplication::show()
+libc = "0.2"
 
 # GUI
 eframe = { version = "0.33", features = ["wayland"] }
@@ -27,8 +34,9 @@ egui   = "0.33"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Image loading (thumbnails + wallpaper pixels)
-image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
+# Image loading (thumbnails + wallpaper pixels). bmp/gif/tga/tiff/webp cover
+# the FreeImage payload formats .tex containers can embed (WE's FIF enum).
+image = { version = "0.24", default-features = false, features = ["jpeg", "png", "bmp", "gif", "tga", "tiff", "webp"] }
 
 # Video decoding (requires system FFmpeg: pacman -S ffmpeg / apt install ffmpeg)
 ffmpeg-next = "8"
@@ -42,10 +50,11 @@ naga     = { version = "27", features = ["glsl-in", "wgsl-in", "wgsl-out", "spv-
 shaderc  = "0.8"
 pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
 
-# Engine – texture decompression + particles
+# Engine – texture decompression + particles + text rasterization
 lz4_flex = "0.11"
 fastrand = "2"
 bytemuck = { version = "1", features = ["derive"] }
+fontdue  = "0.9"
 
 # Utilities
 anyhow = "1"

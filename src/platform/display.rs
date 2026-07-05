@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
-use crate::render::{FrameSource, RenderSettings};
+use crate::render::{RenderSettings, WallpaperContent};
 
 // ── Private inner trait ───────────────────────────────────────────────────────
 
@@ -41,9 +41,14 @@ impl WallpaperHandle {
 // ── Platform trait ────────────────────────────────────────────────────────────
 
 pub trait DisplayPlatform {
+    /// Spawn a wallpaper renderer for `content` on every output.
+    ///
+    /// The platform decides how to render: scene wallpapers draw directly
+    /// into GPU surfaces when the compositor allows it; other content (and
+    /// fallback paths) go through CPU frames + SHM buffers.
     fn spawn_wallpaper(
         &self,
-        frame_source: FrameSource,
+        content: WallpaperContent,
         settings: Arc<Mutex<RenderSettings>>,
     ) -> Result<WallpaperHandle>;
 }

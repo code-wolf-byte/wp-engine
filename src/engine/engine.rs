@@ -113,9 +113,10 @@ impl SceneEngine {
 
     /// Render one frame into `scene_fbo`. Caller is responsible for submitting the queue.
     ///
-    /// Current state: scaffold — clears the scene FBO and per-object primary FBOs.
-    /// Full implementation (Phase 7) will wire up GpuSceneRenderer pipelines for
-    /// base-texture compositing, effect ping-pong, and blend-mode compositing.
+    /// Note: the production render path is `gpu_renderer::GpuSceneInstance`,
+    /// which implements the full pass chain (base blit → effect ping-pong with
+    /// named FBOs → blend-mode composite → bloom). `SceneEngine` remains as the
+    /// typed-port skeleton and only clears its targets.
     pub fn render_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         // 1. Clear scene output.
         {
@@ -140,9 +141,8 @@ impl SceneEngine {
             });
         }
 
-        // 2. Per-object passes.
-        // TODO (Phase 7): blit current_texture() → primary_fbo, run effect passes
-        // (ping-pong primary_fbo ↔ sub_fbo), composite primary_fbo → scene_fbo.
+        // 2. Per-object target clears (full pass execution lives in
+        // gpu_renderer::GpuSceneInstance::render).
         for obj in &self.objects {
             if !obj.is_visible {
                 continue;

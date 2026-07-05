@@ -64,21 +64,284 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> VsOutput {
 
 // ── Passthrough (compositing / layer blit) ───────────────────────────────────
 
-// CompositeParams: position/scale/rotation are baked into quad vertices on the CPU
-// (matching linux-wallpaperengine's vertex-buffer approach). Only per-layer
-// blending parameters remain here.
+// CompositeParams places one scene object's quad and carries its per-frame
+// blending state. `uv_offset` holds camera dynamics (shake + parallax);
+// `rect` is (center_ndc.xy, half_size_ndc.xy) for the quad vertices.
+// `angle` is the object's z-rotation in radians (WE `angles.z`); `aspect`
+// (scene width/height) lets the vertex shader undo the anisotropic NDC scale
+// before rotating so the quad rotates rigidly instead of shearing.
 struct CompositeParams {
     opacity: f32,
-    _p1: f32, _p2: f32, _p3: f32,  // bytes 4-15 padding
+    mode: i32,                      // bytes 4-7: WE colorBlendMode (0 = normal alpha blend)
+    uv_offset: vec2<f32>,           // byte 8 (vec2 alignment=8)
     color: vec3<f32>,               // byte 16 (vec3 alignment=16)
-    _p4: f32,                       // byte 28
+    angle: f32,                     // byte 28 (fills the vec3's std140 tail)
+    rect: vec4<f32>,                // byte 32: center.xy, half_extent.xy (NDC)
+    aspect: f32,                    // byte 48: scene width / height
 }
 @group(0) @binding(2) var<uniform> composite: CompositeParams;
+@group(0) @binding(3) var dest_copy_tex: texture_2d<f32>;
+
+// Quad vertex shader for object composites: two triangles covering the
+// object's rect, generated from vertex_index (no vertex buffer).
+@vertex
+fn vs_composite_quad(@builtin(vertex_index) vi: u32) -> VsOutput {
+    // Corner order: (-1,-1) (1,-1) (-1,1) | (1,-1) (1,1) (-1,1)
+    var corners = array<vec2<f32>, 6>(
+        vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
+        vec2(1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0),
+    );
+    let corner = corners[vi];
+    let he = corner * composite.rect.zw;
+    // Rotate in isotropic (pixel-shaped) space: undo the NDC aspect scale on
+    // one axis, rotate, then reapply it — otherwise a rotation would shear
+    // non-square scenes. At angle=0 this reduces exactly to `he`.
+    // NDC is Y-up while `composite.angle` is derived assuming Y-down pixel
+    // space (matching the CPU compositor's convention), so negate sin here.
+    let c = cos(composite.angle);
+    let s = -sin(composite.angle);
+    let offset = vec2(
+        c * he.x - s * he.y / composite.aspect,
+        s * he.x * composite.aspect + c * he.y,
+    );
+    var out: VsOutput;
+    out.position = vec4(composite.rect.xy + offset, 0.0, 1.0);
+    // NDC y=+1 (top) → v=0.
+    out.uv = vec2(corner.x * 0.5 + 0.5, 0.5 - corner.y * 0.5);
+    return out;
+}
 
 @fragment
 fn fs_composite(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let s = textureSample(src_tex, src_sampler, uv);
+    let s = textureSample(src_tex, src_sampler, uv - composite.uv_offset);
     return vec4(s.rgb * composite.color, s.a * composite.opacity);
+}
+
+// ── Photoshop-style colorBlendMode compositing ───────────────────────────────
+// Mirrors WE_COMMON_BLENDING_H / ApplyBlending in shaders/transpiler.rs and
+// engine/blend.rs (the CPU compositor's copy of the same table). Reads the
+// destination (already-composited scene) via `dest_copy_tex` since wgpu can't
+// read+write the same attachment in one pass.
+
+fn rgb_to_hsl(c: vec3<f32>) -> vec3<f32> {
+    let fmin = min(min(c.r, c.g), c.b);
+    let fmax = max(max(c.r, c.g), c.b);
+    let delta = fmax - fmin;
+    let l = (fmax + fmin) / 2.0;
+    if (delta == 0.0) {
+        return vec3(0.0, 0.0, l);
+    }
+    var s: f32;
+    if (l < 0.5) {
+        s = delta / (fmax + fmin);
+    } else {
+        s = delta / (2.0 - fmax - fmin);
+    }
+    let d_r = (((fmax - c.r) / 6.0) + (delta / 2.0)) / delta;
+    let d_g = (((fmax - c.g) / 6.0) + (delta / 2.0)) / delta;
+    let d_b = (((fmax - c.b) / 6.0) + (delta / 2.0)) / delta;
+    var h: f32;
+    if (c.r == fmax) {
+        h = d_b - d_g;
+    } else if (c.g == fmax) {
+        h = (1.0 / 3.0) + d_r - d_b;
+    } else {
+        h = (2.0 / 3.0) + d_g - d_r;
+    }
+    if (h < 0.0) {
+        h = h + 1.0;
+    } else if (h > 1.0) {
+        h = h - 1.0;
+    }
+    return vec3(h, s, l);
+}
+
+fn hue_to_rgb(f1: f32, f2: f32, hue_in: f32) -> f32 {
+    var hue = hue_in;
+    if (hue < 0.0) {
+        hue = hue + 1.0;
+    } else if (hue > 1.0) {
+        hue = hue - 1.0;
+    }
+    if (6.0 * hue < 1.0) {
+        return f1 + (f2 - f1) * 6.0 * hue;
+    }
+    if (2.0 * hue < 1.0) {
+        return f2;
+    }
+    if (3.0 * hue < 2.0) {
+        return f1 + (f2 - f1) * ((2.0 / 3.0) - hue) * 6.0;
+    }
+    return f1;
+}
+
+fn hsl_to_rgb(hsl: vec3<f32>) -> vec3<f32> {
+    if (hsl.y == 0.0) {
+        return vec3(hsl.z);
+    }
+    var f2: f32;
+    if (hsl.z < 0.5) {
+        f2 = hsl.z * (1.0 + hsl.y);
+    } else {
+        f2 = (hsl.z + hsl.y) - (hsl.y * hsl.z);
+    }
+    let f1 = 2.0 * hsl.z - f2;
+    return vec3(
+        hue_to_rgb(f1, f2, hsl.x + 1.0 / 3.0),
+        hue_to_rgb(f1, f2, hsl.x),
+        hue_to_rgb(f1, f2, hsl.x - 1.0 / 3.0),
+    );
+}
+
+fn screen_f(base: f32, blend: f32) -> f32 { return 1.0 - ((1.0 - base) * (1.0 - blend)); }
+fn overlay_f(base: f32, blend: f32) -> f32 {
+    if (base < 0.5) { return 2.0 * base * blend; }
+    return 1.0 - 2.0 * (1.0 - base) * (1.0 - blend);
+}
+fn soft_light_f(base: f32, blend: f32) -> f32 {
+    if (blend < 0.5) { return 2.0 * base * blend + base * base * (1.0 - 2.0 * blend); }
+    return sqrt(base) * (2.0 * blend - 1.0) + 2.0 * base * (1.0 - blend);
+}
+fn color_dodge_f(base: f32, blend: f32) -> f32 {
+    if (blend == 1.0) { return blend; }
+    return min(base / (1.0 - blend), 1.0);
+}
+fn color_burn_f(base: f32, blend: f32) -> f32 {
+    if (blend == 0.0) { return blend; }
+    return max(1.0 - ((1.0 - base) / blend), 0.0);
+}
+
+fn blend_rgb(mode: i32, base: vec3<f32>, blend: vec3<f32>) -> vec3<f32> {
+    if (mode == 1) { return min(blend, base); }
+    if (mode == 2) { return base * blend; }
+    if (mode == 3) {
+        return vec3(color_burn_f(base.r, blend.r), color_burn_f(base.g, blend.g), color_burn_f(base.b, blend.b));
+    }
+    if (mode == 4) { return max(base + blend - vec3(1.0), vec3(0.0)); }
+    if (mode == 6) { return max(blend, base); }
+    if (mode == 7) {
+        return vec3(screen_f(base.r, blend.r), screen_f(base.g, blend.g), screen_f(base.b, blend.b));
+    }
+    if (mode == 8) {
+        return vec3(color_dodge_f(base.r, blend.r), color_dodge_f(base.g, blend.g), color_dodge_f(base.b, blend.b));
+    }
+    if (mode == 9) { return min(base + blend, vec3(1.0)); }
+    if (mode == 11) {
+        return vec3(overlay_f(base.r, blend.r), overlay_f(base.g, blend.g), overlay_f(base.b, blend.b));
+    }
+    if (mode == 12) {
+        return vec3(soft_light_f(base.r, blend.r), soft_light_f(base.g, blend.g), soft_light_f(base.b, blend.b));
+    }
+    if (mode == 18) { return abs(base - blend); }
+    if (mode == 26) {
+        let b = rgb_to_hsl(base);
+        return hsl_to_rgb(vec3(rgb_to_hsl(blend).x, b.y, b.z));
+    }
+    if (mode == 27) {
+        let b = rgb_to_hsl(base);
+        return hsl_to_rgb(vec3(b.x, rgb_to_hsl(blend).y, b.z));
+    }
+    if (mode == 28) {
+        let b = rgb_to_hsl(blend);
+        return hsl_to_rgb(vec3(b.x, b.y, rgb_to_hsl(base).z));
+    }
+    if (mode == 29) {
+        let b = rgb_to_hsl(base);
+        return hsl_to_rgb(vec3(b.x, b.y, rgb_to_hsl(blend).z));
+    }
+    return blend;
+}
+
+@fragment
+fn fs_composite_blend(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let s = textureSample(src_tex, src_sampler, uv - composite.uv_offset);
+    let dest = textureSample(dest_copy_tex, src_sampler, uv);
+    let src_rgb = s.rgb * composite.color;
+    let src_a = s.a * composite.opacity;
+    let blended = blend_rgb(composite.mode, dest.rgb, src_rgb);
+    let out_rgb = mix(dest.rgb, blended, src_a);
+    return vec4(out_rgb, dest.a);
+}
+
+// ── Blit (surface presentation / FBO up- and down-sampling) ──────────────────
+
+struct BlitParams {
+    uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
+}
+@group(0) @binding(2) var<uniform> blit: BlitParams;
+
+@fragment
+fn fs_blit(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSample(src_tex, src_sampler, uv * blit.uv_scale + blit.uv_offset);
+}
+
+// ── Bloom (scene-level chain) ─────────────────────────────────────────────────
+// Mirrors the reference's `downsample_quarter_bloom` / `downsample_eighth_blur_v`
+// / `blur_h_bloom` / `combine` shaders exactly (the linux-wallpaperengine port
+// synthesizes bloom from these four real WE utility shaders via a hidden
+// fullscreen effect object — see CScene.cpp/WallpaperApplication.cpp). All
+// texel offsets use the *scene's* texel size (WE's `g_TexelSize` is always
+// scene-relative, never the destination FBO's own size — CPass.cpp).
+
+struct BloomThresholdParams {
+    // Scene texel size (1/sceneWidth, 1/sceneHeight) — the four taps sample
+    // at +-texel like the reference vertex shader's v_TexCoord[0..3].
+    texel: vec2<f32>,
+    threshold: f32,
+    strength: f32,
+}
+@group(1) @binding(0) var<uniform> bloom_threshold: BloomThresholdParams;
+
+@fragment
+fn fs_bloom_threshold(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let t = bloom_threshold.texel;
+    var albedo = textureSample(src_tex, src_sampler, uv - t).rgb
+        + textureSample(src_tex, src_sampler, uv + t).rgb
+        + textureSample(src_tex, src_sampler, uv + vec2(-t.x, t.y)).rgb
+        + textureSample(src_tex, src_sampler, uv + vec2(t.x, -t.y)).rgb;
+    albedo = albedo * 0.25;
+
+    let scale = max(max(albedo.x, albedo.y), albedo.z);
+    albedo = albedo * saturate(scale - bloom_threshold.threshold);
+
+    // http://stackoverflow.com/a/34183839 (saturation boost, sat=1.0)
+    let grayscale = dot(vec3(0.2989, 0.5870, 0.1140), albedo);
+    albedo = -grayscale + albedo * 2.0;
+
+    return vec4(max(vec3(0.0), albedo * bloom_threshold.strength), 1.0);
+}
+
+struct BlurParams {
+    // Blur-direction step: scene texel size * 8 along x or y (WE's
+    // `localTexel = g_TexelSize.{x,y} * 8.0`), zero in the other axis.
+    dir_texel: vec2<f32>,
+    _p1: f32, _p2: f32,
+}
+@group(1) @binding(0) var<uniform> blur: BlurParams;
+
+@fragment
+fn fs_blur9(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    // 13-tap kernel, weights and offsets verbatim from
+    // downsample_eighth_blur_v.frag / blur_h_bloom.frag.
+    let weights = array<f32, 13>(
+        0.006299, 0.017298, 0.039533, 0.075189, 0.119007, 0.156756, 0.171834,
+        0.156756, 0.119007, 0.075189, 0.039533, 0.017298, 0.006299,
+    );
+    var acc = vec3(0.0);
+    for (var i = 0; i < 13; i = i + 1) {
+        let o = blur.dir_texel * f32(i - 6);
+        acc = acc + textureSample(src_tex, src_sampler, uv + o).rgb * weights[i];
+    }
+    return vec4(acc, 1.0);
+}
+
+@fragment
+fn fs_bloom_combine(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    // dest_copy_tex (binding 3, "extra slot 0") carries the pre-bloom scene copy.
+    let scene = textureSample(dest_copy_tex, src_sampler, uv).rgb;
+    let bloom = textureSample(src_tex, src_sampler, uv).rgb;
+    return vec4(scene + bloom, 1.0);
 }
 
 // ── Pulse ────────────────────────────────────────────────────────────────────

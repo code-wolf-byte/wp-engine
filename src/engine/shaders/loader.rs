@@ -1,3 +1,4 @@
+use super::resolver::AssetResolver;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -13,58 +14,52 @@ pub fn find_we_assets_dir() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-pub fn load_glsl_shader(assets_dir: &Path, shader_name: &str) -> Result<(String, String)> {
-    load_glsl_shader_for_effect(assets_dir, shader_name, None)
-}
-
-/// Load a GLSL shader, checking the effect bundle dir first if effect_name is given.
-/// WE bundles effect shaders inside assets/effects/{effect_name}/shaders/.
-pub fn load_glsl_shader_for_effect(
-    assets_dir: &Path,
+/// Load a GLSL shader, checking the effect bundle first
+/// (`{effect_dir}/shaders/`, e.g. `effects/clouds/shaders/`) then the main
+/// `shaders/` directory, via the resolver's wallpaper-first then
+/// global-assets search order.
+pub fn load_glsl_shader_with_resolver(
+    resolver: &AssetResolver,
     shader_name: &str,
-    effect_name: Option<&str>,
+    effect_dir: Option<&str>,
 ) -> Result<(String, String)> {
-    let main_shader_dir = assets_dir.join("shaders");
-
-    if let Some(eff) = effect_name {
-        let eff_shader_dir = assets_dir.join("effects").join(eff).join("shaders");
-        let frag_path = eff_shader_dir.join(format!("{shader_name}.frag"));
-        let vert_path = eff_shader_dir.join(format!("{shader_name}.vert"));
-        if frag_path.exists() && vert_path.exists() {
-            let frag_source = std::fs::read_to_string(&frag_path)
-                .with_context(|| format!("reading {}", frag_path.display()))?;
-            let vert_source = std::fs::read_to_string(&vert_path)
-                .with_context(|| format!("reading {}", vert_path.display()))?;
-            let search_dirs: Vec<&Path> = vec![&eff_shader_dir, &main_shader_dir];
-            let frag_resolved = resolve_includes_multi(&search_dirs, &frag_source)?;
-            let vert_resolved = resolve_includes_multi(&search_dirs, &vert_source)?;
+    if let Some(base) = effect_dir {
+        let eff_dir = format!("{base}/shaders/");
+        let frag_rel = format!("{eff_dir}{shader_name}.frag");
+        let vert_rel = format!("{eff_dir}{shader_name}.vert");
+        if let (Some(frag_source), Some(vert_source)) = (
+            resolver.read_string(&frag_rel),
+            resolver.read_string(&vert_rel),
+        ) {
+            let dirs = [eff_dir.as_str(), "shaders/"];
+            let frag_resolved = resolve_includes(resolver, &dirs, &frag_source, 0)?;
+            let vert_resolved = resolve_includes(resolver, &dirs, &vert_source, 0)?;
             return Ok((frag_resolved, vert_resolved));
         }
     }
 
-    let frag_path = main_shader_dir.join(format!("{shader_name}.frag"));
-    let vert_path = main_shader_dir.join(format!("{shader_name}.vert"));
+    let frag_rel = format!("shaders/{shader_name}.frag");
+    let vert_rel = format!("shaders/{shader_name}.vert");
+    let frag_source = resolver
+        .read_string(&frag_rel)
+        .with_context(|| format!("reading {frag_rel}"))?;
+    let vert_source = resolver
+        .read_string(&vert_rel)
+        .with_context(|| format!("reading {vert_rel}"))?;
 
-    let frag_source = std::fs::read_to_string(&frag_path)
-        .with_context(|| format!("reading {}", frag_path.display()))?;
-    let vert_source = std::fs::read_to_string(&vert_path)
-        .with_context(|| format!("reading {}", vert_path.display()))?;
-
-    let frag_resolved = resolve_includes(&main_shader_dir, &frag_source)?;
-    let vert_resolved = resolve_includes(&main_shader_dir, &vert_source)?;
+    let dirs = ["shaders/"];
+    let frag_resolved = resolve_includes(resolver, &dirs, &frag_source, 0)?;
+    let vert_resolved = resolve_includes(resolver, &dirs, &vert_source, 0)?;
 
     Ok((frag_resolved, vert_resolved))
 }
 
-fn resolve_includes(shader_dir: &Path, source: &str) -> Result<String> {
-    resolve_includes_multi(&[shader_dir], source)
-}
-
-fn resolve_includes_multi(dirs: &[&Path], source: &str) -> Result<String> {
-    resolve_includes_depth(dirs, source, 0)
-}
-
-fn resolve_includes_depth(dirs: &[&Path], source: &str, depth: u32) -> Result<String> {
+fn resolve_includes(
+    resolver: &AssetResolver,
+    dirs: &[&str],
+    source: &str,
+    depth: u32,
+) -> Result<String> {
     if depth > 8 {
         return Ok(source.to_string());
     }
@@ -74,21 +69,17 @@ fn resolve_includes_depth(dirs: &[&Path], source: &str, depth: u32) -> Result<St
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("#include \"") {
             if let Some(include_file) = rest.strip_suffix('"') {
-                let mut found = false;
-                for dir in dirs {
-                    let include_path = dir.join(include_file);
-                    if let Ok(content) = std::fs::read_to_string(&include_path) {
-                        let resolved = resolve_includes_depth(dirs, &content, depth + 1)?;
+                match resolver.read_include(dirs, include_file) {
+                    Some(content) => {
+                        let resolved = resolve_includes(resolver, dirs, &content, depth + 1)?;
                         result.push_str(&resolved);
                         result.push('\n');
-                        found = true;
-                        break;
                     }
-                }
-                if !found {
-                    result.push_str("// [include not found: ");
-                    result.push_str(include_file);
-                    result.push_str("]\n");
+                    None => {
+                        result.push_str("// [include not found: ");
+                        result.push_str(include_file);
+                        result.push_str("]\n");
+                    }
                 }
                 continue;
             }

@@ -1,6 +1,6 @@
 use crate::platform::RenderQuality;
 use crate::platform::{display::detect_platform, WallpaperHandle};
-use crate::render::{FrameSource, RenderSettings, WallpaperContent};
+use crate::render::{RenderSettings, WallpaperContent};
 use crate::workshop::{self, Wallpaper, WallpaperType};
 use egui::{pos2, vec2, Align, Color32, CornerRadius, FontId, Layout, Rect, Sense};
 use std::collections::HashMap;
@@ -239,8 +239,8 @@ impl WpApp {
             if let Some(old) = old_renderer {
                 old.stop();
             }
-            let result = FrameSource::from_content(content)
-                .and_then(|fs| detect_platform().spawn_wallpaper(fs, settings))
+            let result = detect_platform()
+                .spawn_wallpaper(content, settings)
                 .map(|handle| (handle, display_title.clone()))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);

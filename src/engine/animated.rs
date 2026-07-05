@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::assets::AssetStore;
 use super::effect::SceneEffect;
-use super::particle::{ParticleConfig, ParticleSystem};
+use super::particle::{InstanceOverride, ParticleConfig, ParticleSystem};
 use super::render::ResolvedScene;
 use super::scene::SceneObject;
 
@@ -60,7 +60,7 @@ impl SceneAnimState {
                         if !obj.is_visible() {
                             continue;
                         }
-                        load_particles(&assets, obj, width, height, &mut particles);
+                        load_particles(&assets, obj, height, &mut particles);
                         load_effects(obj, &mut effects);
                     }
                 }
@@ -135,7 +135,6 @@ pub fn scene_render_loop(
 fn load_particles(
     assets: &AssetStore,
     obj: &SceneObject,
-    width: u32,
     height: u32,
     particles: &mut Vec<ParticleSystem>,
 ) {
@@ -149,8 +148,23 @@ fn load_particles(
         Err(_) => return,
     };
 
+    // WE origin is the object's center in absolute scene coordinates
+    // (Y-up, (0,0) at bottom-left); convert to top-left pixel coords, matching
+    // render.rs's image-layer positioning.
+    let origin = obj.parsed_origin();
+    let spawn_center = [origin[0] as f32, height as f32 - origin[1] as f32];
+
+    let overrides: Option<InstanceOverride> = obj
+        .instanceoverride
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
     if let Ok(config) = serde_json::from_str::<ParticleConfig>(&data) {
-        particles.push(ParticleSystem::from_config(&config, width, height));
+        particles.push(ParticleSystem::from_config(
+            &config,
+            spawn_center,
+            overrides.as_ref(),
+        ));
     }
 }
 

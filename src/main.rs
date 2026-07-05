@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use wp_engine::render::{self, FrameSource, RenderSettings, WallpaperContent};
+use wp_engine::application::{ApplicationContext, WallpaperApplication};
+use wp_engine::render;
 use wp_engine::workshop::{self, Wallpaper};
 use wp_engine::{engine, platform, ui};
 
@@ -26,9 +26,21 @@ enum Command {
         r#type: Option<String>,
     },
     /// Apply a wallpaper by Steam Workshop ID (CLI, blocks until Ctrl-C)
-    Set { id: String },
+    Set {
+        id: String,
+        /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
+        #[arg(long = "set-property", value_name = "NAME=VALUE")]
+        properties: Vec<String>,
+    },
     /// Apply any image file as wallpaper (CLI, blocks until Ctrl-C)
-    SetFile { path: PathBuf },
+    SetFile {
+        path: PathBuf,
+        /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
+        #[arg(long = "set-property", value_name = "NAME=VALUE")]
+        properties: Vec<String>,
+    },
+    /// List the user-configurable properties of a Workshop item
+    ListProperties { id: String },
     /// Show metadata for a Workshop item (CLI)
     Info { id: String },
     /// List available GPU adapters (PAL probe)
@@ -57,6 +69,9 @@ enum Command {
         /// Exercise the new WGPU scene renderer instead of the CPU fallback
         #[arg(long)]
         gpu: bool,
+        /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
+        #[arg(long = "set-property", value_name = "NAME=VALUE")]
+        properties: Vec<String>,
     },
     /// Preview an animated scene wallpaper in a window (for testing animation)
     PreviewScene {
@@ -86,8 +101,9 @@ fn main() {
         // No subcommand → open GUI
         None => run_ui(),
         Some(Command::List { r#type }) => cmd_list(r#type),
-        Some(Command::Set { id }) => cmd_set(&id),
-        Some(Command::SetFile { path }) => cmd_set_file(&path),
+        Some(Command::Set { id, properties }) => cmd_set(&id, properties),
+        Some(Command::SetFile { path, properties }) => cmd_set_file(&path, properties),
+        Some(Command::ListProperties { id }) => cmd_list_properties(&id),
         Some(Command::Info { id }) => cmd_info(&id),
         Some(Command::Probe) => cmd_probe(),
         Some(Command::PkgInfo { path, dump }) => cmd_pkg_info(&path, dump.as_deref()),
@@ -96,7 +112,8 @@ fn main() {
             id_or_path,
             output,
             gpu,
-        }) => cmd_render_scene(&id_or_path, &output, gpu),
+            properties,
+        }) => cmd_render_scene(&id_or_path, &output, gpu, properties),
         Some(Command::PreviewScene {
             id_or_path,
             width,
@@ -201,21 +218,42 @@ fn cmd_info(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_set(id: &str) -> Result<()> {
+fn cmd_set(id: &str, properties: Vec<String>) -> Result<()> {
     let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
 
-    // Type support is checked inside from_wallpaper; unsupported types return Err.
-    let content = WallpaperContent::from_wallpaper(&w)?;
-
-    let path = w.wallpaper_file().unwrap_or_default();
-    println!("Loading: {}", path.display());
-
-    let frame_source = FrameSource::from_content(content)?;
+    println!("Loading: {}", w.path.display());
     println!("Applying \"{}\" to all outputs...", w.title());
-    let settings = Arc::new(Mutex::new(RenderSettings::default()));
-    let handle = platform::detect_platform().spawn_wallpaper(frame_source, settings)?;
+
+    let mut context = ApplicationContext::new(w.path.clone());
+    context.add_property_args(&properties);
+    let mut app = WallpaperApplication::new(context);
+    app.setup()?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
-    handle.wait();
+    app.show()
+}
+
+fn cmd_list_properties(id: &str) -> Result<()> {
+    let w = workshop::find_by_id(id).ok_or_else(|| anyhow!("workshop item '{id}' not found"))?;
+    let props = engine::properties::list_properties(&w.path)?;
+    if props.is_empty() {
+        println!(
+            "\"{}\" declares no user-configurable properties.",
+            w.title()
+        );
+        return Ok(());
+    }
+    println!("{:<28} {:<8} {:<24} {}", "Name", "Type", "Default", "Label");
+    println!("{}", "─".repeat(80));
+    for p in props {
+        println!(
+            "{:<28} {:<8} {:<24} {}",
+            p.name,
+            p.kind,
+            p.value.to_string(),
+            p.text
+        );
+    }
+    println!("\nOverride with: wp-engine set {id} --set-property NAME=VALUE");
     Ok(())
 }
 
@@ -252,19 +290,19 @@ fn cmd_probe() -> Result<()> {
     Ok(())
 }
 
-fn cmd_set_file(path: &PathBuf) -> Result<()> {
+fn cmd_set_file(path: &PathBuf, properties: Vec<String>) -> Result<()> {
     if !path.exists() {
         return Err(anyhow!("file not found: {}", path.display()));
     }
     println!("Loading: {}", path.display());
-    let content = WallpaperContent::from_path(path)?;
     println!("Applying to all outputs…");
-    let frame_source = FrameSource::from_content(content)?;
-    let settings = Arc::new(Mutex::new(RenderSettings::default()));
-    let handle = platform::detect_platform().spawn_wallpaper(frame_source, settings)?;
+
+    let mut context = ApplicationContext::new(path.clone());
+    context.add_property_args(&properties);
+    let mut app = WallpaperApplication::new(context);
+    app.setup()?;
     println!("Wallpaper active. Press Ctrl-C to exit.");
-    handle.wait();
-    Ok(())
+    app.show()
 }
 
 fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Result<()> {
@@ -318,7 +356,7 @@ fn cmd_pkg_info(path: &std::path::Path, dump: Option<&std::path::Path>) -> Resul
 fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Result<()> {
     let data = std::fs::read(path)?;
     let tex = engine::TexFile::parse(&data)?;
-    println!("Format:       {:?}", tex.format);
+    println!("Format:       {:?}", tex.format());
     println!("Image size:   {}x{}", tex.image_width, tex.image_height);
     println!("Texture size: {}x{}", tex.texture_width, tex.texture_height);
     if let Some(out) = save {
@@ -329,7 +367,18 @@ fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Resul
     Ok(())
 }
 
-fn cmd_render_scene(id_or_path: &str, output: &std::path::Path, gpu: bool) -> Result<()> {
+fn cmd_render_scene(
+    id_or_path: &str,
+    output: &std::path::Path,
+    gpu: bool,
+    properties: Vec<String>,
+) -> Result<()> {
+    let overrides = properties
+        .iter()
+        .map(|p| engine::properties::parse_property_arg(p))
+        .collect();
+    engine::properties::set_global_overrides(overrides);
+
     let dir = std::path::PathBuf::from(id_or_path);
     let dir = if dir.exists() {
         dir
@@ -373,7 +422,7 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path, gpu: bool) -> Re
     );
     for layer in scene.layers.iter().take(3) {
         println!(
-            "Layer:       {} origin={:.1},{:.1},{:.1} size={:.1},{:.1},{:.1} parallax={:.3}",
+            "Layer:       {} origin={:.1},{:.1},{:.1} size={:.1},{:.1},{:.1} parallax={:.3},{:.3}",
             if layer.name.is_empty() {
                 "<unnamed>"
             } else {
@@ -385,7 +434,8 @@ fn cmd_render_scene(id_or_path: &str, output: &std::path::Path, gpu: bool) -> Re
             layer.size[0],
             layer.size[1],
             layer.size[2],
-            layer.parallax_depth,
+            layer.parallax_depth[0],
+            layer.parallax_depth[1],
         );
     }
     let img = scene.render();
@@ -412,7 +462,7 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     );
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             eprintln!("gpu scene error: {e}");
         }
@@ -433,6 +483,12 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
             }
         }
     }
+
+    // Drop the receiver so the render loop's next `send` fails and it returns,
+    // then join it: letting the process exit while it's still mid-frame (still
+    // holding the wgpu device/queue) can crash the driver on shutdown.
+    drop(rx);
+    let _ = handle.join();
 
     if collected.len() < 2 {
         anyhow::bail!("not enough frames collected (got {})", collected.len());
@@ -507,7 +563,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     println!("Loading scene from {}...", dir.display());
     let (tx, rx) = sync_channel::<Arc<image::RgbaImage>>(2);
     let render_dir = dir.clone();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
             eprintln!("gpu scene error: {e}");
         }
@@ -546,6 +602,11 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
             .unwrap_or(());
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
+
+    // See cmd_test_scene: join the render thread before exiting so it isn't
+    // killed mid-frame while still holding the wgpu device/queue.
+    drop(rx);
+    let _ = handle.join();
 
     Ok(())
 }

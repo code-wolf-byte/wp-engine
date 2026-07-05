@@ -1,331 +1,467 @@
+//! Wallpaper Engine `.tex` container parser.
+//!
+//! Mirrors `WallpaperEngine::Data::Parsers::TextureParser` /
+//! `Data::Assets::Texture` in the C++ reference: `TEXV0005` header,
+//! `TEXI0001` metadata, a `TEXB000{1..4}` mipmap container (one mipmap chain
+//! per image), and an optional `TEXS000{1..3}` animation/spritesheet table
+//! gated by the `IsGif` flag.
+
 use anyhow::{bail, Context, Result};
 use image::RgbaImage;
 use std::io::{Cursor, Read};
 
+/// Raw pixel formats a mipmap's bytes can be in when there's no FreeImage
+/// payload (`freeImageFormat == FIF_UNKNOWN`). IDs match `TextureFormat` in
+/// the reference's `Data/Assets/Texture.h`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TexFormat {
-    Rgba8,
-    R8,
-    Rg88,
+    Rgba8, // ARGB8888, stored BGRA in memory
     Rgb888,
     Rgb565,
-    Dxt1,
-    Dxt3,
     Dxt5,
-    Bc4,
+    Dxt3,
+    Dxt1,
+    Rg88,
+    R8,
+    Rg1616f,
+    R16f,
     Bc7,
+    RgBa1010102,
+    Rgba16161616f,
+    Rgb161616f,
 }
 
 impl TexFormat {
     fn from_u32(v: u32) -> Result<Self> {
         match v {
-            0 => Ok(Self::Rgba8),  // ARGB8888 (stored BGRA — swap in to_rgba)
-            1 => Ok(Self::Rgb888), // RGB888
-            2 => Ok(Self::Rgb565), // RGB565
-            4 => Ok(Self::Dxt5),   // DXT5
-            6 => Ok(Self::Dxt3),   // DXT3
-            7 => Ok(Self::Dxt1),   // DXT1
-            8 => Ok(Self::Rg88),   // RG88
-            9 => Ok(Self::R8),     // R8
-            12 => Ok(Self::Bc7),   // BC7
+            0 => Ok(Self::Rgba8),
+            1 => Ok(Self::Rgb888),
+            2 => Ok(Self::Rgb565),
+            4 => Ok(Self::Dxt5),
+            6 => Ok(Self::Dxt3),
+            7 => Ok(Self::Dxt1),
+            8 => Ok(Self::Rg88),
+            9 => Ok(Self::R8),
+            10 => Ok(Self::Rg1616f),
+            11 => Ok(Self::R16f),
+            12 => Ok(Self::Bc7),
+            13 => Ok(Self::RgBa1010102),
+            14 => Ok(Self::Rgba16161616f),
+            15 => Ok(Self::Rgb161616f),
             other => bail!("unknown .tex format id: {other}"),
         }
     }
 }
 
+/// `FIF` (FreeImage Format) IDs the reference recognizes. When a mipmap's
+/// container declares one of these (anything but `Unknown`), its bytes are
+/// an encoded image blob (PNG/JPEG/...), not raw pixels in `TexFormat`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FreeImageFormat {
+    Unknown,
+    Mp4,
+    Other,
+}
+
+impl FreeImageFormat {
+    fn from_u32(v: u32) -> Self {
+        match v {
+            // FIF_UNKNOWN is -1 (i.e. u32::MAX) in the reference enum.
+            u32::MAX => Self::Unknown,
+            35 => Self::Other, // FIF_WEBP doubles as FIF_MP4 in the reference; container decides below
+            _ => Self::Other,
+        }
+    }
+}
+
+const CONTAINER_TEXB0001: u32 = 1;
+const CONTAINER_TEXB0002: u32 = 2;
+const CONTAINER_TEXB0003: u32 = 3;
+const CONTAINER_TEXB0004: u32 = 4;
+
+const FLAG_NO_INTERPOLATION: u32 = 1;
+const FLAG_CLAMP_UVS: u32 = 2;
+const FLAG_IS_GIF: u32 = 4;
+const FLAG_CLAMP_UVS_BORDER: u32 = 8;
+
 struct Mipmap {
+    width: u32,
+    height: u32,
+    /// Raw pixel bytes (TexFormat) or an encoded image blob (FreeImage).
     data: Vec<u8>,
 }
 
+/// One TEXS-table animation/spritesheet frame: a sub-rect of `images[0]`'s
+/// first mipmap, shown for `frametime` seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct TexFrame {
+    pub frametime: f32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 pub struct TexFile {
-    pub format: TexFormat,
+    format: TexFormat,
+    free_image: FreeImageFormat,
+    flags: u32,
+    /// Real (unpadded) image dimensions.
     pub image_width: u32,
     pub image_height: u32,
+    /// In-memory (power-of-two padded) texture dimensions.
     pub texture_width: u32,
     pub texture_height: u32,
-    mipmaps: Vec<Mipmap>,
+    /// One mipmap chain per image (`imageCount` images; almost always 1).
+    images: Vec<Vec<Mipmap>>,
+    frames: Vec<TexFrame>,
 }
 
 impl TexFile {
     pub fn parse(data: &[u8]) -> Result<Self> {
-        // Check for embedded PNG/JPEG first (fastest path).
-        let embedded_offset =
-            find_marker(data, b"\x89PNG").or_else(|| find_marker(data, b"\xFF\xD8\xFF"));
-        if let Some(img_offset) = embedded_offset {
-            if img_offset > 20 {
-                let img_data = &data[img_offset..];
-                if let Ok(img) = image::load_from_memory(img_data) {
-                    let img = img.into_rgba8();
+        match Self::parse_we(data) {
+            Ok(tex) => Ok(tex),
+            Err(e) => {
+                // Not a real .tex container (e.g. a test fixture that's a
+                // bare encoded image) — fall back to sniffing it directly.
+                if let Ok(img) = image::load_from_memory(data) {
+                    let (w, h) = (img.width(), img.height());
                     return Ok(Self {
+                        // free_image != Unknown routes decode_mipmap through
+                        // image::load_from_memory instead of the raw BGRA
+                        // unswizzle path, so the original encoded bytes (not
+                        // already-decoded RGBA) must be stored here.
                         format: TexFormat::Rgba8,
-                        image_width: img.width(),
-                        image_height: img.height(),
-                        texture_width: img.width(),
-                        texture_height: img.height(),
-                        mipmaps: vec![Mipmap {
-                            data: img.into_raw(),
-                        }],
+                        free_image: FreeImageFormat::Other,
+                        flags: 0,
+                        image_width: w,
+                        image_height: h,
+                        texture_width: w,
+                        texture_height: h,
+                        images: vec![vec![Mipmap {
+                            width: w,
+                            height: h,
+                            data: data.to_vec(),
+                        }]],
+                        frames: Vec::new(),
                     });
                 }
+                Err(e)
             }
         }
+    }
 
+    fn parse_we(data: &[u8]) -> Result<Self> {
         let mut cur = Cursor::new(data);
 
-        let mut magic = [0u8; 4];
-        cur.read_exact(&mut magic).context("reading TEXV magic")?;
-        if &magic != b"TEXV" {
-            bail!("not a .tex file: expected TEXV, got {:?}", magic);
+        let magic = read_tag(&mut cur)?;
+        if &magic != b"TEXV0005\0" {
+            bail!("not a .tex file: expected TEXV0005, got {:?}", magic);
+        }
+        let sub = read_tag(&mut cur)?;
+        if &sub != b"TEXI0001\0" {
+            bail!(
+                "unexpected .tex sub-container: expected TEXI0001, got {:?}",
+                sub
+            );
         }
 
-        let mut version = [0u8; 4];
-        cur.read_exact(&mut version)
-            .context("reading TEXV version")?;
-        skip_null(&mut cur);
-
-        // Check for TEXI section (V0005 format).
-        let mut next_section = [0u8; 4];
-        cur.read_exact(&mut next_section)
-            .context("reading section")?;
-
-        let texi_meta = if &next_section == b"TEXI" {
-            let mut texi_ver = [0u8; 4];
-            cur.read_exact(&mut texi_ver).ok();
-            skip_null(&mut cur);
-
-            let format_id = read_u32(&mut cur)?;
-            let _flags = read_u32(&mut cur)?;
-            let texture_width = read_u32(&mut cur)?;
-            let texture_height = read_u32(&mut cur)?;
-            let image_width = read_u32(&mut cur)?;
-            let image_height = read_u32(&mut cur)?;
-
-            let texb_pos =
-                find_marker(data, b"TEXB").context("TEXB section not found after TEXI")?;
-            cur.set_position(texb_pos as u64);
-            cur.read_exact(&mut next_section).context("reading TEXB")?;
-
-            Some((
-                format_id,
-                texture_width,
-                texture_height,
-                image_width,
-                image_height,
-            ))
-        } else {
-            None
-        };
-
-        if &next_section != b"TEXB" {
-            bail!("expected TEXB section, got {:?}", next_section);
-        }
-
-        let mut container_ver = [0u8; 4];
-        cur.read_exact(&mut container_ver)
-            .context("reading TEXB version")?;
-        skip_null(&mut cur);
-
-        if let Some((format_id, texture_width, texture_height, image_width, image_height)) =
-            texi_meta
-        {
-            let mipmap_count = match &container_ver {
-                b"0001" | b"0002" => {
-                    let _image_count = read_u32(&mut cur)?;
-                    let mipmap_count = read_u32(&mut cur)?;
-                    let _tw = read_u32(&mut cur)?;
-                    let _th = read_u32(&mut cur)?;
-                    let _unk = read_u32(&mut cur)?;
-                    mipmap_count
-                }
-                b"0003" => {
-                    let _image_count = read_u32(&mut cur)?;
-                    let _flags = read_u32(&mut cur)?;
-                    let mipmap_count = read_u32(&mut cur)?;
-                    let _tw = read_u32(&mut cur)?;
-                    let _th = read_u32(&mut cur)?;
-                    let _unk = read_u32(&mut cur)?;
-                    mipmap_count
-                }
-                b"0004" => {
-                    let _free_image_format = read_u32(&mut cur)?;
-                    let _is_video_mp4 = read_u32(&mut cur)?;
-                    let _image_count = read_u32(&mut cur)?;
-                    let _flags = read_u32(&mut cur)?;
-                    let mipmap_count = read_u32(&mut cur)?;
-                    let _tw = read_u32(&mut cur)?;
-                    let _th = read_u32(&mut cur)?;
-                    let _unk = read_u32(&mut cur)?;
-                    mipmap_count
-                }
-                _ => {
-                    let _image_count = read_u32(&mut cur)?;
-                    let _flags = read_u32(&mut cur)?;
-                    let _unk0 = read_u32(&mut cur)?;
-                    let mipmap_count = read_u32(&mut cur)?;
-                    let _tw = read_u32(&mut cur)?;
-                    let _th = read_u32(&mut cur)?;
-                    let _unk1 = read_u32(&mut cur)?;
-                    mipmap_count
-                }
-            };
-
-            let format = TexFormat::from_u32(format_id)?;
-            let mipmaps = read_mipmaps_v5(&mut cur, mipmap_count)?;
-
-            return Ok(Self {
-                format,
-                image_width,
-                image_height,
-                texture_width,
-                texture_height,
-                mipmaps,
-            });
-        }
-
-        // V0007/V0008: standard TEXB layout
         let format_id = read_u32(&mut cur)?;
-        let _flags = read_u32(&mut cur)?;
+        let flags = read_u32(&mut cur)?;
         let texture_width = read_u32(&mut cur)?;
         let texture_height = read_u32(&mut cur)?;
-        let _unknown1 = read_u32(&mut cur)?;
         let image_width = read_u32(&mut cur)?;
         let image_height = read_u32(&mut cur)?;
-        let _unknown2 = read_u32(&mut cur)?;
+        let _ignored = read_u32(&mut cur)?;
 
-        let format = TexFormat::from_u32(format_id)?;
-        let mipmap_count = read_u32(&mut cur)?;
-        let mipmaps = read_mipmaps(&mut cur, mipmap_count)?;
+        let container_magic = read_tag(&mut cur)?;
+        let image_count = read_u32(&mut cur)?;
+
+        let mut free_image = FreeImageFormat::Unknown;
+        let mut is_video = false;
+        let mut container_version = match &container_magic {
+            b"TEXB0001\0" => CONTAINER_TEXB0001,
+            b"TEXB0002\0" => CONTAINER_TEXB0002,
+            b"TEXB0003\0" => CONTAINER_TEXB0003,
+            b"TEXB0004\0" => CONTAINER_TEXB0004,
+            other => bail!("unknown .tex container: {:?}", other),
+        };
+
+        if container_version == CONTAINER_TEXB0004 {
+            let fif_id = read_u32(&mut cur)?;
+            free_image = FreeImageFormat::from_u32(fif_id);
+            is_video = read_u32(&mut cur)? == 1;
+            if free_image == FreeImageFormat::Unknown && is_video {
+                free_image = FreeImageFormat::Mp4;
+            }
+            // The reference downgrades to the TEXB0003 mipmap layout unless
+            // this is actually an MP4 payload.
+            if free_image != FreeImageFormat::Mp4 {
+                container_version = CONTAINER_TEXB0003;
+            }
+        } else if container_version == CONTAINER_TEXB0003 {
+            let fif_id = read_u32(&mut cur)?;
+            free_image = FreeImageFormat::from_u32(fif_id);
+        }
+
+        if is_video || (flags & 32) != 0 {
+            bail!("embedded video texture (not a static image)");
+        }
+
+        let mut images = Vec::with_capacity(image_count as usize);
+        for _ in 0..image_count {
+            let mipmap_count = read_u32(&mut cur)?;
+            let mut mipmaps = Vec::with_capacity(mipmap_count as usize);
+            for _ in 0..mipmap_count {
+                mipmaps.push(read_mipmap(&mut cur, container_version)?);
+            }
+            images.push(mipmaps);
+        }
+
+        let mut frames = Vec::new();
+        if flags & FLAG_IS_GIF != 0 {
+            frames = read_frames(&mut cur)?;
+        }
+
+        // The raw pixel format only matters when there's no FreeImage payload
+        // to decode instead; an unrecognized id is otherwise harmless.
+        let format = if free_image == FreeImageFormat::Unknown {
+            TexFormat::from_u32(format_id)?
+        } else {
+            TexFormat::from_u32(format_id).unwrap_or(TexFormat::Rgba8)
+        };
 
         Ok(Self {
             format,
+            free_image,
+            flags,
             image_width,
             image_height,
             texture_width,
             texture_height,
-            mipmaps,
+            images,
+            frames,
         })
     }
 
+    fn decode_mipmap(&self, mip: &Mipmap) -> Result<RgbaImage> {
+        if self.free_image != FreeImageFormat::Unknown {
+            let img = image::load_from_memory(&mip.data)
+                .context("decoding FreeImage-format .tex payload")?;
+            return Ok(img.into_rgba8());
+        }
+        let rgba = decode_raw(self.format, &mip.data, mip.width, mip.height);
+        RgbaImage::from_raw(mip.width, mip.height, rgba)
+            .context("failed to create RgbaImage from decoded texture data")
+    }
+
+    /// Decode image 0's first (highest-res) mipmap, cropped to the real
+    /// (unpadded) image dimensions.
     pub fn to_rgba(&self) -> Result<RgbaImage> {
-        let mip = self.mipmaps.first().context("no mipmaps in .tex file")?;
+        let mip = self
+            .images
+            .first()
+            .and_then(|mips| mips.first())
+            .context("no mipmaps in .tex file")?;
+        let img = self.decode_mipmap(mip)?;
 
-        let rgba = match self.format {
-            // WE stores ARGB8888 as BGRA in memory; swap R and B to produce RGBA.
-            TexFormat::Rgba8 => mip
-                .data
-                .chunks_exact(4)
-                .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
-                .collect(),
-            TexFormat::R8 => mip.data.iter().flat_map(|&r| [r, r, r, 255]).collect(),
-            TexFormat::Rg88 => mip
-                .data
-                .chunks(2)
-                .flat_map(|rg| {
-                    let r = rg.first().copied().unwrap_or(0);
-                    let g = rg.get(1).copied().unwrap_or(0);
-                    [r, g, 0, 255]
-                })
-                .collect(),
-            TexFormat::Rgb888 => mip
-                .data
-                .chunks(3)
-                .flat_map(|rgb| {
-                    let r = rgb.first().copied().unwrap_or(0);
-                    let g = rgb.get(1).copied().unwrap_or(0);
-                    let b = rgb.get(2).copied().unwrap_or(0);
-                    [r, g, b, 255]
-                })
-                .collect(),
-            TexFormat::Rgb565 => mip
-                .data
-                .chunks_exact(2)
-                .flat_map(|b| rgb565_to_rgba(u16::from_le_bytes([b[0], b[1]])))
-                .collect(),
-            TexFormat::Dxt1 => decode_dxt1(&mip.data, self.texture_width, self.texture_height),
-            TexFormat::Dxt3 => decode_dxt3(&mip.data, self.texture_width, self.texture_height),
-            TexFormat::Dxt5 => decode_dxt5(&mip.data, self.texture_width, self.texture_height),
-            TexFormat::Bc4 => decode_bc4(&mip.data, self.texture_width, self.texture_height),
-            TexFormat::Bc7 => decode_bc7(&mip.data, self.texture_width, self.texture_height),
-        };
-
-        let img = RgbaImage::from_raw(self.texture_width, self.texture_height, rgba)
-            .context("failed to create RgbaImage from decoded texture data")?;
-
-        if self.image_width != self.texture_width || self.image_height != self.texture_height {
-            Ok(
-                image::imageops::crop_imm(&img, 0, 0, self.image_width, self.image_height)
-                    .to_image(),
-            )
+        if self.image_width != img.width() || self.image_height != img.height() {
+            if self.image_width <= img.width() && self.image_height <= img.height() {
+                Ok(
+                    image::imageops::crop_imm(&img, 0, 0, self.image_width, self.image_height)
+                        .to_image(),
+                )
+            } else {
+                Ok(img)
+            }
         } else {
             Ok(img)
         }
     }
 
-    /// Decode every mipmap as a separate RGBA image (animation frame).
-    /// WE stores sprite animation frames as sequential mipmaps at the same resolution.
-    /// Falls back to a single frame (same as `to_rgba`) for non-animated textures.
+    /// True if this texture carries a TEXS spritesheet/animation table
+    /// (the reference's `Texture::isAnimated()`, gated by the `IsGif` flag).
+    pub fn is_animated(&self) -> bool {
+        self.flags & FLAG_IS_GIF != 0 && !self.frames.is_empty()
+    }
+
+    pub fn format(&self) -> TexFormat {
+        self.format
+    }
+
+    /// Nearest-neighbor sampling instead of the default linear/bilinear.
+    pub fn no_interpolation(&self) -> bool {
+        self.flags & FLAG_NO_INTERPOLATION != 0
+    }
+
+    /// Clamp-to-edge (or clamp-to-border) instead of the default repeat.
+    pub fn clamp_uvs(&self) -> bool {
+        self.flags & (FLAG_CLAMP_UVS | FLAG_CLAMP_UVS_BORDER) != 0
+    }
+
+    pub fn frames(&self) -> &[TexFrame] {
+        &self.frames
+    }
+
+    /// Decode every animation frame as a separate RGBA image:
+    /// - if TEXS spritesheet data is present, crop each frame's sub-rect out
+    ///   of image 0's packed texture;
+    /// - else if the container holds more than one image, decode each image's
+    ///   first mipmap as a frame;
+    /// - else fall back to the single `to_rgba()` frame.
     pub fn to_rgba_frames(&self) -> Result<Vec<RgbaImage>> {
-        let mut frames = Vec::with_capacity(self.mipmaps.len());
-        for mip in &self.mipmaps {
-            let rgba: Vec<u8> = match self.format {
-                TexFormat::Rgba8 => mip
-                    .data
-                    .chunks_exact(4)
-                    .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
-                    .collect(),
-                TexFormat::R8 => mip.data.iter().flat_map(|&r| [r, r, r, 255]).collect(),
-                TexFormat::Rg88 => mip
-                    .data
-                    .chunks(2)
-                    .flat_map(|rg| {
-                        let r = rg.first().copied().unwrap_or(0);
-                        let g = rg.get(1).copied().unwrap_or(0);
-                        [r, g, 0, 255]
-                    })
-                    .collect(),
-                TexFormat::Rgb888 => mip
-                    .data
-                    .chunks(3)
-                    .flat_map(|rgb| {
-                        [
-                            rgb.first().copied().unwrap_or(0),
-                            rgb.get(1).copied().unwrap_or(0),
-                            rgb.get(2).copied().unwrap_or(0),
-                            255,
-                        ]
-                    })
-                    .collect(),
-                TexFormat::Rgb565 => mip
-                    .data
-                    .chunks_exact(2)
-                    .flat_map(|b| rgb565_to_rgba(u16::from_le_bytes([b[0], b[1]])))
-                    .collect(),
-                TexFormat::Dxt1 => decode_dxt1(&mip.data, self.texture_width, self.texture_height),
-                TexFormat::Dxt3 => decode_dxt3(&mip.data, self.texture_width, self.texture_height),
-                TexFormat::Dxt5 => decode_dxt5(&mip.data, self.texture_width, self.texture_height),
-                TexFormat::Bc4 => decode_bc4(&mip.data, self.texture_width, self.texture_height),
-                TexFormat::Bc7 => decode_bc7(&mip.data, self.texture_width, self.texture_height),
-            };
-            if let Some(img) = RgbaImage::from_raw(self.texture_width, self.texture_height, rgba) {
-                let cropped = if self.image_width != self.texture_width
-                    || self.image_height != self.texture_height
-                {
-                    image::imageops::crop_imm(&img, 0, 0, self.image_width, self.image_height)
-                        .to_image()
-                } else {
-                    img
-                };
-                frames.push(cropped);
+        if self.is_animated() {
+            let atlas = self.to_rgba_atlas()?;
+            let mut frames = Vec::with_capacity(self.frames.len());
+            for f in &self.frames {
+                let (x, y, w, h) = (
+                    f.x.round() as u32,
+                    f.y.round() as u32,
+                    f.width.round().max(1.0) as u32,
+                    f.height.round().max(1.0) as u32,
+                );
+                if x + w <= atlas.width() && y + h <= atlas.height() {
+                    frames.push(image::imageops::crop_imm(&atlas, x, y, w, h).to_image());
+                }
+            }
+            if !frames.is_empty() {
+                return Ok(frames);
             }
         }
-        if frames.is_empty() {
-            anyhow::bail!("no decodable frames in .tex file");
+
+        if self.images.len() > 1 {
+            let mut frames = Vec::with_capacity(self.images.len());
+            for mips in &self.images {
+                if let Some(mip) = mips.first() {
+                    frames.push(self.decode_mipmap(mip)?);
+                }
+            }
+            if !frames.is_empty() {
+                return Ok(frames);
+            }
         }
-        Ok(frames)
+
+        Ok(vec![self.to_rgba()?])
+    }
+
+    /// The uncropped, undecoded-atlas version of `to_rgba()` (image 0's
+    /// first mipmap at its native decoded size), used to slice TEXS frames.
+    fn to_rgba_atlas(&self) -> Result<RgbaImage> {
+        let mip = self
+            .images
+            .first()
+            .and_then(|mips| mips.first())
+            .context("no mipmaps in .tex file")?;
+        self.decode_mipmap(mip)
     }
 }
 
-// ── DXT decoders ──────────────────────────────────────────────────────────────
+fn decode_raw(format: TexFormat, data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    match format {
+        // WE stores ARGB8888 as BGRA in memory; swap R and B to produce RGBA.
+        TexFormat::Rgba8 => data
+            .chunks_exact(4)
+            .flat_map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
+            .collect(),
+        TexFormat::R8 => data.iter().flat_map(|&r| [r, r, r, 255]).collect(),
+        TexFormat::Rg88 => data
+            .chunks(2)
+            .flat_map(|rg| {
+                let r = rg.first().copied().unwrap_or(0);
+                let g = rg.get(1).copied().unwrap_or(0);
+                [r, g, 0, 255]
+            })
+            .collect(),
+        TexFormat::Rgb888 => data
+            .chunks(3)
+            .flat_map(|rgb| {
+                let r = rgb.first().copied().unwrap_or(0);
+                let g = rgb.get(1).copied().unwrap_or(0);
+                let b = rgb.get(2).copied().unwrap_or(0);
+                [r, g, b, 255]
+            })
+            .collect(),
+        TexFormat::Rgb565 => data
+            .chunks_exact(2)
+            .flat_map(|b| rgb565_to_rgba(u16::from_le_bytes([b[0], b[1]])))
+            .collect(),
+        TexFormat::R16f => data
+            .chunks_exact(2)
+            .flat_map(|b| {
+                let v = f16_to_u8(u16::from_le_bytes([b[0], b[1]]));
+                [v, v, v, 255]
+            })
+            .collect(),
+        TexFormat::Rg1616f => data
+            .chunks_exact(4)
+            .flat_map(|b| {
+                let r = f16_to_u8(u16::from_le_bytes([b[0], b[1]]));
+                let g = f16_to_u8(u16::from_le_bytes([b[2], b[3]]));
+                [r, g, 0, 255]
+            })
+            .collect(),
+        TexFormat::Rgba16161616f => data
+            .chunks_exact(8)
+            .flat_map(|b| {
+                [
+                    f16_to_u8(u16::from_le_bytes([b[0], b[1]])),
+                    f16_to_u8(u16::from_le_bytes([b[2], b[3]])),
+                    f16_to_u8(u16::from_le_bytes([b[4], b[5]])),
+                    f16_to_u8(u16::from_le_bytes([b[6], b[7]])),
+                ]
+            })
+            .collect(),
+        TexFormat::Rgb161616f => data
+            .chunks_exact(6)
+            .flat_map(|b| {
+                [
+                    f16_to_u8(u16::from_le_bytes([b[0], b[1]])),
+                    f16_to_u8(u16::from_le_bytes([b[2], b[3]])),
+                    f16_to_u8(u16::from_le_bytes([b[4], b[5]])),
+                    255,
+                ]
+            })
+            .collect(),
+        TexFormat::RgBa1010102 => data
+            .chunks_exact(4)
+            .flat_map(|b| {
+                let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                let r = ((v & 0x3FF) * 255 / 1023) as u8;
+                let g = (((v >> 10) & 0x3FF) * 255 / 1023) as u8;
+                let bl = (((v >> 20) & 0x3FF) * 255 / 1023) as u8;
+                let a = (((v >> 30) & 0x3) * 255 / 3) as u8;
+                [r, g, bl, a]
+            })
+            .collect(),
+        TexFormat::Dxt1 => decode_dxt1(data, width, height),
+        TexFormat::Dxt3 => decode_dxt3(data, width, height),
+        TexFormat::Dxt5 => decode_dxt5(data, width, height),
+        TexFormat::Bc7 => decode_bc7(data, width, height),
+    }
+}
+
+/// Approximate f16→u8 conversion for display purposes (HDR/linear values
+/// outside [0,1] are clamped).
+fn f16_to_u8(bits: u16) -> u8 {
+    let sign = (bits >> 15) & 1;
+    let exp = (bits >> 10) & 0x1F;
+    let frac = bits & 0x3FF;
+    let value = if exp == 0 {
+        (frac as f32) / 1024.0 * 2f32.powi(-14)
+    } else if exp == 0x1F {
+        if frac == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp as i32 - 15)
+    };
+    let value = if sign == 1 { -value } else { value };
+    (value.clamp(0.0, 1.0) * 255.0) as u8
+}
+
+// ── DXT/BC decoders ────────────────────────────────────────────────────────────
 
 fn rgb565_to_rgba(c: u16) -> [u8; 4] {
     let r = ((c >> 11) & 0x1F) as u8;
@@ -459,7 +595,7 @@ fn decode_dxt5(data: &[u8], width: u32, height: u32) -> Vec<u8> {
             // Alpha block: 2 reference alphas + 6 bytes of 3-bit indices
             let a0 = block[0];
             let a1 = block[1];
-            let alpha_bits = u64::from(block[2]) as u64
+            let alpha_bits = u64::from(block[2])
                 | (u64::from(block[3]) << 8)
                 | (u64::from(block[4]) << 16)
                 | (u64::from(block[5]) << 24)
@@ -470,21 +606,21 @@ fn decode_dxt5(data: &[u8], width: u32, height: u32) -> Vec<u8> {
                 [
                     a0,
                     a1,
-                    ((6 * a0 as u16 + 1 * a1 as u16) / 7) as u8,
+                    ((6 * a0 as u16 + a1 as u16) / 7) as u8,
                     ((5 * a0 as u16 + 2 * a1 as u16) / 7) as u8,
                     ((4 * a0 as u16 + 3 * a1 as u16) / 7) as u8,
                     ((3 * a0 as u16 + 4 * a1 as u16) / 7) as u8,
                     ((2 * a0 as u16 + 5 * a1 as u16) / 7) as u8,
-                    ((1 * a0 as u16 + 6 * a1 as u16) / 7) as u8,
+                    ((a0 as u16 + 6 * a1 as u16) / 7) as u8,
                 ]
             } else {
                 [
                     a0,
                     a1,
-                    ((4 * a0 as u16 + 1 * a1 as u16) / 5) as u8,
+                    ((4 * a0 as u16 + a1 as u16) / 5) as u8,
                     ((3 * a0 as u16 + 2 * a1 as u16) / 5) as u8,
                     ((2 * a0 as u16 + 3 * a1 as u16) / 5) as u8,
-                    ((1 * a0 as u16 + 4 * a1 as u16) / 5) as u8,
+                    ((a0 as u16 + 4 * a1 as u16) / 5) as u8,
                     0,
                     255,
                 ]
@@ -515,74 +651,6 @@ fn decode_dxt5(data: &[u8], width: u32, height: u32) -> Vec<u8> {
                     out[dst + 1] = palette[cidx][1];
                     out[dst + 2] = palette[cidx][2];
                     out[dst + 3] = alpha_palette[aidx];
-                }
-            }
-        }
-    }
-    out
-}
-
-fn decode_bc4(data: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let bw = ((width + 3) / 4) as usize;
-    let bh = ((height + 3) / 4) as usize;
-    let mut out = vec![0u8; (width * height * 4) as usize];
-    let stride = width as usize * 4;
-
-    for by in 0..bh {
-        for bx in 0..bw {
-            let offset = (by * bw + bx) * 8;
-            if offset + 8 > data.len() {
-                break;
-            }
-            let block = &data[offset..offset + 8];
-
-            let a0 = block[0];
-            let a1 = block[1];
-            let alpha_bits = u64::from(block[2])
-                | (u64::from(block[3]) << 8)
-                | (u64::from(block[4]) << 16)
-                | (u64::from(block[5]) << 24)
-                | (u64::from(block[6]) << 32)
-                | (u64::from(block[7]) << 40);
-
-            let palette = if a0 > a1 {
-                [
-                    a0,
-                    a1,
-                    ((6 * a0 as u16 + 1 * a1 as u16) / 7) as u8,
-                    ((5 * a0 as u16 + 2 * a1 as u16) / 7) as u8,
-                    ((4 * a0 as u16 + 3 * a1 as u16) / 7) as u8,
-                    ((3 * a0 as u16 + 4 * a1 as u16) / 7) as u8,
-                    ((2 * a0 as u16 + 5 * a1 as u16) / 7) as u8,
-                    ((1 * a0 as u16 + 6 * a1 as u16) / 7) as u8,
-                ]
-            } else {
-                [
-                    a0,
-                    a1,
-                    ((4 * a0 as u16 + 1 * a1 as u16) / 5) as u8,
-                    ((3 * a0 as u16 + 2 * a1 as u16) / 5) as u8,
-                    ((2 * a0 as u16 + 3 * a1 as u16) / 5) as u8,
-                    ((1 * a0 as u16 + 4 * a1 as u16) / 5) as u8,
-                    0,
-                    255,
-                ]
-            };
-
-            for py in 0..4u32 {
-                for px in 0..4u32 {
-                    let x = bx as u32 * 4 + px;
-                    let y = by as u32 * 4 + py;
-                    if x >= width || y >= height {
-                        continue;
-                    }
-                    let idx = ((alpha_bits >> ((py * 4 + px) * 3)) & 7) as usize;
-                    let v = palette[idx];
-                    let dst = y as usize * stride + x as usize * 4;
-                    out[dst] = v;
-                    out[dst + 1] = v;
-                    out[dst + 2] = v;
-                    out[dst + 3] = 255;
                 }
             }
         }
@@ -666,63 +734,130 @@ fn decode_bc7_mode6(block: &[u8]) -> [[u8; 4]; 16] {
     result
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Container parsing helpers ─────────────────────────────────────────────────
 
-fn read_mipmaps_v5(cur: &mut Cursor<&[u8]>, count: u32) -> Result<Vec<Mipmap>> {
-    let mut mipmaps = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        if i > 0 {
-            let _width = read_u32(cur)?;
-            let _height = read_u32(cur)?;
-            let _unk = read_u32(cur)?;
-        }
-        let uncompressed_size =
-            read_u32(cur).with_context(|| format!("reading mipmap {i} uncompressed_size"))?;
-        let compressed_size =
-            read_u32(cur).with_context(|| format!("reading mipmap {i} compressed_size"))?;
+fn read_mipmap(cur: &mut Cursor<&[u8]>, container_version: u32) -> Result<Mipmap> {
+    if container_version == CONTAINER_TEXB0004 {
+        let _ignored0 = read_u32(cur)?;
+        let _ignored1 = read_u32(cur)?;
+        let _json = read_cstring(cur)?;
+        let _ignored2 = read_u32(cur)?;
+    }
 
-        if uncompressed_size == 0 {
-            bail!("embedded video texture (not a static image)");
-        }
+    let width = read_u32(cur)?;
+    let height = read_u32(cur)?;
 
+    let mut compression = 0u32;
+    let mut uncompressed_size = 0i64;
+    if matches!(
+        container_version,
+        CONTAINER_TEXB0002 | CONTAINER_TEXB0003 | CONTAINER_TEXB0004
+    ) {
+        compression = read_u32(cur)?;
+        uncompressed_size = read_i32(cur)? as i64;
+    }
+
+    let compressed_size = read_i32(cur)? as i64;
+    if compression == 0 {
+        uncompressed_size = compressed_size;
+    }
+
+    if uncompressed_size < 0 || compressed_size < 0 {
+        bail!("negative .tex mipmap size");
+    }
+
+    let data = if compression == 1 {
         let mut compressed = vec![0u8; compressed_size as usize];
         cur.read_exact(&mut compressed)
-            .with_context(|| format!("reading mipmap {i} data ({compressed_size} bytes)"))?;
+            .context("reading compressed mipmap data")?;
+        lz4_flex::decompress(&compressed, uncompressed_size as usize)
+            .context("LZ4 decompress mipmap")?
+    } else {
+        let mut raw = vec![0u8; uncompressed_size as usize];
+        cur.read_exact(&mut raw).context("reading mipmap data")?;
+        raw
+    };
 
-        let decompressed = if compressed_size == uncompressed_size {
-            compressed
-        } else {
-            lz4_flex::decompress(&compressed, uncompressed_size as usize)
-                .with_context(|| format!("LZ4 decompress mipmap {i}"))?
-        };
-
-        mipmaps.push(Mipmap { data: decompressed });
-    }
-    Ok(mipmaps)
+    Ok(Mipmap {
+        width,
+        height,
+        data,
+    })
 }
 
-fn read_mipmaps(cur: &mut Cursor<&[u8]>, count: u32) -> Result<Vec<Mipmap>> {
-    let mut mipmaps = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let compressed_size =
-            read_u32(cur).with_context(|| format!("reading mipmap {i} compressed_size"))?;
-        let uncompressed_size =
-            read_u32(cur).with_context(|| format!("reading mipmap {i} uncompressed_size"))?;
+fn read_frames(cur: &mut Cursor<&[u8]>) -> Result<Vec<TexFrame>> {
+    let magic = read_tag(cur)?;
+    let version = match &magic {
+        b"TEXS0001\0" => 1,
+        b"TEXS0002\0" => 2,
+        b"TEXS0003\0" => 3,
+        other => bail!("unknown .tex animation section: {:?}", other),
+    };
 
-        let mut compressed = vec![0u8; compressed_size as usize];
-        cur.read_exact(&mut compressed)
-            .with_context(|| format!("reading mipmap {i} data ({compressed_size} bytes)"))?;
-
-        let decompressed = if compressed_size == uncompressed_size {
-            compressed
-        } else {
-            lz4_flex::decompress(&compressed, uncompressed_size as usize)
-                .with_context(|| format!("LZ4 decompress mipmap {i}"))?
-        };
-
-        mipmaps.push(Mipmap { data: decompressed });
+    let frame_count = read_u32(cur)?;
+    if version == 3 {
+        let _gif_width = read_u32(cur)?;
+        let _gif_height = read_u32(cur)?;
     }
-    Ok(mipmaps)
+
+    let mut frames = Vec::with_capacity(frame_count as usize);
+    for _ in 0..frame_count {
+        if version == 1 {
+            let _frame_number = read_u32(cur)?;
+            let frametime = read_f32(cur)?;
+            let x = read_u32(cur)? as f32;
+            let y = read_u32(cur)? as f32;
+            let width = read_u32(cur)? as f32;
+            let _unk0 = read_u32(cur)?;
+            let _unk1 = read_u32(cur)?;
+            let height = read_u32(cur)? as f32;
+            frames.push(TexFrame {
+                frametime,
+                x,
+                y,
+                width,
+                height,
+            });
+        } else {
+            let _frame_number = read_u32(cur)?;
+            let frametime = read_f32(cur)?;
+            let x = read_f32(cur)?;
+            let y = read_f32(cur)?;
+            let width = read_f32(cur)?;
+            let _width2 = read_f32(cur)?;
+            let _height2 = read_f32(cur)?;
+            let height = read_f32(cur)?;
+            frames.push(TexFrame {
+                frametime,
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+    }
+    Ok(frames)
+}
+
+/// Reads a fixed 8-byte tag followed by its NUL terminator (WE always writes
+/// section names as `"TEXV0005"` + `\0`, 9 bytes total).
+fn read_tag(cur: &mut Cursor<&[u8]>) -> Result<[u8; 9]> {
+    let mut buf = [0u8; 9];
+    cur.read_exact(&mut buf).context("reading .tex tag")?;
+    Ok(buf)
+}
+
+fn read_cstring(cur: &mut Cursor<&[u8]>) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        cur.read_exact(&mut byte).context("reading .tex string")?;
+        if byte[0] == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn read_u32(cur: &mut Cursor<&[u8]>) -> Result<u32> {
@@ -732,14 +867,186 @@ fn read_u32(cur: &mut Cursor<&[u8]>) -> Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-fn skip_null(cur: &mut Cursor<&[u8]>) {
-    let pos = cur.position() as usize;
-    let data = cur.get_ref();
-    if pos < data.len() && data[pos] == 0 {
-        cur.set_position((pos + 1) as u64);
-    }
+fn read_i32(cur: &mut Cursor<&[u8]>) -> Result<i32> {
+    let mut buf = [0u8; 4];
+    cur.read_exact(&mut buf)
+        .context("unexpected EOF reading i32")?;
+    Ok(i32::from_le_bytes(buf))
 }
 
-fn find_marker(data: &[u8], marker: &[u8]) -> Option<usize> {
-    data.windows(marker.len()).position(|w| w == marker)
+fn read_f32(cur: &mut Cursor<&[u8]>) -> Result<f32> {
+    let mut buf = [0u8; 4];
+    cur.read_exact(&mut buf)
+        .context("unexpected EOF reading f32")?;
+    Ok(f32::from_le_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tag(out: &mut Vec<u8>, tag: &[u8; 8]) {
+        out.extend_from_slice(tag);
+        out.push(0);
+    }
+
+    /// Build a minimal TEXV0005/TEXI0001/TEXB0001 file: 1 image, 1 mipmap,
+    /// uncompressed R8 pixels (2x2, value 0x80 everywhere).
+    fn minimal_tex() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_tag(&mut out, b"TEXV0005");
+        write_tag(&mut out, b"TEXI0001");
+        out.extend_from_slice(&9u32.to_le_bytes()); // format = R8
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&2u32.to_le_bytes()); // texture_width
+        out.extend_from_slice(&2u32.to_le_bytes()); // texture_height
+        out.extend_from_slice(&2u32.to_le_bytes()); // image_width
+        out.extend_from_slice(&2u32.to_le_bytes()); // image_height
+        out.extend_from_slice(&0u32.to_le_bytes()); // ignored
+
+        write_tag(&mut out, b"TEXB0001");
+        out.extend_from_slice(&1u32.to_le_bytes()); // imageCount = 1
+        out.extend_from_slice(&1u32.to_le_bytes()); // mipmapCount = 1
+
+        // mipmap: width, height, compressedSize, then raw bytes (TEXB0001 has
+        // no compression/uncompressedSize fields).
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        let pixels = [0x80u8; 4];
+        out.extend_from_slice(&(pixels.len() as i32).to_le_bytes());
+        out.extend_from_slice(&pixels);
+        out
+    }
+
+    #[test]
+    fn parses_minimal_texb0001_r8() {
+        let data = minimal_tex();
+        let tex = TexFile::parse(&data).unwrap();
+        assert_eq!(tex.image_width, 2);
+        assert_eq!(tex.image_height, 2);
+        let img = tex.to_rgba().unwrap();
+        assert_eq!(img.width(), 2);
+        assert_eq!(img.height(), 2);
+        assert_eq!(img.get_pixel(0, 0).0, [0x80, 0x80, 0x80, 255]);
+    }
+
+    #[test]
+    fn falls_back_to_plain_image_for_non_tex_data() {
+        // A 1x1 PNG (bare, no TEXV wrapper) should still decode.
+        let png = image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(png)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+            .unwrap();
+        let tex = TexFile::parse(&bytes).unwrap();
+        let img = tex.to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn rejects_wrong_magic_without_valid_fallback_image() {
+        let data = b"not a tex file at all, and not an image either";
+        assert!(TexFile::parse(data).is_err());
+    }
+
+    /// Build a TEXV0005/TEXI0001/TEXB0003 file wrapping a real PNG payload
+    /// (FreeImage format = PNG), exercising the FreeImage decode path.
+    fn free_image_tex() -> Vec<u8> {
+        let png_img = image::RgbaImage::from_pixel(3, 3, image::Rgba([200, 100, 50, 255]));
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(png_img)
+            .write_to(
+                &mut Cursor::new(&mut png_bytes),
+                image::ImageOutputFormat::Png,
+            )
+            .unwrap();
+
+        let mut out = Vec::new();
+        write_tag(&mut out, b"TEXV0005");
+        write_tag(&mut out, b"TEXI0001");
+        out.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // format = UNKNOWN (FreeImage takes over)
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&3u32.to_le_bytes()); // texture_width
+        out.extend_from_slice(&3u32.to_le_bytes()); // texture_height
+        out.extend_from_slice(&3u32.to_le_bytes()); // image_width
+        out.extend_from_slice(&3u32.to_le_bytes()); // image_height
+        out.extend_from_slice(&0u32.to_le_bytes()); // ignored
+
+        write_tag(&mut out, b"TEXB0003");
+        out.extend_from_slice(&1u32.to_le_bytes()); // imageCount = 1
+        out.extend_from_slice(&13u32.to_le_bytes()); // FIF_PNG = 13
+
+        out.extend_from_slice(&1u32.to_le_bytes()); // mipmapCount = 1
+                                                    // mipmap: width, height, compression=0, uncompressedSize, compressedSize, bytes
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // compression = 0 (raw payload bytes)
+        out.extend_from_slice(&(png_bytes.len() as i32).to_le_bytes()); // uncompressedSize (ignored, compression==0)
+        out.extend_from_slice(&(png_bytes.len() as i32).to_le_bytes()); // compressedSize
+        out.extend_from_slice(&png_bytes);
+        out
+    }
+
+    #[test]
+    fn decodes_free_image_payload() {
+        let data = free_image_tex();
+        let tex = TexFile::parse(&data).unwrap();
+        let img = tex.to_rgba().unwrap();
+        assert_eq!(img.width(), 3);
+        assert_eq!(img.height(), 3);
+        assert_eq!(img.get_pixel(1, 1).0, [200, 100, 50, 255]);
+    }
+
+    /// Build a 4x2 R8 spritesheet (two 2x2 frames side by side, left=0x40,
+    /// right=0xC0) with a TEXS0002 animation table and the IsGif flag set.
+    fn spritesheet_tex() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_tag(&mut out, b"TEXV0005");
+        write_tag(&mut out, b"TEXI0001");
+        out.extend_from_slice(&9u32.to_le_bytes()); // format = R8
+        out.extend_from_slice(&FLAG_IS_GIF.to_le_bytes()); // flags
+        out.extend_from_slice(&4u32.to_le_bytes()); // texture_width
+        out.extend_from_slice(&2u32.to_le_bytes()); // texture_height
+        out.extend_from_slice(&4u32.to_le_bytes()); // image_width
+        out.extend_from_slice(&2u32.to_le_bytes()); // image_height
+        out.extend_from_slice(&0u32.to_le_bytes()); // ignored
+
+        write_tag(&mut out, b"TEXB0001");
+        out.extend_from_slice(&1u32.to_le_bytes()); // imageCount = 1
+        out.extend_from_slice(&1u32.to_le_bytes()); // mipmapCount = 1
+
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        let pixels = [0x40, 0x40, 0xC0, 0xC0, 0x40, 0x40, 0xC0, 0xC0];
+        out.extend_from_slice(&(pixels.len() as i32).to_le_bytes());
+        out.extend_from_slice(&pixels);
+
+        write_tag(&mut out, b"TEXS0002");
+        out.extend_from_slice(&2u32.to_le_bytes()); // frameCount = 2
+        for (frame_num, x) in [(0u32, 0.0f32), (1, 2.0)] {
+            out.extend_from_slice(&frame_num.to_le_bytes());
+            out.extend_from_slice(&0.1f32.to_le_bytes()); // frametime
+            out.extend_from_slice(&x.to_le_bytes()); // x
+            out.extend_from_slice(&0.0f32.to_le_bytes()); // y
+            out.extend_from_slice(&2.0f32.to_le_bytes()); // width1
+            out.extend_from_slice(&2.0f32.to_le_bytes()); // width2
+            out.extend_from_slice(&2.0f32.to_le_bytes()); // height2
+            out.extend_from_slice(&2.0f32.to_le_bytes()); // height1
+        }
+        out
+    }
+
+    #[test]
+    fn slices_texs_spritesheet_frames() {
+        let data = spritesheet_tex();
+        let tex = TexFile::parse(&data).unwrap();
+        assert!(tex.is_animated());
+        let frames = tex.to_rgba_frames().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].width(), 2);
+        assert_eq!(frames[0].height(), 2);
+        assert_eq!(frames[0].get_pixel(0, 0).0, [0x40, 0x40, 0x40, 255]);
+        assert_eq!(frames[1].get_pixel(0, 0).0, [0xC0, 0xC0, 0xC0, 255]);
+        assert!((tex.frames()[0].frametime - 0.1).abs() < 1e-6);
+    }
 }

@@ -64,6 +64,11 @@ fn object_to_model(index: usize, obj: &scene::SceneObject) -> ObjectModel {
             .as_ref()
             .map(json_to_animated)
             .unwrap_or(AnimatedValue::from([1.0f32, 1.0, 1.0])),
+        brightness: obj
+            .brightness
+            .as_ref()
+            .map(json_to_animated)
+            .unwrap_or(AnimatedValue::from(1.0f32)),
         visible: obj
             .visible
             .as_ref()
@@ -80,6 +85,7 @@ fn effect_to_model(eff: &scene::Effect) -> EffectModel {
     EffectModel {
         file: eff.file.clone(),
         name: String::new(),
+        visible: eff.is_visible(),
         passes: eff.passes.iter().map(pass_to_model).collect(),
     }
 }
@@ -104,7 +110,7 @@ fn pass_to_model(pass: &scene::Pass) -> PassModel {
     }
 }
 
-fn json_to_animated(v: &serde_json::Value) -> AnimatedValue {
+pub fn json_to_animated(v: &serde_json::Value) -> AnimatedValue {
     match v {
         serde_json::Value::Object(map) => {
             if let (Some(script), Some(inner)) = (map.get("script"), map.get("value")) {

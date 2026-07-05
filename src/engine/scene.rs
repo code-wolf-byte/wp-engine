@@ -39,7 +39,7 @@ pub struct OrthogonalProjection {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct General {
     #[serde(rename = "supportsaudioprocessing")]
     pub supports_audio_processing: Option<bool>,
@@ -48,6 +48,33 @@ pub struct General {
     pub orthogonal_projection: Option<OrthogonalProjection>,
     #[serde(rename = "clearcolor")]
     pub clear_color: Option<serde_json::Value>,
+    // Camera dynamics — all user-settable via project.json properties
+    // (values arrive as {"user":..., "value":...} and are resolved by the
+    // property pass before deserialization).
+    #[serde(rename = "camerafade")]
+    pub camera_fade: Option<serde_json::Value>,
+    #[serde(rename = "cameraparallax")]
+    pub camera_parallax: Option<serde_json::Value>,
+    #[serde(rename = "cameraparallaxamount")]
+    pub camera_parallax_amount: Option<serde_json::Value>,
+    #[serde(rename = "cameraparallaxdelay")]
+    pub camera_parallax_delay: Option<serde_json::Value>,
+    #[serde(rename = "cameraparallaxmouseinfluence")]
+    pub camera_parallax_mouse_influence: Option<serde_json::Value>,
+    #[serde(rename = "camerashake")]
+    pub camera_shake: Option<serde_json::Value>,
+    #[serde(rename = "camerashakeamplitude")]
+    pub camera_shake_amplitude: Option<serde_json::Value>,
+    #[serde(rename = "camerashakeroughness")]
+    pub camera_shake_roughness: Option<serde_json::Value>,
+    #[serde(rename = "camerashakespeed")]
+    pub camera_shake_speed: Option<serde_json::Value>,
+    // Scene-level bloom (user-settable)
+    pub bloom: Option<serde_json::Value>,
+    #[serde(rename = "bloomstrength")]
+    pub bloom_strength: Option<serde_json::Value>,
+    #[serde(rename = "bloomthreshold")]
+    pub bloom_threshold: Option<serde_json::Value>,
 }
 
 /// A single object/layer in the scene.
@@ -65,10 +92,42 @@ pub struct SceneObject {
     pub scale: Option<serde_json::Value>,
     pub alpha: Option<serde_json::Value>,
     pub color: Option<serde_json::Value>,
+    #[serde(default)]
+    pub brightness: Option<serde_json::Value>,
     #[serde(rename = "parallaxDepth")]
     pub parallax_depth: Option<serde_json::Value>,
     pub image: Option<String>,
+    /// "top"/"bottom"/"left"/"right" (any combination, substring-matched like
+    /// the reference) — shifts the object so its origin becomes an edge
+    /// rather than its center. See `CImage.cpp` lines 242-256.
+    #[serde(default)]
+    pub alignment: Option<String>,
     pub particle: Option<serde_json::Value>,
+    /// Per-instance overrides for a referenced particle preset (alpha, color,
+    /// rate, size, speed) — e.g. `{"alpha":0.5,"color":"192 192 192","rate":0.16}`.
+    #[serde(default)]
+    pub instanceoverride: Option<serde_json::Value>,
+    /// Presence of this field marks a text object (CText.cpp); the value is
+    /// the initial/placeholder string (user-settable, possibly scripted —
+    /// we only support the static case, matching the reference's own
+    /// "Phase 1" text scope of no live script updates... actually the
+    /// reference *does* support scripted text; we don't have a JS engine, so
+    /// we render whatever the initial value is and leave it static).
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
+    /// Font reference: a path into the wallpaper's own assets
+    /// (`"fonts/VCR_OSD_MONO.ttf"`) or `"systemfont_*"` for a system font.
+    #[serde(default)]
+    pub font: Option<String>,
+    #[serde(default)]
+    pub pointsize: Option<serde_json::Value>,
+    /// Vertical text alignment: "top"/"center"/"bottom". Horizontal alignment
+    /// reuses `alignment`/`horizontalalign` — same field the reference falls
+    /// back through for text objects (ObjectParser.cpp's `parseText`).
+    #[serde(default)]
+    pub verticalalign: Option<String>,
+    #[serde(default)]
+    pub horizontalalign: Option<String>,
     #[serde(default)]
     pub effects: Vec<Effect>,
     #[serde(rename = "colorBlendMode", default)]
@@ -188,6 +247,12 @@ impl Scene {
         })
     }
 
+    /// Parse from an already-loaded JSON tree (used after user-property
+    /// resolution has rewritten `{"user":...}` values in place).
+    pub fn from_value(value: serde_json::Value) -> Result<Self> {
+        serde_json::from_value(value).context("failed to parse scene.json value tree")
+    }
+
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let text = std::str::from_utf8(data).context("scene.json is not valid UTF-8")?;
         Self::from_json(text)
@@ -297,6 +362,32 @@ fn parse_vec3(s: Option<&str>) -> [f64; 3] {
         parts.get(1).copied().unwrap_or(0.0),
         parts.get(2).copied().unwrap_or(0.0),
     ]
+}
+
+/// Unwrap a possibly `{"value": ...}`-wrapped JSON value to f32.
+pub fn parse_value_f32(v: &serde_json::Value) -> Option<f32> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64().map(|f| f as f32),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        serde_json::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        serde_json::Value::Object(m) => m.get("value").and_then(parse_value_f32),
+        _ => None,
+    }
+}
+
+/// Unwrap a possibly `{"value": ...}`-wrapped JSON value to bool.
+pub fn parse_value_bool(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => Some(n.as_f64().unwrap_or(0.0) != 0.0),
+        serde_json::Value::String(s) => match s.trim() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        serde_json::Value::Object(m) => m.get("value").and_then(parse_value_bool),
+        _ => None,
+    }
 }
 
 pub fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {

@@ -74,6 +74,18 @@ impl UniformDefault {
         }
     }
 
+    pub fn as_vec4(&self) -> [f32; 4] {
+        match self {
+            // Scalar defaults broadcast so vec2/vec3 lookups of a scalar
+            // annotation (e.g. `"default": 1`) fill every component.
+            UniformDefault::Float(f) => [*f; 4],
+            UniformDefault::Vec2([a, b]) => [*a, *b, 0.0, 0.0],
+            UniformDefault::Vec3([a, b, c]) => [*a, *b, *c, 0.0],
+            UniformDefault::Vec4(arr) => *arr,
+            UniformDefault::None => [0.0; 4],
+        }
+    }
+
     pub fn as_vec3(&self) -> [f32; 3] {
         match self {
             UniformDefault::Float(f) => [*f, 0.0, 0.0],

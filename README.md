@@ -177,42 +177,73 @@ cargo run -- render-scene <workshop-id-or-directory> --output scene_output.png
 The CPU path is not feature-equivalent to Wallpaper Engine, but it remains useful
 for smoke tests and as a stable fallback while the `wgpu` renderer grows.
 
-### 11. Live Frame Output
+### 11. Live Output
 
-`src/render/frame.rs` converts wallpaper content into a frame source.
+Scene wallpapers render on the GPU and present **directly into the Wayland
+layer-shell surface** through a `wgpu::Surface` — no CPU readback, no SHM
+copy. `src/platform/wayland` creates the surface from the `wl_surface` raw
+handle; if surface creation fails (or `WP_ENGINE_FORCE_SHM` is set) the
+renderer falls back to RGBA readback + SHM buffers.
 
-- Static images return one shared RGBA frame.
-- Videos decode frames on a background thread with FFmpeg.
-- Scene wallpapers currently use the animated CPU scene loop.
-- The new `wgpu` scene renderer is not yet wired into the live Wayland output.
+Static images and videos flow through `src/render/frame.rs` frame sources and
+the SHM path.
 
-`src/platform` takes the produced frames and presents them on Wayland surfaces.
+### 12. Application Lifecycle
+
+`src/application` owns the run flow (the Rust counterpart of the C++
+`WallpaperApplication`): `ApplicationContext` carries the background path,
+`--set-property` overrides, and shared render settings;
+`WallpaperApplication::setup()/show()` resolve content, spawn the platform
+renderer, and block until SIGINT/SIGTERM. `main.rs` `set`/`set-file`
+delegate to it.
+
+### 13. User Properties
+
+`src/engine/properties.rs` loads `project.json` `general.properties`,
+applies `--set-property NAME=VALUE` overrides, and rewrites `{"user": ...}`
+references inside `scene.json` before parsing — the Rust counterpart of the
+reference `PropertyParser`/`UserSettingParser`. `wp-engine list-properties
+<id>` lists what a wallpaper exposes.
+
+### 14. Camera Dynamics
+
+`src/engine/camera_dynamics.rs` implements scene-level `camerashake`,
+`camerafade`, and `cameraparallax` from the resolved general settings. Shake
+and per-layer parallax feed the composite pass as UV offsets; fade drives
+global scene opacity.
 
 ## Current Port Status
 
 Implemented:
 
 - asset store for loose files and PKG archives
-- tolerant `scene.json` parsing
+- tolerant `scene.json` parsing with user-property resolution
 - model/material/effect parsing
-- backend-neutral scene graph
-- backend-neutral render graph skeleton
-- frame context skeleton
-- Naga shader translation/probing
-- first `wgpu` image-layer render path
-- CPU fallback compositor
+- backend-neutral scene graph + render graph
+- GLSL→WGSL shader translation (shaderc + naga) with std140 uniform packing
+- full effect pass chaining: ping-pong FBOs, named effect FBOs
+  (`target`/`bind`), multi-pass effects, quarter/eighth-res bloom chain
+- per-object quad placement (WE scene coordinates, Y-up)
+- camera shake / fade / parallax
+- direct GPU presentation to Wayland (wgpu surface on layer-shell)
+- application lifecycle (`WallpaperApplication`, `--set-property`, signals)
+- CPU fallback compositor + SHM fallback path
 
 Still pending:
 
-- real model/puppet mesh loading for `wgpu`
-- full material pass execution
-- translated shader binding layout generation
-- render target/FBO allocation and pass chaining
-- effect pass execution
-- final composite pass
-- live Wayland output from GPU textures
-- particle rendering on `wgpu`
-- audio-reactive uniforms
+- real model/puppet mesh loading (bones, skinning)
+- particle simulation + rendering
+- text objects, lighting/shadow atlas
+- mouse input → parallax/pointer uniforms (parallax rests at center for now)
+- audio-reactive uniforms (FFT), sound playback
+- JavaScript scene scripting (current evaluator handles simple `update()` returns)
+- web (CEF) wallpapers, MPRIS media integration, X11 backend
+
+Debugging aids:
+
+- `wp-engine test-scene <id>` — headless animation check, dumps frames to /tmp
+- `WP_ENGINE_SKIP_EFFECTS=name1,name2` — disable specific effects
+- `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
 
 ## Development Checks
 

@@ -88,7 +88,7 @@ return mix(A,B,opacity);}\n\
 pub struct UniformEntry {
     pub key: String,
     pub glsl_type: String,
-    pub default: f32,
+    pub default: [f32; 4],
 }
 
 #[derive(Debug)]
@@ -97,9 +97,151 @@ pub struct TranslatedShader {
     pub vert_wgsl: Option<String>,
     pub uniform_keys: Vec<UniformEntry>,
     pub texture_count: usize,
+    /// Vertex attributes (glsl type, name) in declaration order when the real
+    /// WE vertex shader was translated; empty for the synthetic-VS path.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// Collect non-sampler `uniform` declarations (type, name) in source order.
+fn collect_scalar_uniforms(src: &str) -> Vec<(String, String)> {
+    let mut scalars = Vec::new();
+    for line in src.lines() {
+        let decl = line.trim().split("//").next().unwrap_or("").trim();
+        let tok: Vec<&str> = decl.split_whitespace().collect();
+        if tok.len() >= 3 && tok[0] == "uniform" {
+            let ty = tok[1];
+            if !ty.starts_with("sampler") && !ty.is_empty() {
+                let name = tok[2].trim_end_matches(';');
+                // Array uniforms (audio spectra etc.) can't be packed by the
+                // renderer's flat UBO writer; skip them (they read as zero).
+                if !name.contains('[') {
+                    scalars.push((ty.to_string(), name.to_string()));
+                }
+            }
+        }
+    }
+    scalars
+}
+
+/// Rewrite fixed-size, literally-indexed array varyings/attributes (WE's
+/// downsample/blur/bloom shaders all declare e.g. `varying vec2 v_TexCoord[4]`
+/// and only ever read/write it with literal indices `v_TexCoord[0]` etc.)
+/// into N separate scalar varyings (`v_TexCoord_0`, `v_TexCoord_1`, ...).
+/// naga's GLSL frontend rejects array-typed entry-point I/O outright, so this
+/// is the only way these shaders translate at all. Dynamically-indexed arrays
+/// (a variable or loop-counter index) aren't touched — they still hit the
+/// "array varying not supported" rejection further down the pipeline.
+pub fn unroll_array_varyings(src: &str) -> String {
+    // name -> (qualifier, type, count)
+    let mut arrays: Vec<(String, String, String, usize)> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let (qualifier, rest) = if let Some(r) = t.strip_prefix("varying ") {
+            ("varying", r)
+        } else if let Some(r) = t.strip_prefix("attribute ") {
+            ("attribute", r)
+        } else {
+            continue;
+        };
+        let rest = rest.split("//").next().unwrap_or(rest).trim();
+        let rest = rest.trim_end_matches(';').trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let Some(ty) = parts.next() else { continue };
+        let Some(name_and_dim) = parts.next().map(str::trim) else {
+            continue;
+        };
+        let Some(bracket) = name_and_dim.find('[') else {
+            continue;
+        };
+        let name = &name_and_dim[..bracket];
+        let Some(close) = name_and_dim[bracket + 1..].find(']') else {
+            continue;
+        };
+        let dim_str = &name_and_dim[bracket + 1..bracket + 1 + close];
+        let Ok(n) = dim_str.parse::<usize>() else {
+            continue;
+        };
+        if n == 0 {
+            continue;
+        }
+        arrays.push((name.to_string(), qualifier.to_string(), ty.to_string(), n));
+    }
+
+    if arrays.is_empty() {
+        return src.to_string();
+    }
+
+    // WE shaders often declare the same array varying multiple times at
+    // different sizes under mutually-exclusive `#if COMBO==N` branches (e.g.
+    // godrays_gaussian.frag's `v_TexCoord[13|7|3]` per KERNEL quality level).
+    // Since this pass runs before `#if` resolution, all branches are still
+    // literally present; collapse same-named declarations to one, sized to
+    // the largest variant seen (extra unused varyings are harmless).
+    let mut merged: Vec<(String, String, String, usize)> = Vec::new();
+    for (name, qualifier, ty, n) in arrays {
+        if let Some(existing) = merged.iter_mut().find(|(en, ..)| *en == name) {
+            existing.3 = existing.3.max(n);
+        } else {
+            merged.push((name, qualifier, ty, n));
+        }
+    }
+    let arrays = merged;
+
+    // Re-extract this line's declared array name (if any) the same way as the
+    // collection pass, so the declaration line is matched precisely instead
+    // of by fragile substring checks against the qualifier/type prefix.
+    let declared_name = |t: &str| -> Option<String> {
+        let rest = t
+            .strip_prefix("varying ")
+            .or_else(|| t.strip_prefix("attribute "))?;
+        let rest = rest.split("//").next().unwrap_or(rest).trim();
+        let rest = rest.trim_end_matches(';').trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        parts.next()?;
+        let name_and_dim = parts.next()?.trim();
+        let bracket = name_and_dim.find('[')?;
+        Some(name_and_dim[..bracket].to_string())
+    };
+
+    let mut emitted: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let t = line.trim();
+        if let Some(decl_name) = declared_name(t) {
+            if emitted.contains(&decl_name) {
+                // Same name already declared (a smaller #if/#else variant) —
+                // drop this line rather than redeclare it.
+                continue;
+            }
+            if let Some((name, qualifier, ty, n)) = arrays.iter().find(|(n, ..)| *n == decl_name) {
+                for i in 0..*n {
+                    out.push_str(&format!("{qualifier} {ty} {name}_{i};\n"));
+                }
+                emitted.push(decl_name);
+                continue;
+            }
+        }
+        let mut rewritten = line.to_string();
+        for (name, _, _, n) in &arrays {
+            for i in 0..*n {
+                rewritten = rewritten.replace(&format!("{name}[{i}]"), &format!("{name}_{i}"));
+            }
+        }
+        out.push_str(&rewritten);
+        out.push('\n');
+    }
+    out
 }
 
 pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
+    translate_full(model, None)
+}
+
+/// Translate the fragment shader and, when `vert_glsl` is given, the real WE
+/// vertex shader. Both stages share one UBO layout (union of their scalar
+/// uniforms, fragment's first) at group(1) binding(0), and varying locations
+/// are matched by name so the naga-generated interfaces line up.
+pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<TranslatedShader> {
     // Shaders that use array varyings (e.g. `varying vec2 v[7]`) cannot be translated
     // because naga's SPIR-V reader rejects array-typed entry-point I/O.
     for line in model.frag_glsl.lines() {
@@ -126,86 +268,142 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
         }
     }
 
-    let glsl = preprocess_frag(model);
+    // Union scalar-uniform list: fragment's declarations first (their order
+    // defines the front of the UBO), then vertex-only ones appended. Both
+    // stages emit the SAME block so std140 offsets agree.
+    let frag_scalars = collect_scalar_uniforms(&model.frag_glsl);
+    let vert_only_scalars: Vec<(String, String)> = vert_glsl
+        .map(|v| {
+            collect_scalar_uniforms(v)
+                .into_iter()
+                .filter(|(_, name)| !frag_scalars.iter().any(|(_, f)| f == name))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let glsl = preprocess_frag(model, &vert_only_scalars);
     let spv = glsl_to_spirv(&glsl, naga::ShaderStage::Fragment)
         .context("GLSL→SPIR-V compilation failed")?;
     let wgsl = spirv_to_wgsl(&spv).context("SPIR-V→WGSL conversion failed")?;
 
-    // Build a map from glsl_name → (material_key, default) for annotated uniforms.
-    let annotated: std::collections::HashMap<&str, (&str, f32)> = model
-        .value_uniforms
+    // glsl_name → (material_key, typed default) from `// {"material": ...}`
+    // annotations, collected from BOTH stages (fragment wins on conflicts).
+    let mut annotated: std::collections::HashMap<String, (String, [f32; 4])> =
+        std::collections::HashMap::new();
+    if let Some(v) = vert_glsl {
+        for meta in crate::engine::shaders::uniform_meta::parse_uniform_metadata(v) {
+            annotated.insert(
+                meta.uniform_name.clone(),
+                (
+                    meta.material_key.unwrap_or(meta.uniform_name),
+                    meta.default_value
+                        .as_ref()
+                        .map(json_default_vec4)
+                        .unwrap_or([0.0; 4]),
+                ),
+            );
+        }
+    }
+    for u in &model.value_uniforms {
+        annotated.insert(
+            u.glsl_name.clone(),
+            (u.material_key.clone(), u.default.as_vec4()),
+        );
+    }
+
+    // The UBO contains all union scalars in emission order. We store the GLSL
+    // type so the renderer can compute proper std140 layout/padding.
+    let uniform_keys: Vec<UniformEntry> = frag_scalars
         .iter()
-        .map(|u| {
-            (
-                u.glsl_name.as_str(),
-                (u.material_key.as_str(), u.default.as_float()),
-            )
+        .chain(vert_only_scalars.iter())
+        .map(|(ty, name)| {
+            let (key, default) = annotated
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| (name.clone(), [0.0; 4]));
+            UniformEntry {
+                key,
+                glsl_type: ty.clone(),
+                default,
+            }
         })
         .collect();
 
-    // The UBO contains ALL non-sampler uniforms in source order (same as preprocess_frag).
-    // We store the GLSL type so the renderer can compute proper WGSL struct layout/padding.
-    let mut uniform_keys: Vec<UniformEntry> = Vec::new();
-    for line in model.frag_glsl.lines() {
-        let decl = line.trim().split("//").next().unwrap_or("").trim();
-        let tok: Vec<&str> = decl.split_whitespace().collect();
-        if tok.len() >= 3 && tok[0] == "uniform" {
-            let ty = tok[1];
-            if !ty.starts_with("sampler") && !ty.is_empty() {
-                let name = tok[2].trim_end_matches(';');
-                let (key, default) = annotated
-                    .get(name)
-                    .map(|(k, d)| (k.to_string(), *d))
-                    .unwrap_or_else(|| (name.to_string(), 0.0));
-                uniform_keys.push(UniformEntry {
-                    key,
-                    glsl_type: ty.to_string(),
-                    default,
-                });
+    let inputs = frag_inputs(&model.frag_glsl);
+
+    // Prefer the real WE vertex shader: it computes scrolled/scaled UVs, wave
+    // phases, blur offsets etc. Fall back to a synthetic passthrough VS when
+    // translation fails (the caller falls back again if the pipeline fails).
+    let mut attributes: Vec<(String, String)> = Vec::new();
+    let mut vert_wgsl: Option<String> = None;
+    if let Some(v) = vert_glsl {
+        let union_scalars: Vec<(String, String)> = frag_scalars
+            .iter()
+            .chain(vert_only_scalars.iter())
+            .cloned()
+            .collect();
+        match preprocess_vert_matched(v, &union_scalars, &inputs, &model.effective_combos()) {
+            Ok((vsrc, attrs)) => {
+                match glsl_to_spirv(&vsrc, naga::ShaderStage::Vertex)
+                    .and_then(|spv| spirv_to_wgsl(&spv))
+                {
+                    Ok(w) => {
+                        vert_wgsl = Some(w);
+                        attributes = attrs;
+                    }
+                    Err(e) => eprintln!(
+                        "[shader] '{}': real VS translation failed ({e}); using synthetic VS",
+                        model.name
+                    ),
+                }
             }
+            Err(e) => eprintln!(
+                "[shader] '{}': real VS preprocess failed ({e}); using synthetic VS",
+                model.name
+            ),
         }
     }
 
-    // Generate a synthetic vertex shader whose outputs match the fragment shader's declared
-    // varyings.  vs_we_effect always outputs (vec4 v_TexCoord, vec2 v_Scroll) which causes
-    // a pipeline validation panic when the frag expects different types (e.g. clouds expects
-    // vec4 v_TexCoordClouds at location 1).  Our synthetic VS has no uniforms so it doesn't
-    // conflict with any bind group layout.
-    let inputs = frag_inputs(&model.frag_glsl);
-    let vert_wgsl = if needs_custom_vs(&inputs) {
+    // Synthetic fallback: outputs match the fragment shader's declared varyings.
+    // vs_we_effect always outputs (vec4 v_TexCoord, vec2 v_Scroll) which causes
+    // a pipeline validation panic when the frag expects different types.
+    if vert_wgsl.is_none() && needs_custom_vs(&inputs) {
         let vert_glsl = synthetic_vs_glsl(&inputs);
-        glsl_to_spirv(&vert_glsl, naga::ShaderStage::Vertex)
+        vert_wgsl = glsl_to_spirv(&vert_glsl, naga::ShaderStage::Vertex)
             .and_then(|spv| spirv_to_wgsl(&spv))
-            .ok()
-    } else {
-        None
-    };
+            .ok();
+    }
 
     Ok(TranslatedShader {
         wgsl,
         vert_wgsl,
         uniform_keys,
         texture_count: model.texture_slots.len(),
+        attributes,
     })
 }
 
-pub fn translate_vertex(vert_glsl: &str) -> Result<String> {
-    let glsl = preprocess_vert(vert_glsl);
-    let spv = glsl_to_spirv(&glsl, naga::ShaderStage::Vertex)
-        .context("vertex GLSL→SPIR-V compilation failed")?;
-    spirv_to_wgsl(&spv).context("vertex SPIR-V→WGSL conversion failed")
-}
-
-pub fn translate_with_vertex(model: &ShaderModel, vert_glsl: &str) -> Result<TranslatedShader> {
-    let mut result = translate(model)?;
-    match translate_vertex(vert_glsl) {
-        Ok(wgsl) => result.vert_wgsl = Some(wgsl),
-        Err(e) => eprintln!(
-            "warn: vertex shader translation failed for '{}': {e}",
-            model.name
-        ),
+/// Convert an annotation `default` JSON value into a vec4-shaped default.
+fn json_default_vec4(val: &serde_json::Value) -> [f32; 4] {
+    let mut out = [0.0f32; 4];
+    match val {
+        serde_json::Value::Number(n) => {
+            let f = n.as_f64().unwrap_or(0.0) as f32;
+            out = [f; 4];
+        }
+        serde_json::Value::String(s) => {
+            for (i, p) in s.split_whitespace().take(4).enumerate() {
+                out[i] = p.parse().unwrap_or(0.0);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for (i, p) in a.iter().take(4).enumerate() {
+                out[i] = p.as_f64().unwrap_or(0.0) as f32;
+            }
+        }
+        _ => {}
     }
-    Ok(result)
+    out
 }
 
 // ── GLSL → SPIR-V via shaderc ────────────────────────────────────────────────
@@ -276,7 +474,143 @@ fn spirv_to_wgsl(spv: &[u8]) -> Result<String> {
 //   Group 0, binding 5    : texture 3
 //   Group 1, binding 0    : effect UBO (scalar uniforms)
 
-fn preprocess_frag(model: &ShaderModel) -> String {
+fn vec_width(ty: &str) -> Option<u8> {
+    match ty {
+        "vec2" => Some(2),
+        "vec3" => Some(3),
+        "vec4" => Some(4),
+        _ => None,
+    }
+}
+
+fn swizzle_prefix(n: u8) -> &'static str {
+    match n {
+        1 => ".x",
+        2 => ".xy",
+        3 => ".xyz",
+        4 => ".xyzw",
+        _ => "",
+    }
+}
+
+const TEX_SAMPLE_CALLS: &[&str] = &[
+    "texSample2DLod(",
+    "texSample2D(",
+    "texture2DLod(",
+    "textureSample2D(",
+    "texture2D(",
+    "textureCube(",
+    "texture(",
+];
+
+/// Legacy NVIDIA GLSL compilers silently truncated the wider operand when
+/// vector widths mismatched in an assignment or binary op (e.g. assigning a
+/// vec4 texture sample to a `vec3` without a `.rgb` swizzle, or subtracting a
+/// `vec2` from a `vec3` varying). Workshop shaders authored and only ever
+/// tested on NVIDIA rely on this; naga/shaderc's stricter frontend rejects it
+/// outright. `var_width` is updated in place as declarations are seen so the
+/// caller can process a shader body line by line.
+fn coerce_vector_widths(line: &str, var_width: &mut HashMap<String, u8>) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+    let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+
+    // `vecN name = <expr>;` — track the declared width, and if <expr> is an
+    // unswizzled texture sample (always vec4) narrower than N, truncate it.
+    let mut declared: Option<(u8, &str)> = None;
+    for w in [2u8, 3u8] {
+        let prefix = format!("vec{w} ");
+        if let Some(rest) = trimmed.strip_prefix(prefix.as_str()) {
+            if let Some(eq_pos) = rest.find('=') {
+                let name = rest[..eq_pos].trim();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    declared = Some((w, name));
+                }
+            }
+        }
+    }
+    if let Some((w, name)) = declared {
+        var_width.insert(name.to_string(), w);
+        if let Some(body) = trimmed.strip_suffix(';') {
+            if let Some(eq_pos) = body.find('=') {
+                let rhs = body[eq_pos + 1..].trim();
+                if TEX_SAMPLE_CALLS.iter().any(|c| rhs.starts_with(c))
+                    && rhs.ends_with(')')
+                    && w < 4
+                {
+                    let lhs = &body[..=eq_pos];
+                    return format!("{indent}{lhs} {rhs}{};", swizzle_prefix(w));
+                }
+            }
+        }
+    }
+
+    // Plain reassignment `name = <texture sample>;` to an already-known narrower var.
+    if declared.is_none() {
+        if let Some(body) = trimmed.strip_suffix(';') {
+            if let Some(eq_pos) = body.find('=') {
+                let (lhs, rhs) = (body[..eq_pos].trim(), body[eq_pos + 1..].trim());
+                if lhs.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    if let Some(&w) = var_width.get(lhs) {
+                        if w < 4
+                            && TEX_SAMPLE_CALLS.iter().any(|c| rhs.starts_with(c))
+                            && rhs.ends_with(')')
+                        {
+                            return format!("{indent}{lhs} = {rhs}{};", swizzle_prefix(w));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Binary arithmetic against a `CASTn(...)` broadcast: `wide_var - CASTn(x)` where
+    // wide_var's known width exceeds n. Truncate wide_var's trailing components.
+    let mut out = trimmed.to_string();
+    for cast_w in [2u8, 3u8] {
+        let marker = format!("CAST{cast_w}(");
+        let mut search_from = 0;
+        while let Some(rel) = out[search_from..].find(marker.as_str()) {
+            let cast_pos = search_from + rel;
+            // Walk left over whitespace, then the binary operator, then whitespace,
+            // to find the end of the preceding operand.
+            let mut i = cast_pos;
+            let bytes = out.as_bytes();
+            while i > 0 && bytes[i - 1] == b' ' {
+                i -= 1;
+            }
+            if i == 0 || !matches!(bytes[i - 1], b'-' | b'+' | b'*' | b'/') {
+                search_from = cast_pos + marker.len();
+                continue;
+            }
+            i -= 1; // consume operator
+            while i > 0 && bytes[i - 1] == b' ' {
+                i -= 1;
+            }
+            let operand_end = i;
+            let mut start = i;
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+            {
+                start -= 1;
+            }
+            let operand = &out[start..operand_end];
+            if let Some(&w) = var_width.get(operand) {
+                if w > cast_w && start > 0 && bytes[start - 1] != b'.' {
+                    let swz = swizzle_prefix(cast_w);
+                    out = format!("{}{}{}", &out[..operand_end], swz, &out[operand_end..]);
+                    search_from = operand_end + swz.len() + marker.len();
+                    continue;
+                }
+            }
+            search_from = cast_pos + marker.len();
+        }
+    }
+    format!("{indent}{out}")
+}
+
+fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> String {
     let src = &model.frag_glsl;
 
     // First pass: collect declarations in order
@@ -293,7 +627,7 @@ fn preprocess_frag(model: &ShaderModel) -> String {
             let name = tok[2].trim_end_matches(';');
             if ty.starts_with("sampler") {
                 sampler_names.push(name.to_string());
-            } else if !ty.is_empty() {
+            } else if !ty.is_empty() && !name.contains('[') {
                 scalars.push((ty.to_string(), name.to_string()));
             }
         } else if t.starts_with("varying ") || t.starts_with("attribute ") {
@@ -376,10 +710,12 @@ fn preprocess_frag(model: &ShaderModel) -> String {
     if !sampler_names.is_empty() {
         out.push_str("layout(set=0, binding=1) uniform sampler _wp_sampler;\n");
     }
-    // UBO for scalars at group 1 binding 0 (matches effect_bgl)
-    if !scalars.is_empty() {
+    // UBO for scalars at group 1 binding 0 (matches effect_bgl). The block is
+    // the union of fragment + vertex scalars (fragment first) so both stages
+    // agree on std140 offsets.
+    if !scalars.is_empty() || !extra_scalars.is_empty() {
         out.push_str("layout(set=1, binding=0) uniform WEUniforms {\n");
-        for (ty, name) in &scalars {
+        for (ty, name) in scalars.iter().chain(extra_scalars.iter()) {
             out.push_str(&format!("    {ty} {name};\n"));
         }
         out.push_str("};\n");
@@ -389,6 +725,15 @@ fn preprocess_frag(model: &ShaderModel) -> String {
         out.push_str(&format!("layout(location={i}) in {ty} {name};\n"));
     }
     out.push_str("layout(location=0) out vec4 fragColor;\n");
+
+    // Seed known vector widths (varyings + uniforms) for the truncation-coercion
+    // pass below; it grows this map with local declarations as it walks the body.
+    let mut var_width: HashMap<String, u8> = HashMap::new();
+    for (ty, name) in inputs.iter().chain(scalars.iter()) {
+        if let Some(w) = vec_width(ty) {
+            var_width.insert(name.clone(), w);
+        }
+    }
 
     // Emit shader body (skip declarations already emitted above)
     for line in src.lines() {
@@ -419,7 +764,8 @@ fn preprocess_frag(model: &ShaderModel) -> String {
             continue;
         }
 
-        let renamed = rename_reserved_word(line, "sample", "_wp_s");
+        let coerced = coerce_vector_widths(line, &mut var_width);
+        let renamed = rename_reserved_word(&coerced, "sample", "_wp_s");
         let l = renamed
             .replace("gl_FragColor", "fragColor")
             .replace("gl_FragData[0]", "fragColor");
@@ -429,10 +775,26 @@ fn preprocess_frag(model: &ShaderModel) -> String {
     out
 }
 
-fn preprocess_vert(glsl: &str) -> String {
-    // Collect outputs (varying) and inputs (attribute) for explicit locations
-    let mut attr_count = 0u32;
-    let mut vary_count = 0u32;
+/// Preprocess a real WE vertex shader into Vulkan GLSL 4.50.
+///
+/// - Emits the SAME `WEUniforms` block as the fragment stage (union scalar
+///   list, set=1 binding=0) so std140 offsets agree across stages.
+/// - Assigns each varying the location of the same-named fragment input;
+///   fragment inputs the VS never writes are declared and zero-initialized at
+///   the top of `main()` (wgpu requires every FS input to have a VS output).
+/// - Returns the processed source plus the attribute list (type, name) in
+///   declaration order for vertex-buffer layout construction.
+fn preprocess_vert_matched(
+    glsl: &str,
+    union_scalars: &[(String, String)],
+    frag_inputs: &[(String, String)],
+    combos: &HashMap<String, i32>,
+) -> Result<(String, Vec<(String, String)>)> {
+    // Vertex shaders that sample textures need image bindings we don't
+    // provide in the vertex stage; let the synthetic fallback handle those.
+    if glsl.contains("texSample2D") || glsl.contains("texture2D") {
+        anyhow::bail!("vertex shader samples textures");
+    }
 
     let mut out = String::new();
     out.push_str("#version 450\n");
@@ -441,9 +803,9 @@ fn preprocess_vert(glsl: &str) -> String {
     out.push_str("#define CAST2(x) vec2(x)\n");
     out.push_str("#define CAST3(x) vec3(x)\n");
     out.push_str("#define CAST4(x) vec4(x)\n");
-    out.push_str("#define texture2D(s, uv) texture(s, uv)\n");
     out.push_str("#define lerp(a, b, t) mix(a, b, t)\n");
     out.push_str("#define mul(a, b) ((b) * (a))\n");
+    out.push_str(&combo_defines(combos));
     out.push_str("#define float2 vec2\n");
     out.push_str("#define float3 vec3\n");
     out.push_str("#define float4 vec4\n");
@@ -453,74 +815,99 @@ fn preprocess_vert(glsl: &str) -> String {
     out.push_str("#define CAST3X3(x) mat3(x)\n");
     out.push_str("#define atan2(y,x) atan(y,x)\n");
     out.push_str("#define fmod(x,y) ((x)-(y)*trunc((x)/(y)))\n");
-    out.push_str("#define ddx dFdx\n");
-    out.push_str("#define ddy(x) dFdy(-(x))\n");
     out.push_str("#define log10(x) (log2(x)*0.301029995663981)\n");
+    out.push_str("#ifndef M_PI\n#define M_PI 3.14159265359\n#endif\n");
+    out.push_str("#ifndef M_PI_2\n#define M_PI_2 6.28318530718\n#endif\n");
 
-    // Collect scalar uniforms for UBO
-    let mut scalars: Vec<(String, String)> = Vec::new();
-    for line in glsl.lines() {
-        let t = line.trim();
-        let tok: Vec<&str> = t.split_whitespace().collect();
-        if tok.len() >= 3 && tok[0] == "uniform" && !tok[1].starts_with("sampler") {
-            let ty = tok[1];
-            let decl = t.split("//").next().unwrap_or(t);
-            let name = decl
-                .split_whitespace()
-                .nth(2)
-                .unwrap_or("")
-                .trim_end_matches(';')
-                .trim();
-            scalars.push((ty.to_string(), name.to_string()));
-        }
-    }
-    if !scalars.is_empty() {
-        out.push_str("layout(set=0, binding=0) uniform WEUniforms {\n");
-        for (ty, name) in &scalars {
+    if !union_scalars.is_empty() {
+        out.push_str("layout(set=1, binding=0) uniform WEUniforms {\n");
+        for (ty, name) in union_scalars {
             out.push_str(&format!("    {ty} {name};\n"));
         }
         out.push_str("};\n");
     }
 
+    // Fragment-input locations by name; varyings must line up with them.
+    let frag_loc: HashMap<&str, usize> = frag_inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, name))| (name.as_str(), i))
+        .collect();
+    let mut next_free_loc = frag_inputs.len();
+
+    let mut attributes: Vec<(String, String)> = Vec::new();
+    let mut declared_varyings: Vec<String> = Vec::new();
+    let mut body = String::new();
+
     for line in glsl.lines() {
         let t = line.trim_start();
-        if t.starts_with("#version") || t.starts_with("precision ") || t.starts_with("// [COMBO]") {
+        if t.starts_with("#version")
+            || t.starts_with("precision ")
+            || t.starts_with("// [COMBO]")
+            || t.starts_with("#include ")
+        {
             continue;
         }
-        let tok: Vec<&str> = t.split_whitespace().collect();
+        let decl = t.split("//").next().unwrap_or(t).trim();
+        let tok: Vec<&str> = decl.split_whitespace().collect();
         if tok.len() >= 3 && tok[0] == "attribute" {
-            let ty = tok[1];
-            let decl = t.split("//").next().unwrap_or(t);
-            let name = decl
-                .split_whitespace()
-                .nth(2)
-                .unwrap_or("")
-                .trim_end_matches(';')
-                .trim();
-            out.push_str(&format!("layout(location={attr_count}) in {ty} {name};\n"));
-            attr_count += 1;
+            let ty = tok[1].to_string();
+            let name = tok[2].trim_end_matches(';').to_string();
+            out.push_str(&format!(
+                "layout(location={}) in {ty} {name};\n",
+                attributes.len()
+            ));
+            attributes.push((ty, name));
             continue;
         }
         if tok.len() >= 3 && tok[0] == "varying" {
-            let ty = tok[1];
-            let decl = t.split("//").next().unwrap_or(t);
-            let name = decl
-                .split_whitespace()
-                .nth(2)
-                .unwrap_or("")
-                .trim_end_matches(';')
-                .trim();
-            out.push_str(&format!("layout(location={vary_count}) out {ty} {name};\n"));
-            vary_count += 1;
+            let ty = tok[1].to_string();
+            let name = tok[2].trim_end_matches(';').to_string();
+            if name.contains('[') {
+                anyhow::bail!("array varying '{name}' not supported");
+            }
+            let loc = frag_loc.get(name.as_str()).copied().unwrap_or_else(|| {
+                let l = next_free_loc;
+                next_free_loc += 1;
+                l
+            });
+            out.push_str(&format!("layout(location={loc}) out {ty} {name};\n"));
+            declared_varyings.push(name);
             continue;
         }
         if tok.first() == Some(&"uniform") {
-            continue;
-        } // already in UBO
-        out.push_str(line);
-        out.push('\n');
+            continue; // already in the shared UBO
+        }
+        body.push_str(line);
+        body.push('\n');
     }
-    out
+
+    // Fragment inputs the vertex shader never declares: emit + zero-init so
+    // the wgpu interface check passes.
+    let mut missing_inits = String::new();
+    for (ty, name) in frag_inputs {
+        if !declared_varyings.iter().any(|v| v == name) {
+            out.push_str(&format!(
+                "layout(location={}) out {ty} {name};\n",
+                frag_loc[name.as_str()]
+            ));
+            missing_inits.push_str(&format!("    {name} = {ty}(0.0);\n"));
+        }
+    }
+    if !missing_inits.is_empty() {
+        // Insert right after the opening brace of main().
+        let main_pos = body
+            .find("void main")
+            .context("vertex shader has no main()")?;
+        let brace = body[main_pos..]
+            .find('{')
+            .map(|i| main_pos + i + 1)
+            .context("vertex shader main() has no body")?;
+        body.insert_str(brace, &format!("\n{missing_inits}"));
+    }
+
+    out.push_str(&body);
+    Ok((out, attributes))
 }
 
 // ── Synthetic vertex shader helpers ──────────────────────────────────────────
@@ -578,7 +965,10 @@ fn synthetic_vs_glsl(inputs: &[(String, String)]) -> String {
     out.push_str("    float y = float(vi >> 1) * 4.0 - 1.0;\n");
     out.push_str("    gl_Position = vec4(x, y, 0.0, 1.0);\n");
     out.push_str("    float u = (x + 1.0) * 0.5;\n");
-    out.push_str("    float v = (1.0 - y) * 0.5;\n");
+    // naga's SPIR-V frontend runs with adjust_coordinate_space=true, which
+    // negates gl_Position.y. UVs must be derived from the POST-flip screen
+    // position, so v maps y=-1 (screen top after flip) → 0.
+    out.push_str("    float v = (y + 1.0) * 0.5;\n");
     for (ty, name) in inputs {
         let val = match ty.as_str() {
             "float" => "u".to_string(),
@@ -627,4 +1017,120 @@ fn rename_reserved_word(src: &str, keyword: &str, replacement: &str) -> String {
 #[inline]
 fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrolls_literal_indexed_array_varying() {
+        let src = "varying vec2 v_TexCoord[4];\nvarying vec2 v_TexCoordBase;\n\
+                   void main() {\n\
+                   \tv_TexCoord[0] = a;\n\tv_TexCoord[1] = b;\n\
+                   \tv_TexCoord[2] = c;\n\tv_TexCoord[3] = d;\n}\n";
+        let out = unroll_array_varyings(src);
+        assert!(out.contains("varying vec2 v_TexCoord_0;"));
+        assert!(out.contains("varying vec2 v_TexCoord_1;"));
+        assert!(out.contains("varying vec2 v_TexCoord_2;"));
+        assert!(out.contains("varying vec2 v_TexCoord_3;"));
+        assert!(out.contains("varying vec2 v_TexCoordBase;"));
+        assert!(!out.contains('['));
+        assert!(out.contains("v_TexCoord_0 = a;"));
+        assert!(out.contains("v_TexCoord_3 = d;"));
+    }
+
+    #[test]
+    fn leaves_source_without_array_varyings_untouched() {
+        let src = "varying vec2 v_TexCoord;\nvoid main() { gl_FragColor = vec4(1.0); }\n";
+        assert_eq!(unroll_array_varyings(src), src);
+    }
+
+    #[test]
+    fn leaves_dynamically_sized_arrays_alone() {
+        let src = "varying vec2 v_TexCoord[LIGHTS_POINT];\n";
+        let out = unroll_array_varyings(src);
+        assert_eq!(out, src);
+    }
+
+    /// godrays_gaussian.frag declares the same varying at three different
+    /// sizes under mutually-exclusive `#if KERNEL==N` branches; only one
+    /// (max-sized) declaration block should survive, with no duplicates.
+    #[test]
+    fn merges_same_name_declared_at_multiple_sizes_across_if_branches() {
+        let src = "#if KERNEL == 0\nvarying vec2 v_TexCoord[13];\n#endif\n\
+                   #if KERNEL == 1\nvarying vec2 v_TexCoord[7];\n#endif\n\
+                   #if KERNEL == 2\nvarying vec2 v_TexCoord[3];\n#endif\n\
+                   void main() {\n\
+                   #if KERNEL == 2\n\tvec2 a = v_TexCoord[0] + v_TexCoord[2];\n#endif\n}\n";
+        let out = unroll_array_varyings(src);
+        assert_eq!(out.matches("varying vec2 v_TexCoord_0;").count(), 1);
+        assert_eq!(out.matches("varying vec2 v_TexCoord_12;").count(), 1);
+        assert!(!out.contains("v_TexCoord_13"));
+        assert!(out.contains("v_TexCoord_0 + v_TexCoord_2"));
+        assert!(!out.contains('['));
+    }
+
+    #[test]
+    fn coerce_truncates_unswizzled_texture_sample_to_declared_width() {
+        let mut vw = HashMap::new();
+        let out = coerce_vector_widths(
+            "vec3 albedo = texSample2D(g_Texture0, v_TexCoord.xy);",
+            &mut vw,
+        );
+        assert_eq!(
+            out,
+            "vec3 albedo = texSample2D(g_Texture0, v_TexCoord.xy).xyz;"
+        );
+        assert_eq!(vw.get("albedo"), Some(&3));
+    }
+
+    #[test]
+    fn coerce_truncates_plain_reassignment_using_tracked_width() {
+        let mut vw = HashMap::new();
+        vw.insert("albedo".to_string(), 3u8);
+        let out = coerce_vector_widths("albedo = texSample2D(g_Texture0, uv);", &mut vw);
+        assert_eq!(out, "albedo = texSample2D(g_Texture0, uv).xyz;");
+    }
+
+    #[test]
+    fn coerce_truncates_wide_varying_against_cast_broadcast() {
+        let mut vw = HashMap::new();
+        vw.insert("v_TexCoord".to_string(), 3u8);
+        let out = coerce_vector_widths(
+            "float scale = pow(length(abs(v_TexCoord - CAST2(u_offset)) * 1.0), 3.0);",
+            &mut vw,
+        );
+        assert_eq!(
+            out,
+            "float scale = pow(length(abs(v_TexCoord.xy - CAST2(u_offset)) * 1.0), 3.0);"
+        );
+    }
+
+    #[test]
+    fn coerce_leaves_matching_widths_untouched() {
+        let mut vw = HashMap::new();
+        vw.insert("v_TexCoord".to_string(), 2u8);
+        let line = "float scale = length(v_TexCoord - CAST2(u_offset));";
+        assert_eq!(coerce_vector_widths(line, &mut vw), line);
+    }
+
+    #[test]
+    fn coerce_leaves_swizzled_texture_sample_untouched() {
+        let mut vw = HashMap::new();
+        let line = "vec3 albedo = texSample2D(g_Texture0, uv).rgb;";
+        assert_eq!(coerce_vector_widths(line, &mut vw), line);
+    }
+
+    #[test]
+    fn coerce_is_idempotent_on_already_truncated_operand() {
+        let mut vw = HashMap::new();
+        vw.insert("v_TexCoord".to_string(), 3u8);
+        let once = coerce_vector_widths(
+            "float scale = length(v_TexCoord - CAST2(u_offset));",
+            &mut vw,
+        );
+        let twice = coerce_vector_widths(&once, &mut vw);
+        assert_eq!(once, twice);
+    }
 }

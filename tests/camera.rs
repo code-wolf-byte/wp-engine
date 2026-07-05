@@ -21,13 +21,11 @@ fn scene_with_general_proj(w: u32, h: u32) -> Scene {
     Scene {
         camera: None,
         general: Some(General {
-            supports_audio_processing: None,
-            speed: None,
-            clear_color: None,
             orthogonal_projection: Some(OrthogonalProjection {
                 width: Some(w),
                 height: Some(h),
             }),
+            ..Default::default()
         }),
         objects: vec![],
     }
@@ -64,12 +62,27 @@ fn from_scene_falls_back_to_fallback_wh() {
 
 #[test]
 fn object_to_quad_centered_full_screen() {
+    // WE origins are absolute scene coordinates: a fullscreen object's center
+    // is (w/2, h/2), not (0, 0).
     let cam = SceneCamera::new(1920.0, 1080.0);
-    let (offset, size) = cam.object_to_quad([0.0, 0.0, 0.0], [1920.0, 1080.0]);
+    let (offset, size) = cam.object_to_quad([960.0, 540.0, 0.0], [1920.0, 1080.0]);
     assert!((offset[0]).abs() < 1e-6);
     assert!((offset[1]).abs() < 1e-6);
     assert!((size[0] - 1.0).abs() < 1e-6);
     assert!((size[1] - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn object_to_quad_y_axis_points_up() {
+    // An object near the top of the scene (large Y in WE coords) must land
+    // near the top of the screen (small offset_norm[1]).
+    let cam = SceneCamera::new(1000.0, 1000.0);
+    let (offset, _) = cam.object_to_quad([500.0, 900.0, 0.0], [100.0, 100.0]);
+    assert!(
+        offset[1] < 0.1,
+        "high WE Y should map near screen top, got {}",
+        offset[1]
+    );
 }
 
 #[test]
