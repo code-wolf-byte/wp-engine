@@ -1124,10 +1124,10 @@ pub struct GpuSceneInstance {
     /// these always draw on top of images (before bloom, so bright particles
     /// still contribute to the bloom pass) — see [[wp_engine_project]] memory.
     particle_systems: Vec<particle::ParticleSystem>,
-    /// Parallel to `particle_systems`: each system's resolved sprite texture
-    /// (from its config's `material`, if any), sampled CPU-side by
-    /// `render_onto`'s textured path. `None` falls back to flat-color circles.
-    particle_sprites: Vec<Option<RgbaImage>>,
+    /// Parallel to `particle_systems`: each system's resolved sprite (from
+    /// its config's `material`, if any), sampled CPU-side by `render_onto`'s
+    /// textured path. `None` falls back to flat-color circles.
+    particle_sprites: Vec<Option<particle::ParticleSprite>>,
     /// Parallel to `particle_systems`: each system's `order_index` (from its
     /// source `ParticleLayer`), so `render()` can interleave particles with
     /// image layers in true scene z-order.
@@ -1319,14 +1319,18 @@ impl GpuSceneInstance {
             .iter()
             .map(|pl| {
                 let spawn_center = [pl.origin[0] as f32, h as f32 - pl.origin[1] as f32];
-                particle::ParticleSystem::from_config(
+                let mut system = particle::ParticleSystem::from_config(
                     &pl.config,
                     spawn_center,
                     pl.overrides.as_ref(),
-                )
+                );
+                if let Some(sprite) = &pl.sprite_texture {
+                    system.set_sprite_frames(sprite.frames.len(), sprite.duration);
+                }
+                system
             })
             .collect();
-        let particle_sprites: Vec<Option<RgbaImage>> = resolved
+        let particle_sprites: Vec<Option<particle::ParticleSprite>> = resolved
             .particle_layers
             .iter()
             .map(|pl| pl.sprite_texture.clone())

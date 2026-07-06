@@ -49,9 +49,10 @@ pub struct ParticleLayer {
     pub config: particle::ParticleConfig,
     pub overrides: Option<particle::InstanceOverride>,
     /// Resolved once from `config.material` (if present) via the same
-    /// model/material→texture chain image layers use. `None` falls back to
-    /// `render_onto`'s flat-color circle draw.
-    pub sprite_texture: Option<RgbaImage>,
+    /// model/material→texture chain image layers use, keeping every
+    /// sprite-sheet frame. `None` falls back to `render_onto`'s flat-color
+    /// circle draw.
+    pub sprite_texture: Option<particle::ParticleSprite>,
     /// This object's position in `scene.visible_objects()` (already the
     /// scene's topological/declaration render order) — lets render loops
     /// interleave particle systems with image layers in true scene z-order
@@ -406,6 +407,9 @@ impl ResolvedScene {
                         spawn_center,
                         pl.overrides.as_ref(),
                     );
+                    if let Some(sprite) = &pl.sprite_texture {
+                        system.set_sprite_frames(sprite.frames.len(), sprite.duration);
+                    }
                     for _ in 0..150 {
                         system.step(1.0 / 30.0);
                     }
@@ -704,9 +708,9 @@ fn particle_layer_from_object(
 
     let sprite_texture = config.material.as_deref().and_then(|mat_path| {
         if let Some(pkg) = pkg {
-            resolve_model_chain_pkg(pkg, mat_path).ok()
+            resolve_particle_sprite_pkg(pkg, mat_path).ok()
         } else {
-            dir.and_then(|dir| resolve_model_chain_dir(dir, mat_path).ok())
+            dir.and_then(|dir| resolve_particle_sprite_dir(dir, mat_path).ok())
         }
     });
 
@@ -873,7 +877,7 @@ fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.join(rel_path)).ok()
 }
 
-fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
+fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<TexFile> {
     let data = pkg
         .get(json_path)
         .map(|d| d.to_vec())
@@ -883,7 +887,7 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
         serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
-        return resolve_model_chain_pkg(pkg, mat_path);
+        return find_model_chain_tex_pkg(pkg, mat_path);
     }
 
     if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
@@ -897,9 +901,8 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
                             .map(|d| d.to_vec())
                             .or_else(|| read_from_global_assets(&tex_path))
                         {
-                            let tex = TexFile::parse(&tex_data)
-                                .with_context(|| format!("parsing {tex_path}"))?;
-                            return tex.to_rgba();
+                            return TexFile::parse(&tex_data)
+                                .with_context(|| format!("parsing {tex_path}"));
                         }
 
                         let alt_path = format!("{tex_name}.tex");
@@ -908,8 +911,7 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
                             .map(|d| d.to_vec())
                             .or_else(|| read_from_global_assets(&alt_path))
                         {
-                            let tex = TexFile::parse(&tex_data)?;
-                            return tex.to_rgba();
+                            return TexFile::parse(&tex_data);
                         }
                     }
                 }
@@ -921,7 +923,7 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
 }
 
 /// Follow the model -> material -> texture chain for loose files on disk.
-fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
+fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<TexFile> {
     let data = std::fs::read(dir.join(json_path))
         .ok()
         .or_else(|| read_from_global_assets(json_path))
@@ -930,7 +932,7 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
         serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
-        return resolve_model_chain_dir(dir, mat_path);
+        return find_model_chain_tex_dir(dir, mat_path);
     }
 
     if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
@@ -943,8 +945,7 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
                             .ok()
                             .or_else(|| read_from_global_assets(&tex_path))
                         {
-                            let tex = TexFile::parse(&tex_data)?;
-                            return tex.to_rgba();
+                            return TexFile::parse(&tex_data);
                         }
                     }
                 }
@@ -953,6 +954,37 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
     }
 
     anyhow::bail!("could not resolve texture from {json_path}")
+}
+
+fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
+    find_model_chain_tex_pkg(pkg, json_path)?.to_rgba()
+}
+
+fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
+    find_model_chain_tex_dir(dir, json_path)?.to_rgba()
+}
+
+/// Same model -> material -> texture chain as `resolve_model_chain_{pkg,dir}`,
+/// but for particle sprites: keeps every sprite-sheet frame (sliced from the
+/// `.tex`'s TEXS table, if any) instead of collapsing to one flat image, plus
+/// the animation's total loop duration so `ParticleSystem::set_sprite_frames`
+/// can drive per-particle frame advance.
+fn resolve_particle_sprite_pkg(pkg: &Package, json_path: &str) -> Result<particle::ParticleSprite> {
+    let tex = find_model_chain_tex_pkg(pkg, json_path)?;
+    let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
+    Ok(particle::ParticleSprite {
+        frames: tex.to_rgba_frames()?,
+        duration,
+    })
+}
+
+fn resolve_particle_sprite_dir(dir: &Path, json_path: &str) -> Result<particle::ParticleSprite> {
+    let tex = find_model_chain_tex_dir(dir, json_path)?;
+    let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
+    Ok(particle::ParticleSprite {
+        frames: tex.to_rgba_frames()?,
+        duration,
+    })
 }
 
 fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {

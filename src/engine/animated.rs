@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use super::assets::AssetStore;
 use super::effect::SceneEffect;
-use super::particle::{InstanceOverride, ParticleConfig, ParticleSystem};
+use super::particle::{InstanceOverride, ParticleConfig, ParticleSprite, ParticleSystem};
 use super::render::ResolvedScene;
 use super::scene::SceneObject;
+use super::tex::TexFile;
 
 struct SceneAnimState {
     /// Paired with each layer's `order_index` (its position in
@@ -20,7 +21,7 @@ struct SceneAnimState {
     /// Each system paired with its `order_index` and resolved sprite texture
     /// (from the preset's `material` field, if any) — `None` sprite falls
     /// back to `render_onto`'s flat-color circle draw.
-    particles: Vec<(usize, ParticleSystem, Option<RgbaImage>)>,
+    particles: Vec<(usize, ParticleSystem, Option<ParticleSprite>)>,
     effects: Vec<LayerEffect>,
     width: u32,
     height: u32,
@@ -169,7 +170,7 @@ fn load_particles(
     obj: &SceneObject,
     height: u32,
     order_index: usize,
-    particles: &mut Vec<(usize, ParticleSystem, Option<RgbaImage>)>,
+    particles: &mut Vec<(usize, ParticleSystem, Option<ParticleSprite>)>,
 ) {
     let particle_ref = match &obj.particle {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -197,18 +198,21 @@ fn load_particles(
             .material
             .as_deref()
             .and_then(|mat_path| resolve_particle_sprite(assets, mat_path));
-        let system = ParticleSystem::from_config(&config, spawn_center, overrides.as_ref());
+        let mut system = ParticleSystem::from_config(&config, spawn_center, overrides.as_ref());
+        if let Some(sprite) = &sprite {
+            system.set_sprite_frames(sprite.frames.len(), sprite.duration);
+        }
         particles.push((order_index, system, sprite));
     }
 }
 
 /// Resolves a particle preset's `material` field (a material JSON path, e.g.
 /// `"materials/presets/water_faucet.json"`) to its first pass's base
-/// texture, following one level of `material`-field indirection in case the
-/// path points at a model JSON instead (mirrors `render.rs`'s
-/// `resolve_model_chain_dir`/`_pkg`, but via `AssetStore` since this loader
-/// doesn't have direct `dir`/`pkg` access).
-fn resolve_particle_sprite(assets: &AssetStore, material_path: &str) -> Option<RgbaImage> {
+/// texture (every sprite-sheet frame, if animated), following one level of
+/// `material`-field indirection in case the path points at a model JSON
+/// instead (mirrors `render.rs`'s `resolve_particle_sprite_dir`/`_pkg`, but
+/// via `AssetStore` since this loader doesn't have direct `dir`/`pkg` access).
+fn resolve_particle_sprite(assets: &AssetStore, material_path: &str) -> Option<ParticleSprite> {
     let mut val: serde_json::Value = assets.read_json(material_path).ok()?;
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
         val = assets.read_json(mat_path).ok()?;
@@ -220,13 +224,28 @@ fn resolve_particle_sprite(assets: &AssetStore, material_path: &str) -> Option<R
         };
         for tex_ref in textures {
             if let Some(tex_name) = tex_ref.as_str() {
-                if let Ok(img) = assets.read_texture_rgba(tex_name) {
-                    return Some(img);
+                if let Some(sprite) = resolve_particle_sprite_asset(assets, tex_name) {
+                    return Some(sprite);
                 }
             }
         }
     }
     None
+}
+
+fn resolve_particle_sprite_asset(assets: &AssetStore, tex_name: &str) -> Option<ParticleSprite> {
+    let asset = assets.read_texture(tex_name).ok()?;
+    match TexFile::parse(&asset.bytes) {
+        Ok(tex) => {
+            let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
+            tex.to_rgba_frames()
+                .ok()
+                .map(|frames| ParticleSprite { frames, duration })
+        }
+        Err(_) => image::load_from_memory(&asset.bytes)
+            .ok()
+            .map(|img| ParticleSprite::single(img.into_rgba8())),
+    }
 }
 
 fn load_effects(obj: &SceneObject, effects: &mut Vec<LayerEffect>) {

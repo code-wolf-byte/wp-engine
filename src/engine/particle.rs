@@ -30,6 +30,56 @@ pub struct ParticleConfig {
     /// (this module stays asset-agnostic) and passed into `render_onto`.
     #[serde(default)]
     pub material: Option<String>,
+    /// How a particle's sprite-sheet frame advances over time: `"once"`
+    /// (play through over the particle's lifetime), `"randomframe"` (pick
+    /// one fixed random frame at spawn), or anything else/absent (loop
+    /// continuously) — CParticle.cpp's animation-frame update.
+    #[serde(default)]
+    pub animationmode: Option<String>,
+    /// Playback speed multiplier for sprite-sheet animation; `<= 0` (or
+    /// absent) means 1.0, matching the reference's `sequenceMultiplier > 0
+    /// ? sequenceMultiplier : 1.0`.
+    #[serde(default)]
+    pub sequencemultiplier: Option<f64>,
+}
+
+/// One resolved particle sprite: every sprite-sheet frame (already sliced
+/// out of the `.tex` atlas by `TexFile::to_rgba_frames`) plus the total
+/// loop duration in seconds (sum of each frame's `frametime`, 0 for a
+/// single-frame/non-animated sprite).
+#[derive(Clone)]
+pub struct ParticleSprite {
+    pub frames: Vec<RgbaImage>,
+    pub duration: f32,
+}
+
+impl ParticleSprite {
+    pub fn single(image: RgbaImage) -> Self {
+        Self {
+            frames: vec![image],
+            duration: 0.0,
+        }
+    }
+}
+
+/// Parsed `animationmode` (defaults to `Loop` for anything unrecognized or
+/// absent, matching the reference's `else` fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum AnimationMode {
+    #[default]
+    Loop,
+    Once,
+    RandomFrame,
+}
+
+impl AnimationMode {
+    fn from_config(mode: Option<&str>) -> Self {
+        match mode {
+            Some("once") => Self::Once,
+            Some("randomframe") => Self::RandomFrame,
+            _ => Self::Loop,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +247,10 @@ struct Particle {
     /// flat-color circle is rotation-invariant.
     rotation: f32,
     angular_velocity: f32,
+    /// Current sprite-sheet frame (fractional, truncated at draw time);
+    /// `-1.0` at spawn means "not yet assigned" (only meaningful for
+    /// `AnimationMode::RandomFrame`, which assigns it once and freezes it).
+    frame: f32,
 }
 
 /// Parsed `oscillatealpha`/`oscillatesize`/`oscillateposition` operator
@@ -251,6 +305,11 @@ pub struct ParticleSystem {
     life_max: f32,
     size_min: f32,
     size_max: f32,
+    /// `alpharandom` initializer range (CParticle.cpp's `AlphaRandomInitializer`):
+    /// defaults to `(1.0, 1.0)` — a no-op — when the config has no such
+    /// initializer at all, matching `ParticleInstance::alpha`'s `1.0f` default.
+    alpha_min: f32,
+    alpha_max: f32,
     velocity_min: Option<[f32; 3]>,
     velocity_max: Option<[f32; 3]>,
     color_min: [f32; 3],
@@ -292,6 +351,15 @@ pub struct ParticleSystem {
     /// `angularmovement` operator (z-axis `force` component, plus `drag`).
     angular_force: f32,
     angular_drag: f32,
+    /// Sprite-sheet animation: how many frames the resolved sprite has (0 if
+    /// no sprite, or a plain single-frame one) and its total loop duration
+    /// in seconds — set post-construction via `set_sprite_frames` once the
+    /// caller has actually resolved the sprite texture (this module stays
+    /// asset-agnostic, same convention as `material`/`render_onto`).
+    sprite_frame_count: usize,
+    sprite_duration: f32,
+    animation_mode: AnimationMode,
+    sequence_multiplier: f32,
 }
 
 struct EmitterState {
@@ -380,6 +448,8 @@ impl ParticleSystem {
             scalar_range_from_initializers(&config.initializer, "lifetime", 2.0, 6.0);
         let (size_min, size_max) =
             scalar_range_from_initializers(&config.initializer, "size", 2.0, 6.0);
+        let (alpha_min, alpha_max) =
+            scalar_range_from_initializers(&config.initializer, "alpha", 1.0, 1.0);
         let velocity_range = vec3_range_from_initializers(&config.initializer, "velocity");
         let (velocity_min, velocity_max) = match velocity_range {
             Some((min, max)) => (Some(min), Some(max)),
@@ -541,6 +611,8 @@ impl ParticleSystem {
             life_max,
             size_min,
             size_max,
+            alpha_min,
+            alpha_max,
             velocity_min,
             velocity_max,
             color_min,
@@ -566,7 +638,26 @@ impl ParticleSystem {
             angular_velocity_max,
             angular_force,
             angular_drag,
+            sprite_frame_count: 0,
+            sprite_duration: 0.0,
+            animation_mode: AnimationMode::from_config(config.animationmode.as_deref()),
+            sequence_multiplier: config
+                .sequencemultiplier
+                .map(|v| v as f32)
+                .filter(|v| *v > 0.0)
+                .unwrap_or(1.0),
         }
+    }
+
+    /// Tell the system its resolved sprite's frame count/loop duration, so
+    /// `step()` can advance each particle's `frame` — called once by the
+    /// caller right after resolving the sprite (this module itself never
+    /// loads textures). A no-op frame count of 0/1 leaves every particle's
+    /// `frame` at its spawn sentinel, matching `render_onto`'s "always frame
+    /// 0" behavior for non-animated sprites.
+    pub fn set_sprite_frames(&mut self, frame_count: usize, duration: f32) {
+        self.sprite_frame_count = frame_count;
+        self.sprite_duration = duration;
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -624,6 +715,33 @@ impl ParticleSystem {
                 1.0
             };
 
+            // Sprite-sheet frame advance (CParticle.cpp's "Update animation
+            // frames"): only meaningful once the caller has told us the
+            // resolved sprite actually has more than one frame.
+            if self.sprite_frame_count > 1 {
+                let frame_count = self.sprite_frame_count as f32;
+                match self.animation_mode {
+                    AnimationMode::RandomFrame => {
+                        if p.frame < 0.0 {
+                            p.frame = (fastrand::f32() * frame_count).floor().min(frame_count - 1.0);
+                        }
+                    }
+                    AnimationMode::Once => {
+                        p.frame = (lifetime_pos * frame_count * self.sequence_multiplier)
+                            .min(frame_count - 1.0);
+                    }
+                    AnimationMode::Loop => {
+                        p.frame = if self.sprite_duration > 0.0 {
+                            let time_in_cycle = (age * self.sequence_multiplier) % self.sprite_duration;
+                            let cycle_pos = time_in_cycle / self.sprite_duration;
+                            (cycle_pos * frame_count) % frame_count
+                        } else {
+                            (lifetime_pos * frame_count * self.sequence_multiplier) % frame_count
+                        };
+                    }
+                }
+            }
+
             // Alpha: alphafade takes precedence (its very common fade-in/hold/
             // fade-out shape), then a generic alphachange ramp, else fall back
             // to a plain linear death-fade so particles don't hard-cut when a
@@ -679,7 +797,11 @@ impl ParticleSystem {
                 ];
             }
 
-            p.alpha = alpha * self.alpha_mult;
+            // `self.alpha_mult` (the instance-override multiplier) is already
+            // baked into `p.initial_alpha` at spawn, matching the
+            // reference's `p.alpha = random(min,max) * override` — applying
+            // it again here would square it whenever an override isn't 1.0.
+            p.alpha = alpha;
             p.size = size;
         }
 
@@ -741,6 +863,12 @@ impl ParticleSystem {
                     ]
                 });
 
+                // `alpharandom`: CParticle.cpp's `p.alpha = random(min, max) *
+                // override` — a plain multiply (unlike sizerandom, not halved).
+                let spawn_alpha = (self.alpha_min
+                    + fastrand::f32() * (self.alpha_max - self.alpha_min).max(0.0))
+                    * self.alpha_mult;
+
                 self.particles.push(Particle {
                     x: ox + (fastrand::f32() - 0.5) * spread_x,
                     y: oy + (fastrand::f32() - 0.5) * spread_y,
@@ -749,9 +877,9 @@ impl ParticleSystem {
                     life,
                     max_life: life,
                     size,
-                    alpha: self.alpha_mult,
+                    alpha: spawn_alpha,
                     color,
-                    initial_alpha: self.alpha_mult,
+                    initial_alpha: spawn_alpha,
                     initial_size: size,
                     initial_color: [
                         color[0] as f32 / 255.0,
@@ -772,6 +900,7 @@ impl ParticleSystem {
                     rotation: 0.0,
                     angular_velocity: self.angular_velocity_min
                         + fastrand::f32() * (self.angular_velocity_max - self.angular_velocity_min),
+                    frame: -1.0,
                 });
             }
         }
@@ -804,7 +933,12 @@ impl ParticleSystem {
     /// lets callers raster into a canvas sized to just a system's bounding
     /// box (see `bounds()`) instead of the full scene. Existing full-canvas
     /// callers pass `[0.0, 0.0]`.
-    pub fn render_onto(&self, canvas: &mut RgbaImage, sprite: Option<&RgbaImage>, origin: [f32; 2]) {
+    pub fn render_onto(
+        &self,
+        canvas: &mut RgbaImage,
+        sprite: Option<&ParticleSprite>,
+        origin: [f32; 2],
+    ) {
         if self.rope_mode {
             self.render_rope_onto(canvas, origin);
             return;
@@ -825,7 +959,16 @@ impl ParticleSystem {
             let px_pos = p.x - origin[0];
             let py_pos = p.y - origin[1];
 
-            if let Some(tex) = sprite {
+            if let Some(sprite) = sprite {
+                // `p.frame` is only ever set (in `step`) when the sprite has
+                // more than one frame; a single-frame sprite always draws
+                // frame 0 regardless of its (unused, still -1.0) value.
+                let frame_idx = if sprite.frames.len() > 1 {
+                    (p.frame.max(0.0) as usize).min(sprite.frames.len() - 1)
+                } else {
+                    0
+                };
+                let tex = &sprite.frames[frame_idx];
                 draw_textured_particle(canvas, px_pos, py_pos, p.size, p.rotation, p.color, alpha, tex);
                 continue;
             }
@@ -1547,6 +1690,7 @@ mod tests {
                 osc_pos: None,
                 rotation: 0.0,
                 angular_velocity: 0.0,
+                frame: -1.0,
             });
             let _ = i;
         }
@@ -1580,6 +1724,7 @@ mod tests {
             osc_pos: None,
             rotation,
             angular_velocity: 0.0,
+            frame: -1.0,
         }
     }
 
@@ -1603,11 +1748,12 @@ mod tests {
         )
         .expect("should parse");
 
+        let sprite = ParticleSprite::single(tex.clone());
         let render_at = |rotation: f32| -> image::Rgba<u8> {
             let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
             sys.particles.push(make_particle(50.0, 50.0, 20.0, rotation));
             let mut canvas = RgbaImage::new(100, 100);
-            sys.render_onto(&mut canvas, Some(&tex), [0.0, 0.0]);
+            sys.render_onto(&mut canvas, Some(&sprite), [0.0, 0.0]);
             *canvas.get_pixel(44, 50)
         };
 
@@ -1617,6 +1763,147 @@ mod tests {
             unrotated, rotated,
             "expected rotation to change the sampled footprint at a fixed canvas point"
         );
+    }
+
+    /// A config with no `alpharandom` initializer at all must stay a no-op
+    /// (full alpha, matching `ParticleInstance::alpha`'s `1.0` default) —
+    /// the common case, and the one that must not regress.
+    #[test]
+    fn no_alpharandom_initializer_defaults_to_full_alpha() {
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":1000}]}"#)
+                .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(0.001);
+        assert_eq!(sys.particles[0].initial_alpha, 1.0);
+    }
+
+    /// `alpharandom` (e.g. fog1.json's `"min":0.15,"max":0.2`) must actually
+    /// constrain spawn alpha to that range instead of always spawning at
+    /// full opacity — this was silently ignored before.
+    #[test]
+    fn alpharandom_constrains_spawn_alpha_to_its_range() {
+        let json = r#"{
+            "maxcount": 20,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [{"id":1,"name":"alpharandom","min":0.15,"max":0.2}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(0.05); // spawn several at once (rate 1000 * 0.05s = 50, capped at maxcount)
+        assert!(!sys.particles.is_empty());
+        for p in &sys.particles {
+            assert!(
+                (0.15..=0.2).contains(&p.initial_alpha),
+                "expected initial_alpha in [0.15, 0.2], got {}",
+                p.initial_alpha
+            );
+            assert_eq!(p.alpha, p.initial_alpha, "no alphafade — alpha should equal initial_alpha before any fade operator runs");
+        }
+    }
+
+    /// An instance-override alpha multiplier must apply exactly once (not
+    /// squared) even when combined with `alpharandom`.
+    #[test]
+    fn alpha_override_multiplier_applies_once_not_twice() {
+        let json = r#"{
+            "maxcount": 1,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [{"id":1,"name":"alpharandom","min":1.0,"max":1.0}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let overrides = InstanceOverride {
+            alpha: Some(0.5),
+            color: None,
+            rate: None,
+            size: None,
+            speed: None,
+        };
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
+        sys.step(0.01);
+        assert_eq!(sys.particles[0].initial_alpha, 0.5);
+        sys.step(0.01);
+        // No alphafade/alphachange configured, so the plain lifetime-based
+        // death-fade fallback (`initial_alpha * life/max_life`) applies —
+        // barely distinguishable from 0.5 this soon after spawn, but not
+        // bit-exact. The point of this assertion is that it's nowhere near
+        // 0.5*0.5=0.25 (the double-multiply bug), not exact equality.
+        assert!(
+            (sys.particles[0].alpha - 0.5).abs() < 0.01,
+            "override should apply once (~0.5), not 0.5*0.5=0.25; got {}",
+            sys.particles[0].alpha
+        );
+    }
+
+    /// Default (no `animationmode`) sprite-sheet playback loops continuously
+    /// based on lifetime position: at half life with 4 frames, the particle
+    /// should be sitting on frame 2.
+    #[test]
+    fn sprite_frame_loops_by_lifetime_position() {
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":1000}]}"#)
+                .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.set_sprite_frames(4, 0.0);
+        sys.step(0.001); // spawn
+        assert_eq!(sys.particles.len(), 1);
+        sys.step(5.0); // half of a 10s life
+        assert!((sys.particles[0].frame - 2.0).abs() < 0.01);
+    }
+
+    /// `animationmode: "once"` plays through the sheet across the particle's
+    /// lifetime and clamps at the last frame instead of wrapping.
+    #[test]
+    fn sprite_frame_clamps_at_last_frame_when_animation_mode_once() {
+        let config: ParticleConfig = serde_json::from_str(
+            r#"{"maxcount":1,"animationmode":"once","emitter":[{"name":"box","rate":1000}]}"#,
+        )
+        .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.set_sprite_frames(4, 0.0);
+        sys.step(0.001); // spawn
+        sys.step(9.99); // nearly the whole 10s life
+        assert_eq!(sys.particles[0].frame, 3.0);
+    }
+
+    /// `animationmode: "randomframe"` assigns one frame at spawn and freezes
+    /// it — a second `step()` must not change it.
+    #[test]
+    fn sprite_random_frame_stays_fixed_after_assignment() {
+        let config: ParticleConfig = serde_json::from_str(
+            r#"{"maxcount":1,"animationmode":"randomframe","emitter":[{"name":"box","rate":1000}]}"#,
+        )
+        .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.set_sprite_frames(5, 0.0);
+        sys.step(0.001); // spawn (frame assignment lags by one step, like other operators)
+        sys.step(0.001); // assigns a random frame
+        let frame = sys.particles[0].frame;
+        assert!((0.0..5.0).contains(&frame));
+        sys.step(1.0);
+        assert_eq!(sys.particles[0].frame, frame);
+    }
+
+    /// A sprite with only one frame should never advance `p.frame` at all —
+    /// `render_onto` always draws frame 0 for it regardless.
+    #[test]
+    fn single_frame_sprite_leaves_frame_at_spawn_sentinel() {
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":1000}]}"#)
+                .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.life_min = 10.0;
+        sys.life_max = 10.0;
+        sys.set_sprite_frames(1, 0.0);
+        sys.step(0.001);
+        sys.step(5.0);
+        assert_eq!(sys.particles[0].frame, -1.0);
     }
 
     #[test]
