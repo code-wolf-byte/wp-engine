@@ -14,6 +14,13 @@ use super::tex::TexFile;
 pub struct AssetStore {
     root: PathBuf,
     packages: Vec<Package>,
+    /// Global Wallpaper Engine assets install, checked only after the
+    /// wallpaper's own loose files/packages come up empty. Built-in presets
+    /// (e.g. particle "fog1") ship their own `particles/presets/*.json` per
+    /// wallpaper but rely on the shared `materials/presets/*.json` + `.tex`
+    /// living only in this global install, never copied into the
+    /// wallpaper's own directory/pkg — see [[wp_engine_project]] memory.
+    assets_dir: Option<PathBuf>,
 }
 
 impl AssetStore {
@@ -29,6 +36,7 @@ impl AssetStore {
         Ok(Self {
             root: root.to_path_buf(),
             packages,
+            assets_dir: super::shaders::loader::find_we_assets_dir(),
         })
     }
 
@@ -43,6 +51,13 @@ impl AssetStore {
         for package in &self.packages {
             if let Some(data) = package.get(&normalized) {
                 return Ok(data.to_vec());
+            }
+        }
+
+        if let Some(dir) = &self.assets_dir {
+            let global_path = dir.join(&normalized);
+            if let Ok(data) = std::fs::read(&global_path) {
+                return Ok(data);
             }
         }
 

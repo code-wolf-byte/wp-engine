@@ -862,12 +862,25 @@ fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<LoadedImage>
 }
 
 /// Follow the model -> material -> texture reference chain in a PKG archive.
+/// Shared global WE assets install, used as a fallback when a model/material/
+/// texture isn't bundled with this specific wallpaper. Built-in particle
+/// presets (e.g. "fog1") ship their own `particles/presets/*.json` per
+/// wallpaper but rely on the shared `materials/presets/*.json` + `.tex`
+/// living only in the global assets install, never copied into the
+/// wallpaper's own directory/pkg — see [[wp_engine_project]] memory.
+fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
+    let dir = crate::engine::shaders::loader::find_we_assets_dir()?;
+    std::fs::read(dir.join(rel_path)).ok()
+}
+
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
     let data = pkg
         .get(json_path)
-        .with_context(|| format!("model/material not found in pkg: {json_path}"))?;
+        .map(|d| d.to_vec())
+        .or_else(|| read_from_global_assets(json_path))
+        .with_context(|| format!("model/material not found in pkg or global assets: {json_path}"))?;
     let val: serde_json::Value =
-        serde_json::from_slice(data).with_context(|| format!("parsing {json_path}"))?;
+        serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
         return resolve_model_chain_pkg(pkg, mat_path);
@@ -879,15 +892,23 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
                         let tex_path = format!("materials/{tex_name}.tex");
-                        if let Some(tex_data) = pkg.get(&tex_path) {
-                            let tex = TexFile::parse(tex_data)
+                        if let Some(tex_data) = pkg
+                            .get(&tex_path)
+                            .map(|d| d.to_vec())
+                            .or_else(|| read_from_global_assets(&tex_path))
+                        {
+                            let tex = TexFile::parse(&tex_data)
                                 .with_context(|| format!("parsing {tex_path}"))?;
                             return tex.to_rgba();
                         }
 
                         let alt_path = format!("{tex_name}.tex");
-                        if let Some(tex_data) = pkg.get(&alt_path) {
-                            let tex = TexFile::parse(tex_data)?;
+                        if let Some(tex_data) = pkg
+                            .get(&alt_path)
+                            .map(|d| d.to_vec())
+                            .or_else(|| read_from_global_assets(&alt_path))
+                        {
+                            let tex = TexFile::parse(&tex_data)?;
                             return tex.to_rgba();
                         }
                     }
@@ -901,11 +922,12 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> 
 
 /// Follow the model -> material -> texture chain for loose files on disk.
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
-    let full = dir.join(json_path);
-    let data =
-        std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
+    let data = std::fs::read(dir.join(json_path))
+        .ok()
+        .or_else(|| read_from_global_assets(json_path))
+        .with_context(|| format!("model/material not found in {} or global assets: {json_path}", dir.display()))?;
     let val: serde_json::Value =
-        serde_json::from_str(&data).with_context(|| format!("parsing {}", full.display()))?;
+        serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
     if let Some(mat_path) = val.get("material").and_then(|v| v.as_str()) {
         return resolve_model_chain_dir(dir, mat_path);
@@ -916,9 +938,11 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
-                        let tex_path = dir.join(format!("materials/{tex_name}.tex"));
-                        if tex_path.exists() {
-                            let tex_data = std::fs::read(&tex_path)?;
+                        let tex_path = format!("materials/{tex_name}.tex");
+                        if let Some(tex_data) = std::fs::read(dir.join(&tex_path))
+                            .ok()
+                            .or_else(|| read_from_global_assets(&tex_path))
+                        {
                             let tex = TexFile::parse(&tex_data)?;
                             return tex.to_rgba();
                         }
