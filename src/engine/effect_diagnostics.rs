@@ -279,6 +279,7 @@ fn collect_scene_override_uniforms(
                 uniforms.insert(format!("scene-pass{pass_index}:constant:{key}"));
             }
             for (texture_index, texture) in pass.textures.iter().enumerate() {
+                let Some(texture) = texture else { continue };
                 if let Some(name) = texture.file.as_deref().or(texture.name.as_deref()) {
                     uniforms.insert(format!("scene-pass{pass_index}:texture-ref{texture_index}"));
                     if is_render_target_name(name) {

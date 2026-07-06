@@ -148,7 +148,7 @@ impl SceneGraph {
             for effect in &object.effects {
                 for pass in &effect.passes {
                     stats.scene_override_textures += pass.textures.len();
-                    for texture in &pass.textures {
+                    for texture in pass.textures.iter().flatten() {
                         stats.scene_override_texture_names += usize::from(texture.file.is_some());
                         stats.scene_override_texture_names += usize::from(texture.name.is_some());
                     }

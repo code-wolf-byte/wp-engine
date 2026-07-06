@@ -440,6 +440,97 @@ pub fn coerce_int_literal_builtin_args(src: &str) -> String {
     out
 }
 
+/// WE's shader compiler tolerates truncating a wider vector to match a
+/// narrower swizzled assignment target — e.g. `albedo.rgb = mix(albedo,
+/// newAlbedo, mask)` where `albedo` is `vec4` but the assignment (and
+/// `newAlbedo`) are `vec3`. Strict GLSL (naga/shaderc) requires `mix()`'s
+/// first two arguments to have the same component count and rejects this.
+/// When an assignment's LHS is `IDENT.SWIZZLE` and the RHS is a `mix(...)`
+/// call whose first argument is the same bare `IDENT`, apply the LHS's
+/// swizzle to that argument too: a no-op when the types already matched, and
+/// exactly the truncation WE's compiler performed implicitly otherwise.
+pub fn coerce_swizzle_mismatched_mix_arg(src: &str) -> String {
+    fn is_swizzle(s: &str) -> bool {
+        (1..=4).contains(&s.len())
+            && (s.bytes().all(|b| b"xyzw".contains(&b)) || s.bytes().all(|b| b"rgba".contains(&b)))
+    }
+    fn is_ident(s: &str) -> bool {
+        !s.is_empty()
+            && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(rel) = rest.find("mix(") else {
+            out.push_str(rest);
+            break;
+        };
+        // Skip matches that are just the tail of a longer identifier (e.g. a
+        // hypothetical `remix(`).
+        if rel > 0 {
+            let prev = rest.as_bytes()[rel - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                out.push_str(&rest[..rel + 4]);
+                rest = &rest[rel + 4..];
+                continue;
+            }
+        }
+        let open_pos = rel + 3; // index of '(' in "mix("
+        let Some((call, call_end)) = extract_balanced(rest, open_pos, b'(', b')') else {
+            out.push_str(&rest[..open_pos + 1]);
+            rest = &rest[open_pos + 1..];
+            continue;
+        };
+
+        // Find the assignment this call is the RHS of: walk back over
+        // whitespace and a trailing '=' immediately preceding "mix(".
+        let before_trim = rest[..rel].trim_end();
+        let Some(lhs_and_stmt) = before_trim.strip_suffix('=') else {
+            out.push_str(&rest[..call_end]);
+            rest = &rest[call_end..];
+            continue;
+        };
+        // '==' is a comparison, not an assignment — reject if another '='
+        // immediately precedes.
+        if lhs_and_stmt.ends_with('=') {
+            out.push_str(&rest[..call_end]);
+            rest = &rest[call_end..];
+            continue;
+        }
+        let lhs = lhs_and_stmt.trim_end();
+        let stmt_start = lhs.rfind(['\n', ';', '{', '}']).map(|i| i + 1).unwrap_or(0);
+        let lhs_expr = lhs[stmt_start..].trim();
+        let Some((base, swizzle)) = lhs_expr.split_once('.') else {
+            out.push_str(&rest[..call_end]);
+            rest = &rest[call_end..];
+            continue;
+        };
+        if !is_ident(base) || !is_swizzle(swizzle) {
+            out.push_str(&rest[..call_end]);
+            rest = &rest[call_end..];
+            continue;
+        }
+
+        let inner = &call[1..call.len() - 1];
+        let args = split_top_level_args(inner);
+        if args.is_empty() || args[0].0.trim() != base {
+            out.push_str(&rest[..call_end]);
+            rest = &rest[call_end..];
+            continue;
+        }
+
+        out.push_str(&rest[..open_pos + 1]);
+        let mut fixed: Vec<String> = args.iter().map(|(a, _)| a.trim().to_string()).collect();
+        fixed[0] = format!("{base}.{swizzle}");
+        out.push_str(&fixed.join(", "));
+        out.push(')');
+        rest = &rest[call_end..];
+    }
+    out
+}
+
 pub fn unroll_array_varyings(src: &str) -> String {
     // name -> (qualifier, type, count)
     let mut arrays: Vec<(String, String, String, usize)> = Vec::new();
@@ -1519,6 +1610,39 @@ mod tests {
             coerce_int_literal_builtin_args(src),
             "max(texture(tex, uv).rgb, 0.0)"
         );
+    }
+
+    #[test]
+    fn coerce_swizzle_mix_fixes_real_shift_hue_pattern() {
+        let src = "albedo.rgb = mix(albedo, newAlbedo, mask);";
+        assert_eq!(
+            coerce_swizzle_mismatched_mix_arg(src),
+            "albedo.rgb = mix(albedo.rgb, newAlbedo, mask);"
+        );
+    }
+
+    #[test]
+    fn coerce_swizzle_mix_leaves_already_matching_types_untouched() {
+        let src = "color.xyz = mix(color.xyz, other, t);";
+        assert_eq!(coerce_swizzle_mismatched_mix_arg(src), src);
+    }
+
+    #[test]
+    fn coerce_swizzle_mix_ignores_unrelated_mix_calls() {
+        let src = "vec3 c = mix(a, b, t);";
+        assert_eq!(coerce_swizzle_mismatched_mix_arg(src), src);
+    }
+
+    #[test]
+    fn coerce_swizzle_mix_ignores_comparison_not_assignment() {
+        let src = "if (foo.rgb == mix(foo, bar, t)) { }";
+        assert_eq!(coerce_swizzle_mismatched_mix_arg(src), src);
+    }
+
+    #[test]
+    fn coerce_swizzle_mix_ignores_different_base_identifier() {
+        let src = "albedo.rgb = mix(other, newAlbedo, mask);";
+        assert_eq!(coerce_swizzle_mismatched_mix_arg(src), src);
     }
 
     /// godrays_gaussian.frag declares the same varying at three different

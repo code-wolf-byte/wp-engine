@@ -967,6 +967,10 @@ fn wgpu_blend_state(blending: &WEBlending) -> Option<wgpu::BlendState> {
 struct PassOverride {
     combos: HashMap<String, i32>,
     values: ShaderVals,
+    /// Positional scene.json texture override for this pass (e.g. a custom
+    /// opacity mask or noise map); `None` entries mean "leave this slot at
+    /// the material's own default". See `scene::Pass::textures`.
+    textures: Vec<Option<String>>,
 }
 
 /// One effect attached to one layer (an *instance* — the same effect on two
@@ -2187,6 +2191,12 @@ fn load_effect_instance(
         // NVIDIA compilers implicitly promoted it, naga/shaderc don't.
         let frag_glsl = transpiler::coerce_int_literal_builtin_args(&frag_glsl);
         let vert_glsl = transpiler::coerce_int_literal_builtin_args(&vert_glsl);
+        // Some shaders assign a swizzle of a wider vector from `mix()` using
+        // the un-swizzled vector as the first arg (e.g. shift_hue.frag's
+        // `albedo.rgb = mix(albedo, newAlbedo, mask)` where `albedo` is
+        // vec4) — WE's compiler truncates implicitly, naga/shaderc don't.
+        let frag_glsl = transpiler::coerce_swizzle_mismatched_mix_arg(&frag_glsl);
+        let vert_glsl = transpiler::coerce_swizzle_mismatched_mix_arg(&vert_glsl);
 
         // Scene.json pass overrides align with effect.json pass indices
         // (the reference's ImageEffectPassOverride).
@@ -2203,6 +2213,44 @@ fn load_effect_instance(
         }
         for (k, v) in &override_.combos {
             combos.insert(k.to_uppercase(), *v);
+        }
+        // Texture bindings: the material's own list, with the scene
+        // instance's per-pass override applied on top position-by-position
+        // (a scene `null` entry means "keep the material's default", not
+        // "clear it" — matches the reference's ImageEffectPassOverride).
+        let merged_textures: Vec<Option<String>> = {
+            let len = mat_pass.textures.len().max(override_.textures.len());
+            (0..len)
+                .map(|i| {
+                    override_
+                        .textures
+                        .get(i)
+                        .and_then(|t| t.clone())
+                        .or_else(|| mat_pass.textures.get(i).and_then(|t| t.clone()))
+                })
+                .collect()
+        };
+        // Some sampler2D uniforms annotate a `"combo":"NAME"` (e.g. nitro's
+        // opacitymask slot) whose real semantics is "enabled whenever a real
+        // texture is assigned to this slot" rather than a JSON-declared
+        // combo default. Without this, an optional mask texture the scene
+        // *does* provide never actually gates anything — the masked effect
+        // washes over the whole layer instead of being confined to the mask
+        // (e.g. nitro.frag's `#if MASK` block silently compiling out).
+        let sampler_combos: Vec<Option<String>> =
+            crate::engine::shaders::uniform_meta::parse_uniform_metadata(&frag_glsl)
+                .into_iter()
+                .filter(|m| m.uniform_type == "sampler2D")
+                .map(|m| m.combo)
+                .collect();
+        for (i, tex) in merged_textures.iter().enumerate() {
+            let Some(name) = tex else { continue };
+            if name.is_empty() || name.starts_with("_rt_") || name.starts_with("_alias_") {
+                continue;
+            }
+            if let Some(Some(combo_name)) = sampler_combos.get(i) {
+                combos.insert(combo_name.to_uppercase(), 1);
+            }
         }
 
         // Constants: material JSON defaults, overridden by scene values.
@@ -2261,8 +2309,9 @@ fn load_effect_instance(
         let vertex_buffers = renderer.attr_buffers_for(&pipeline_attrs);
 
         // Secondary textures (g_Texture1..): shader-annotation defaults,
-        // overridden by the material pass's texture list. Slot indices must
-        // stay aligned, so failed loads push a white 1×1 stand-in instead of
+        // overridden by the material pass's texture list (with the scene
+        // instance's own override merged in above). Slot indices must stay
+        // aligned, so failed loads push a white 1×1 stand-in instead of
         // shifting later slots down.
         let mut texture_names: Vec<Option<String>> = model
             .texture_slots
@@ -2270,7 +2319,7 @@ fn load_effect_instance(
             .skip(1)
             .map(|slot| slot.default_path.clone())
             .collect();
-        for (i, tex) in mat_pass.textures.iter().enumerate().skip(1) {
+        for (i, tex) in merged_textures.iter().enumerate().skip(1) {
             let slot = i - 1;
             if slot >= texture_names.len() {
                 texture_names.resize(slot + 1, None);
@@ -2445,6 +2494,7 @@ fn collect_effects(scene: &crate::engine::model::SceneModel) -> Vec<EffectInstan
                     PassOverride {
                         combos: p.combos.clone(),
                         values,
+                        textures: p.textures.clone(),
                     }
                 })
                 .collect();

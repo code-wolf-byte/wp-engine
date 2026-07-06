@@ -412,7 +412,7 @@ fn collect_effect_uniforms(graph: &SceneGraph, uniforms: &mut BTreeMap<String, U
                 }
 
                 for (texture_index, texture) in pass.textures.iter().enumerate() {
-                    if texture.file.is_some() {
+                    if texture.as_ref().is_some_and(|t| t.file.is_some()) {
                         insert_uniform(
                             uniforms,
                             format!(

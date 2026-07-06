@@ -97,10 +97,13 @@ fn pass_to_model(pass: &scene::Pass) -> PassModel {
         .map(|(k, v)| (k.clone(), json_to_animated(v)))
         .collect();
 
-    let textures: Vec<String> = pass
+    // Positional: preserve `null` slots as `None` instead of dropping them,
+    // otherwise a texture after a gap (e.g. nitro's `[null, "clouds", "mask"]`)
+    // shifts into the wrong shader slot.
+    let textures: Vec<Option<String>> = pass
         .textures
         .iter()
-        .filter_map(|t| t.file.clone())
+        .map(|t| t.as_ref().and_then(|t| t.file.clone().or_else(|| t.name.clone())))
         .collect();
 
     PassModel {

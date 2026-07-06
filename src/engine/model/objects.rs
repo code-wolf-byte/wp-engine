@@ -65,5 +65,6 @@ pub struct EffectModel {
 pub struct PassModel {
     pub combos: HashMap<String, i32>,
     pub shader_values: HashMap<String, AnimatedValue>,
-    pub textures: Vec<String>,
+    /// Positional, `None` for a `null`/absent slot — see `scene::Pass::textures`.
+    pub textures: Vec<Option<String>>,
 }

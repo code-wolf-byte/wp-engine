@@ -204,8 +204,15 @@ pub struct Pass {
     pub material: Option<String>,
     #[serde(default)]
     pub combos: std::collections::HashMap<String, i32>,
+    /// Positional: index N is the texture bound to shader slot N (`null`
+    /// entries are real gaps, e.g. "leave this slot at its material
+    /// default"), preserved as `None` rather than dropped — texture slots
+    /// are matched to shader uniforms by array position, so collapsing
+    /// `[null, "a", "b"]` down to `["a", "b"]` silently shifts every texture
+    /// after a gap into the wrong slot (see [[wp_engine_project]] memory,
+    /// nitro effect mask bug).
     #[serde(default, deserialize_with = "deserialize_textures")]
-    pub textures: Vec<TextureRef>,
+    pub textures: Vec<Option<TextureRef>>,
     #[serde(default)]
     pub constantshadervalues: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -216,14 +223,16 @@ pub struct TextureRef {
     pub name: Option<String>,
 }
 
-fn deserialize_textures<'de, D>(deserializer: D) -> std::result::Result<Vec<TextureRef>, D::Error>
+fn deserialize_textures<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<Option<TextureRef>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let items: Vec<Option<serde_json::Value>> = Vec::deserialize(deserializer)?;
     Ok(items
         .into_iter()
-        .filter_map(|v| {
+        .map(|v| {
             let v = v?;
             if v.is_null() {
                 return None;
@@ -339,7 +348,7 @@ impl Scene {
         for obj in &self.objects {
             for effect in &obj.effects {
                 for pass in &effect.passes {
-                    for tex in &pass.textures {
+                    for tex in pass.textures.iter().flatten() {
                         if let Some(f) = tex.file.as_deref() {
                             paths.push(f);
                         }
