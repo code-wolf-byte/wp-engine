@@ -78,6 +78,14 @@ struct CompositeParams {
     angle: f32,                     // byte 28 (fills the vec3's std140 tail)
     rect: vec4<f32>,                // byte 32: center.xy, half_extent.xy (NDC)
     aspect: f32,                    // byte 48: scene width / height
+    // byte 52: 4 bytes padding (vec2 below needs 8-byte alignment).
+    resolution: vec2<f32>,          // byte 56: scene size in pixels, for
+                                     // converting a fragment's screen position
+                                     // to full-scene UV when reading
+                                     // `dest_copy_tex` (a full-scene texture) —
+                                     // `uv` itself is *local* to this quad's own
+                                     // rect, which only coincides with full-scene
+                                     // UV for a fullscreen quad.
 }
 @group(0) @binding(2) var<uniform> composite: CompositeParams;
 @group(0) @binding(3) var dest_copy_tex: texture_2d<f32>;
@@ -253,10 +261,29 @@ fn blend_rgb(mode: i32, base: vec3<f32>, blend: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs_composite_blend(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+fn fs_composite_blend(
+    @builtin(position) frag_coord: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv - composite.uv_offset);
-    let dest = textureSample(dest_copy_tex, src_sampler, uv);
+    // `dest_copy_tex` is a full-scene snapshot, but `uv` is *local* to this
+    // quad's own rect — only identical to full-scene UV when the quad
+    // happens to cover the whole screen. Use the fragment's actual
+    // screen-space position instead so a partial-screen quad (a particle
+    // system's tight bounding box, a small rotated/scaled layer, ...) reads
+    // the scene content actually behind *it*, not a stretched sample of
+    // the scene's top-left corner.
+    let screen_uv = frag_coord.xy / composite.resolution;
+    let dest = textureSample(dest_copy_tex, src_sampler, screen_uv);
     let src_rgb = s.rgb * composite.color;
+    // Mode 30 (ours, above WE's 0-29 Photoshop range): pure premultiplied
+    // add for additive particle layers. The CPU rasterizer already
+    // accumulated `src * src_a` per particle (GL_SRC_ALPHA/GL_ONE), so the
+    // buffer's RGB is ready to add as-is — weighting by its alpha here
+    // would apply each particle's alpha twice.
+    if (composite.mode == 30) {
+        return vec4(min(dest.rgb + src_rgb, vec3(1.0)), dest.a);
+    }
     let src_a = s.a * composite.opacity;
     let blended = blend_rgb(composite.mode, dest.rgb, src_rgb);
     let out_rgb = mix(dest.rgb, blended, src_a);

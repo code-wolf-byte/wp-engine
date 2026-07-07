@@ -244,13 +244,13 @@ impl TexFile {
         })
     }
 
-    fn decode_mipmap(&self, mip: &Mipmap) -> Result<RgbaImage> {
+    fn decode_mipmap(&self, mip: &Mipmap, channel_alpha: bool) -> Result<RgbaImage> {
         if self.free_image != FreeImageFormat::Unknown {
             let img = image::load_from_memory(&mip.data)
                 .context("decoding FreeImage-format .tex payload")?;
             return Ok(img.into_rgba8());
         }
-        let rgba = decode_raw(self.format, &mip.data, mip.width, mip.height);
+        let rgba = decode_raw(self.format, &mip.data, mip.width, mip.height, channel_alpha);
         RgbaImage::from_raw(mip.width, mip.height, rgba)
             .context("failed to create RgbaImage from decoded texture data")
     }
@@ -258,12 +258,16 @@ impl TexFile {
     /// Decode image 0's first (highest-res) mipmap, cropped to the real
     /// (unpadded) image dimensions.
     pub fn to_rgba(&self) -> Result<RgbaImage> {
+        self.to_rgba_with(false)
+    }
+
+    fn to_rgba_with(&self, channel_alpha: bool) -> Result<RgbaImage> {
         let mip = self
             .images
             .first()
             .and_then(|mips| mips.first())
             .context("no mipmaps in .tex file")?;
-        let img = self.decode_mipmap(mip)?;
+        let img = self.decode_mipmap(mip, channel_alpha)?;
 
         if self.image_width != img.width() || self.image_height != img.height() {
             if self.image_width <= img.width() && self.image_height <= img.height() {
@@ -289,6 +293,10 @@ impl TexFile {
         self.format
     }
 
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
     /// Nearest-neighbor sampling instead of the default linear/bilinear.
     pub fn no_interpolation(&self) -> bool {
         self.flags & FLAG_NO_INTERPOLATION != 0
@@ -310,8 +318,20 @@ impl TexFile {
     ///   first mipmap as a frame;
     /// - else fall back to the single `to_rgba()` frame.
     pub fn to_rgba_frames(&self) -> Result<Vec<RgbaImage>> {
+        self.to_rgba_frames_with(false)
+    }
+
+    /// `to_rgba_frames()` for particle sprites: R8/RG88 (and their f16
+    /// variants) become white-RGB/luminance with the channel as alpha,
+    /// unconditionally by format — the real engine's `ConvertTexture0Format`
+    /// applied by the generic particle shaders (see `decode_raw`).
+    pub fn to_particle_rgba_frames(&self) -> Result<Vec<RgbaImage>> {
+        self.to_rgba_frames_with(true)
+    }
+
+    fn to_rgba_frames_with(&self, channel_alpha: bool) -> Result<Vec<RgbaImage>> {
         if self.is_animated() {
-            let atlas = self.to_rgba_atlas()?;
+            let atlas = self.to_rgba_atlas(channel_alpha)?;
             let mut frames = Vec::with_capacity(self.frames.len());
             for f in &self.frames {
                 let (x, y, w, h) = (
@@ -333,7 +353,7 @@ impl TexFile {
             let mut frames = Vec::with_capacity(self.images.len());
             for mips in &self.images {
                 if let Some(mip) = mips.first() {
-                    frames.push(self.decode_mipmap(mip)?);
+                    frames.push(self.decode_mipmap(mip, channel_alpha)?);
                 }
             }
             if !frames.is_empty() {
@@ -341,22 +361,28 @@ impl TexFile {
             }
         }
 
-        Ok(vec![self.to_rgba()?])
+        Ok(vec![self.to_rgba_with(channel_alpha)?])
     }
 
     /// The uncropped, undecoded-atlas version of `to_rgba()` (image 0's
     /// first mipmap at its native decoded size), used to slice TEXS frames.
-    fn to_rgba_atlas(&self) -> Result<RgbaImage> {
+    fn to_rgba_atlas(&self, channel_alpha: bool) -> Result<RgbaImage> {
         let mip = self
             .images
             .first()
             .and_then(|mips| mips.first())
             .context("no mipmaps in .tex file")?;
-        self.decode_mipmap(mip)
+        self.decode_mipmap(mip, channel_alpha)
     }
 }
 
-fn decode_raw(format: TexFormat, data: &[u8], width: u32, height: u32) -> Vec<u8> {
+fn decode_raw(
+    format: TexFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    channel_alpha: bool,
+) -> Vec<u8> {
     match format {
         // Despite the reference's "ARGB8888" name, CTexture.cpp uploads raw
         // (non-FreeImage-embedded) bytes for this format directly via
@@ -365,13 +391,39 @@ fn decode_raw(format: TexFormat, data: &[u8], width: u32, height: u32) -> Vec<u8
         // R/B swap here was wrong and visibly shifted every wallpaper's hues
         // (teal skies rendering yellow-green, blues rendering magenta/red).
         TexFormat::Rgba8 => data.to_vec(),
-        TexFormat::R8 => data.iter().flat_map(|&r| [r, r, r, 255]).collect(),
+        // `channel_alpha` mirrors the real engine's `ConvertTexture0Format`
+        // (assets/shaders/common_fragment.h): shaders that opt in — the
+        // generic particle/rope-particle/fur shaders — treat single/dual
+        // channel formats as alpha carriers, unconditionally by format
+        // (CPass.cpp sets the TEX0FORMAT combo from the pixel format alone;
+        // the `AlphaChannelPriority` texture flag exists but is never read).
+        // R8/R16F → vec4(1, 1, 1, r): white tinted by the particle color,
+        // shaped purely by alpha. Without the conversion every sprite draws
+        // its full bounding rectangle as an opaque box (black for R8, red-
+        // tinted for RG88's [r, g, 0] expansion).
+        TexFormat::R8 => data
+            .iter()
+            .flat_map(|&r| {
+                if channel_alpha {
+                    [255, 255, 255, r]
+                } else {
+                    [r, r, r, 255]
+                }
+            })
+            .collect(),
         TexFormat::Rg88 => data
             .chunks(2)
             .flat_map(|rg| {
                 let r = rg.first().copied().unwrap_or(0);
                 let g = rg.get(1).copied().unwrap_or(0);
-                [r, g, 0, 255]
+                if channel_alpha {
+                    // _sample.rrrg: R = luminance, G = alpha (independent of
+                    // brightness — e.g. a beam that stays bright along its
+                    // whole length but tapers alpha only at the very ends).
+                    [r, r, r, g]
+                } else {
+                    [r, g, 0, 255]
+                }
             })
             .collect(),
         TexFormat::Rgb888 => data
@@ -391,7 +443,11 @@ fn decode_raw(format: TexFormat, data: &[u8], width: u32, height: u32) -> Vec<u8
             .chunks_exact(2)
             .flat_map(|b| {
                 let v = f16_to_u8(u16::from_le_bytes([b[0], b[1]]));
-                [v, v, v, 255]
+                if channel_alpha {
+                    [255, 255, 255, v]
+                } else {
+                    [v, v, v, 255]
+                }
             })
             .collect(),
         TexFormat::Rg1616f => data
@@ -399,7 +455,11 @@ fn decode_raw(format: TexFormat, data: &[u8], width: u32, height: u32) -> Vec<u8
             .flat_map(|b| {
                 let r = f16_to_u8(u16::from_le_bytes([b[0], b[1]]));
                 let g = f16_to_u8(u16::from_le_bytes([b[2], b[3]]));
-                [r, g, 0, 255]
+                if channel_alpha {
+                    [r, r, r, g]
+                } else {
+                    [r, g, 0, 255]
+                }
             })
             .collect(),
         TexFormat::Rgba16161616f => data
@@ -893,13 +953,14 @@ mod tests {
     }
 
     /// Build a minimal TEXV0005/TEXI0001/TEXB0001 file: 1 image, 1 mipmap,
-    /// uncompressed R8 pixels (2x2, value 0x80 everywhere).
-    fn minimal_tex() -> Vec<u8> {
+    /// `format_id`/`flags` as given, with `pixels` as the raw mipmap bytes
+    /// (2x2 texture).
+    fn minimal_tex_with(format_id: u32, flags: u32, pixels: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         write_tag(&mut out, b"TEXV0005");
         write_tag(&mut out, b"TEXI0001");
-        out.extend_from_slice(&9u32.to_le_bytes()); // format = R8
-        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&format_id.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&2u32.to_le_bytes()); // texture_width
         out.extend_from_slice(&2u32.to_le_bytes()); // texture_height
         out.extend_from_slice(&2u32.to_le_bytes()); // image_width
@@ -914,10 +975,14 @@ mod tests {
         // no compression/uncompressedSize fields).
         out.extend_from_slice(&2u32.to_le_bytes());
         out.extend_from_slice(&2u32.to_le_bytes());
-        let pixels = [0x80u8; 4];
         out.extend_from_slice(&(pixels.len() as i32).to_le_bytes());
-        out.extend_from_slice(&pixels);
+        out.extend_from_slice(pixels);
         out
+    }
+
+    /// Uncompressed R8 pixels (2x2, value 0x80 everywhere), no flags.
+    fn minimal_tex() -> Vec<u8> {
+        minimal_tex_with(9, 0, &[0x80u8; 4])
     }
 
     #[test]
@@ -930,6 +995,58 @@ mod tests {
         assert_eq!(img.width(), 2);
         assert_eq!(img.height(), 2);
         assert_eq!(img.get_pixel(0, 0).0, [0x80, 0x80, 0x80, 255]);
+    }
+
+    /// Generic (non-particle) decode: R8 stays a plain opaque luminance
+    /// mask, regardless of any texture flag.
+    #[test]
+    fn r8_generic_decode_is_opaque_luminance() {
+        let data = minimal_tex_with(9, 0, &[0x40u8; 4]);
+        let img = TexFile::parse(&data).unwrap().to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [0x40, 0x40, 0x40, 255]);
+    }
+
+    /// Particle decode mirrors `ConvertTexture0Format`: R8 becomes
+    /// vec4(1, 1, 1, r) — white shaped purely by the channel-as-alpha —
+    /// unconditionally by format (no flag involved; the real engine keys
+    /// the conversion off TEX0FORMAT alone). This is the bug behind
+    /// "particle effects have hard black boxes around them": debris/smoke
+    /// masks are R8, and decoding them as opaque made every particle draw
+    /// its full bounding rectangle as a solid dark box.
+    #[test]
+    fn r8_particle_decode_is_white_with_channel_alpha() {
+        let data = minimal_tex_with(9, 0, &[0x40u8; 4]);
+        let frames = TexFile::parse(&data)
+            .unwrap()
+            .to_particle_rgba_frames()
+            .unwrap();
+        assert_eq!(frames[0].get_pixel(0, 0).0, [255, 255, 255, 0x40]);
+    }
+
+    /// Generic (non-particle) decode: RG88 keeps its plain
+    /// two-color-channel expansion (blue=0, fully opaque).
+    #[test]
+    fn rg88_generic_decode_is_two_channel_color() {
+        let pixels = [0x10u8, 0x20, 0x10, 0x20, 0x10, 0x20, 0x10, 0x20];
+        let data = minimal_tex_with(8, 0, &pixels);
+        let img = TexFile::parse(&data).unwrap().to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [0x10, 0x20, 0, 255]);
+    }
+
+    /// Particle decode: RG88 becomes _sample.rrrg — R broadcast to RGB as
+    /// luminance, G as alpha (independent of brightness, e.g. a beam sprite
+    /// that stays bright along its whole length but tapers alpha only at
+    /// the very ends). Decoding it generically instead shows as an opaque
+    /// red-tinted box ([r, g, 0, 255] is red-dominant).
+    #[test]
+    fn rg88_particle_decode_uses_green_as_alpha() {
+        let pixels = [0x10u8, 0x20, 0x10, 0x20, 0x10, 0x20, 0x10, 0x20];
+        let data = minimal_tex_with(8, 0, &pixels);
+        let frames = TexFile::parse(&data)
+            .unwrap()
+            .to_particle_rgba_frames()
+            .unwrap();
+        assert_eq!(frames[0].get_pixel(0, 0).0, [0x10, 0x10, 0x10, 0x20]);
     }
 
     #[test]

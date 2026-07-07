@@ -359,6 +359,7 @@ fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Resul
     println!("Format:       {:?}", tex.format());
     println!("Image size:   {}x{}", tex.image_width, tex.image_height);
     println!("Texture size: {}x{}", tex.texture_width, tex.texture_height);
+    println!("Flags:        0x{:x}", tex.flags());
     if let Some(out) = save {
         let img = tex.to_rgba()?;
         img.save(out)?;

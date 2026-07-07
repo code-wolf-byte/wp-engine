@@ -939,8 +939,23 @@ impl ParticleSystem {
         sprite: Option<&ParticleSprite>,
         origin: [f32; 2],
     ) {
+        self.render_onto_blended(canvas, sprite, origin, false);
+    }
+
+    /// `render_onto` with the material's blending mode: `additive` layers
+    /// accumulate premultiplied contributions (the reference renders each
+    /// particle quad with `glBlendFunc(GL_SRC_ALPHA, GL_ONE)`, CPass.cpp),
+    /// so overlapping particles brighten each other instead of the newer
+    /// one occluding the older via "over" compositing.
+    pub fn render_onto_blended(
+        &self,
+        canvas: &mut RgbaImage,
+        sprite: Option<&ParticleSprite>,
+        origin: [f32; 2],
+        additive: bool,
+    ) {
         if self.rope_mode {
-            self.render_rope_onto(canvas, origin);
+            self.render_rope_onto(canvas, origin, additive);
             return;
         }
 
@@ -969,7 +984,9 @@ impl ParticleSystem {
                     0
                 };
                 let tex = &sprite.frames[frame_idx];
-                draw_textured_particle(canvas, px_pos, py_pos, p.size, p.rotation, p.color, alpha, tex);
+                draw_textured_particle(
+                    canvas, px_pos, py_pos, p.size, p.rotation, p.color, alpha, tex, additive,
+                );
                 continue;
             }
 
@@ -993,25 +1010,14 @@ impl ParticleSystem {
                     // (fog/light shafts) that are meant to be soft glows.
                     let t = 1.0 - (d2 / sz2).sqrt();
                     let falloff = t * t;
-                    let dst = canvas.get_pixel_mut(px as u32, py as u32);
-                    // Standard "over" compositing (not a plain lerp): the
-                    // destination isn't always opaque — the GPU path renders
-                    // particles into their own transparent scene-sized buffer
-                    // before compositing it as a texture, so overlapping
-                    // particles must accumulate alpha correctly rather than
-                    // assuming a fully-opaque backdrop.
                     let src_a = (alpha as f32 / 255.0) * falloff;
-                    let dst_a = dst[3] as f32 / 255.0;
-                    let out_a = src_a + dst_a * (1.0 - src_a);
-                    if out_a > 0.0 {
-                        for i in 0..3 {
-                            let src_c = p.color[i] as f32 / 255.0;
-                            let dst_c = dst[i] as f32 / 255.0;
-                            let out_c = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
-                            dst[i] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
-                        }
-                    }
-                    dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+                    let src_c = [
+                        p.color[0] as f32 / 255.0,
+                        p.color[1] as f32 / 255.0,
+                        p.color[2] as f32 / 255.0,
+                    ];
+                    let dst = canvas.get_pixel_mut(px as u32, py as u32);
+                    blend_pixel(dst, src_c, src_a, additive);
                 }
             }
         }
@@ -1026,7 +1032,7 @@ impl ParticleSystem {
     /// repo) from a tangent/normal it derives per-vertex — this perpendicular-
     /// offset quad approach is our own design for the same visual effect,
     /// informed by, but not a line-for-line port of, that shader.
-    fn render_rope_onto(&self, canvas: &mut RgbaImage, origin: [f32; 2]) {
+    fn render_rope_onto(&self, canvas: &mut RgbaImage, origin: [f32; 2], additive: bool) {
         let n = self.particles.len();
         if n < 2 {
             return;
@@ -1080,7 +1086,9 @@ impl ParticleSystem {
 
         for pair in subpoints.windows(2) {
             let (a, b) = (&pair[0], &pair[1]);
-            fill_rope_segment(canvas, a.pos, b.pos, a.size, b.size, a.color, b.color, a.alpha, b.alpha);
+            fill_rope_segment(
+                canvas, a.pos, b.pos, a.size, b.size, a.color, b.color, a.alpha, b.alpha, additive,
+            );
         }
     }
 }
@@ -1121,6 +1129,7 @@ fn fill_rope_segment(
     color_b: [u8; 3],
     alpha_a: f32,
     alpha_b: f32,
+    additive: bool,
 ) {
     let dir = [b[0] - a[0], b[1] - a[1]];
     let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
@@ -1181,19 +1190,14 @@ fn fill_rope_segment(
                 lerp_f32(color_a[2] as f32, color_b[2] as f32, seg_t) as u8,
             ];
 
-            let dst = canvas.get_pixel_mut(px as u32, py as u32);
             let src_a = alpha as f32 / 255.0;
-            let dst_a = dst[3] as f32 / 255.0;
-            let out_a = src_a + dst_a * (1.0 - src_a);
-            if out_a > 0.0 {
-                for i in 0..3 {
-                    let src_c = color[i] as f32 / 255.0;
-                    let dst_c = dst[i] as f32 / 255.0;
-                    let out_c = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
-                    dst[i] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
-                }
-            }
-            dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+            let src_c = [
+                color[0] as f32 / 255.0,
+                color[1] as f32 / 255.0,
+                color[2] as f32 / 255.0,
+            ];
+            let dst = canvas.get_pixel_mut(px as u32, py as u32);
+            blend_pixel(dst, src_c, src_a, additive);
         }
     }
 }
@@ -1247,6 +1251,7 @@ fn draw_textured_particle(
     color: [u8; 3],
     alpha_byte: u8,
     tex: &RgbaImage,
+    additive: bool,
 ) {
     // `p.size` is already a radius, not a diameter (see `sizerandom`'s
     // comment on the halving done at spawn) — matches the flat-color circle
@@ -1284,20 +1289,52 @@ fn draw_textured_particle(
             if src_a <= 0.0 {
                 continue;
             }
+            let src_c = [
+                (sample[0] as f32 / 255.0) * (color[0] as f32 / 255.0),
+                (sample[1] as f32 / 255.0) * (color[1] as f32 / 255.0),
+                (sample[2] as f32 / 255.0) * (color[2] as f32 / 255.0),
+            ];
             let dst = canvas.get_pixel_mut(px as u32, py as u32);
-            let dst_a = dst[3] as f32 / 255.0;
-            let out_a = src_a + dst_a * (1.0 - src_a);
-            if out_a > 0.0 {
-                for i in 0..3 {
-                    let src_c = (sample[i] as f32 / 255.0) * (color[i] as f32 / 255.0);
-                    let dst_c = dst[i] as f32 / 255.0;
-                    let out_c = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
-                    dst[i] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
-                }
-            }
-            dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+            blend_pixel(dst, src_c, src_a, additive);
         }
     }
+}
+
+/// Composites one source sample into a canvas pixel.
+///
+/// Normal/translucent layers use standard "over" compositing (not a plain
+/// lerp): the destination isn't always opaque — the GPU path renders
+/// particles into their own transparent scene-sized buffer before
+/// compositing it as a texture, so overlapping particles must accumulate
+/// alpha correctly rather than assuming a fully-opaque backdrop.
+///
+/// Additive layers accumulate premultiplied contributions instead — the
+/// reference draws every particle quad with
+/// `glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_SRC_ALPHA, GL_ONE)`
+/// (CPass.cpp), i.e. `dst += src * src_a` — so overlapping glows brighten
+/// each other rather than the newest quad occluding the ones below. The
+/// buffer then holds already-premultiplied color, which the GPU composite's
+/// pure-add mode adds to the scene without re-weighting by alpha.
+fn blend_pixel(dst: &mut image::Rgba<u8>, src_c: [f32; 3], src_a: f32, additive: bool) {
+    if additive {
+        for i in 0..3 {
+            let dst_c = dst[i] as f32 / 255.0;
+            dst[i] = ((dst_c + src_c[i] * src_a) * 255.0).clamp(0.0, 255.0) as u8;
+        }
+        let dst_a = dst[3] as f32 / 255.0;
+        dst[3] = ((dst_a + src_a * src_a) * 255.0).clamp(0.0, 255.0) as u8;
+        return;
+    }
+    let dst_a = dst[3] as f32 / 255.0;
+    let out_a = src_a + dst_a * (1.0 - src_a);
+    if out_a > 0.0 {
+        for i in 0..3 {
+            let dst_c = dst[i] as f32 / 255.0;
+            let out_c = (src_c[i] * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
+            dst[i] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+    dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
 }
 
 fn sample_bilinear(tex: &RgbaImage, u: f32, v: f32) -> [u8; 4] {

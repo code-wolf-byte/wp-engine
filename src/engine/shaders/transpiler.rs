@@ -1059,9 +1059,23 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
         }
     }
 
-    // Texture binding indices: 1st texture → 0, rest → 3, 4, 5, ...
-    let tex_binding = |i: usize| -> u32 {
-        match i {
+    // Texture binding indices: g_Texture0 → 0, g_TextureN → N+2 (3, 4, 5, ...).
+    //
+    // The binding MUST come from the `N` in the uniform's own name, not from
+    // its position in the declaration scan: the scan reads the raw source
+    // and ignores `#if` blocks, so a conditionally-declared sampler that the
+    // compile strips (e.g. shine_combine.frag declares `g_Texture2` inside
+    // `#if COPYBG` *above* g_Texture0/g_Texture1) would otherwise shift every
+    // later sampler's binding by one — the shader then samples neighbouring
+    // slots (or the white 1×1 dummy) instead of its real inputs. WE itself
+    // keys texture units off the name's index (CPass binds unit N to
+    // g_TextureN), so the name is the authoritative slot.
+    let tex_binding = |i: usize, name: &str| -> u32 {
+        let n = name
+            .strip_prefix("g_Texture")
+            .and_then(|rest| rest.parse::<usize>().ok())
+            .unwrap_or(i);
+        match n {
             0 => 0,
             n => 2 + n as u32,
         } // 0→0, 1→3, 2→4, 3→5
@@ -1112,7 +1126,7 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
 
     // Separate texture2D declarations with matching bindings
     for (i, name) in sampler_names.iter().enumerate() {
-        let b = tex_binding(i);
+        let b = tex_binding(i, name);
         out.push_str(&format!(
             "layout(set=0, binding={b}) uniform texture2D {name};\n"
         ));

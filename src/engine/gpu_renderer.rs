@@ -1132,6 +1132,12 @@ pub struct GpuSceneInstance {
     /// source `ParticleLayer`), so `render()` can interleave particles with
     /// image layers in true scene z-order.
     particle_order: Vec<usize>,
+    /// Parallel to `particle_systems`: true when the resolved sprite's
+    /// material declares `"blending":"additive"` (fog/smoke/embers/rain/
+    /// lightning — most real particle materials). Composited additively
+    /// instead of the default alpha-over, which otherwise makes a sprite's
+    /// near-black background visibly darken/box the scene behind it.
+    particle_additive: Vec<bool>,
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
@@ -1284,9 +1290,14 @@ impl GpuSceneInstance {
         }
         for (instance_idx, runtime) in effect_runtimes.iter().enumerate() {
             if let Some(runtime) = runtime {
+                // `inst.layer_idx` is a raw scene-object index; find the
+                // loaded layer that came from that object (positional
+                // indexing would misalign whenever particles/skipped
+                // objects precede the layer, sizing FBOs off — and routing
+                // effects onto — a completely unrelated layer).
                 let (ow, oh) = scene_effects
                     .get(instance_idx)
-                    .and_then(|inst| layers.get(inst.layer_idx))
+                    .and_then(|inst| layers.iter().find(|l| l.order_index == inst.layer_idx))
                     .map(|layer| (layer.object_size.0.max(1), layer.object_size.1.max(1)))
                     .unwrap_or((w, h));
                 for (fbo_name, scale) in &runtime.fbos {
@@ -1340,6 +1351,11 @@ impl GpuSceneInstance {
             .iter()
             .map(|pl| pl.order_index)
             .collect();
+        let particle_additive: Vec<bool> = resolved
+            .particle_layers
+            .iter()
+            .map(|pl| pl.additive_blend)
+            .collect();
 
         Ok(Self {
             renderer,
@@ -1357,6 +1373,7 @@ impl GpuSceneInstance {
             particle_systems,
             particle_sprites,
             particle_order,
+            particle_additive,
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
@@ -1505,10 +1522,16 @@ impl GpuSceneInstance {
             let layer_sampler = self
                 .renderer
                 .sampler_for(layer.no_interpolation, layer.clamp_uvs);
+            // Effects reference their owner by raw scene-object index
+            // (layer.order_index), NOT by position in `self.layers` —
+            // positional matching applied effects to whichever layer
+            // happened to share the count once particles/skipped objects
+            // offset the two spaces.
+            let obj_index = layer.order_index;
             let has_effects = self
                 .scene_effects
                 .iter()
-                .any(|inst| inst.layer_idx == layer_idx);
+                .any(|inst| inst.layer_idx == obj_index);
 
             // Base material pass (genericimage3-equivalent): reference always
             // renders `texture * g_Color4` into the object's own FBO *before*
@@ -1534,6 +1557,7 @@ impl GpuSceneInstance {
                         0.0,
                         FULLSCREEN_RECT,
                         1.0,
+                        [1.0, 1.0],
                     ),
                     64,
                 );
@@ -1560,7 +1584,7 @@ impl GpuSceneInstance {
                 .scene_effects
                 .iter()
                 .enumerate()
-                .filter(|(_, inst)| inst.layer_idx == layer_idx)
+                .filter(|(_, inst)| inst.layer_idx == obj_index)
             {
                 let Some(runtime) = self
                     .effect_runtimes
@@ -1708,6 +1732,7 @@ impl GpuSceneInstance {
                     layer.angle,
                     layer.rect,
                     self.width as f32 / self.height as f32,
+                    [self.width as f32, self.height as f32],
                 ),
                 64,
             );
@@ -1787,8 +1812,14 @@ impl GpuSceneInstance {
         let bw = (max_x - min_x).ceil().max(1.0) as u32;
         let bh = (max_y - min_y).ceil().max(1.0) as u32;
 
+        let additive = self.particle_additive.get(idx).copied().unwrap_or(false);
         let mut buf = RgbaImage::new(bw, bh);
-        system.render_onto(&mut buf, self.particle_sprites[idx].as_ref(), [min_x, min_y]);
+        system.render_onto_blended(
+            &mut buf,
+            self.particle_sprites[idx].as_ref(),
+            [min_x, min_y],
+            additive,
+        );
         let tex = self.renderer.upload_texture(&buf);
         let view = tex.create_view(&Default::default());
         let sampler = self.renderer.sampler_for(false, false);
@@ -1806,24 +1837,50 @@ impl GpuSceneInstance {
             bw as f32 / self.width as f32,
             bh as f32 / self.height as f32,
         ];
+        // Additive particle materials (fog/smoke/embers/rain/lightning — the
+        // overwhelming majority of real particle materials) need the
+        // dest-read blend pipeline. Mode 30 is our pure premultiplied add:
+        // the rasterizer above already accumulated `src * src_a` per
+        // particle (the reference's GL_SRC_ALPHA/GL_ONE quad blending), so
+        // the composite adds the buffer's RGB to the scene as-is. Plain
+        // alpha-over (mode 0) otherwise makes a sprite's near-black
+        // background visibly darken/box the scene instead of contributing
+        // nothing, since particle compositing previously always used mode 0.
+        const BLEND_MODE_PARTICLE_ADD: i32 = 30;
+        let mode = if additive { BLEND_MODE_PARTICLE_ADD } else { 0 };
         let composite_buf = self.renderer.make_uniform_buffer(
             &composite_params(
                 1.0,
-                0,
+                mode,
                 [0.0, 0.0],
                 [1.0, 1.0, 1.0],
                 0.0,
                 rect,
                 self.width as f32 / self.height as f32,
+                [self.width as f32, self.height as f32],
             ),
             64,
         );
+        let extra: Vec<Option<wgpu::TextureView>> = if additive {
+            encoder.copy_texture_to_texture(
+                self.target.as_image_copy(),
+                self.scene_copy.as_image_copy(),
+                wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            vec![Some(self.scene_copy.create_view(&Default::default()))]
+        } else {
+            vec![]
+        };
         let base_bg = self
             .renderer
-            .make_base_bind_group(&view, sampler, &composite_buf, &[]);
+            .make_base_bind_group(&view, sampler, &composite_buf, &extra);
         self.renderer.run_pass(
             encoder,
-            self.renderer.composite_pipeline(0),
+            self.renderer.composite_pipeline(mode as u32),
             &base_bg,
             None,
             target_view,
@@ -1942,6 +1999,20 @@ impl GpuSceneInstance {
     /// fallback paths).
     pub fn render_rgba(&mut self) -> Result<RgbaImage> {
         self.render();
+        // Temporary debug hook: dump every pooled render target to PNG.
+        if std::env::var("WP_DEBUG_DUMP_FBOS").is_ok() {
+            for (name, rt) in self.fbo_pool.iter() {
+                if let Ok(img) = self.renderer.readback(&rt.texture, rt.width, rt.height) {
+                    let safe = name.replace([':', '/'], "_");
+                    let _ = img.save(format!("/tmp/fbo_{safe}.png"));
+                    let mut a = img.clone();
+                    for p in a.pixels_mut() {
+                        p.0 = [p.0[3], p.0[3], p.0[3], 255];
+                    }
+                    let _ = a.save(format!("/tmp/fbo_{safe}_alpha.png"));
+                }
+            }
+        }
         self.renderer
             .readback(&self.target, self.width, self.height)
     }
@@ -2029,9 +2100,10 @@ fn composite_params(
     angle: f32,
     rect: [f32; 4],
     aspect: f32,
+    resolution: [f32; 2],
 ) -> [u8; 64] {
     // WGSL CompositeParams layout: opacity@0, mode@4, uv_offset@8, color@16,
-    // angle@28, rect@32, aspect@48.
+    // angle@28, rect@32, aspect@48, resolution@56 (bytes 52-55 are padding).
     let mut data = [0u8; 64];
     data[0..4].copy_from_slice(&opacity.to_le_bytes());
     data[4..8].copy_from_slice(&mode.to_le_bytes());
@@ -2045,12 +2117,16 @@ fn composite_params(
         data[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     data[48..52].copy_from_slice(&aspect.to_le_bytes());
+    data[56..60].copy_from_slice(&resolution[0].to_le_bytes());
+    data[60..64].copy_from_slice(&resolution[1].to_le_bytes());
     data
 }
 
 /// Fullscreen rect: centered, full extents.
 const FULLSCREEN_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
+/// Always mode 0 (`fs_composite`, never reads `dest_copy_tex`), so the
+/// resolution field is unused — a dummy value is harmless here.
 fn passthrough_composite_params() -> [u8; 64] {
     composite_params(
         1.0,
@@ -2060,6 +2136,7 @@ fn passthrough_composite_params() -> [u8; 64] {
         0.0,
         FULLSCREEN_RECT,
         1.0,
+        [1.0, 1.0],
     )
 }
 
@@ -2281,6 +2358,14 @@ fn load_effect_instance(
             }
         };
         let key = format!("fx{instance_idx}:{effect_name}#{pass_idx}");
+        // Temporary debug hook: dump translated WGSL per pass.
+        if std::env::var("WP_DEBUG_DUMP_WGSL").is_ok() {
+            let safe = key.replace([':', '/', '#'], "_");
+            let _ = std::fs::write(format!("/tmp/wgsl_{safe}.frag.wgsl"), &translated.wgsl);
+            if let Some(v) = &translated.vert_wgsl {
+                let _ = std::fs::write(format!("/tmp/wgsl_{safe}.vert.wgsl"), v);
+            }
+        }
         let blend = wgpu_blend_state(&model.blending);
         let mut pipeline_attrs = translated.attributes.clone();
         let mut added = renderer.add_dynamic_pipeline(
@@ -2294,6 +2379,10 @@ fn load_effect_instance(
         if added.is_err() && !pipeline_attrs.is_empty() {
             // Real-VS pipeline failed (usually an interface mismatch the
             // preprocessor couldn't reconcile) — retry with the synthetic VS.
+            eprintln!(
+                "[effect] '{effect_name}' pass {pass_idx}: real VS failed ({}), synthetic fallback",
+                added.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+            );
             if let Ok(fallback) = transpiler::translate(&model) {
                 pipeline_attrs = Vec::new();
                 added = renderer.add_dynamic_pipeline(

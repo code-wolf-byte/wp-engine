@@ -110,4 +110,7 @@ impl RenderTargetPool {
     pub fn get_mut(&mut self, name: &str) -> Option<&mut RenderTarget> {
         self.targets.get_mut(name)
     }
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &RenderTarget)> {
+        self.targets.iter()
+    }
 }

@@ -53,10 +53,18 @@ pub struct ParticleLayer {
     /// sprite-sheet frame. `None` falls back to `render_onto`'s flat-color
     /// circle draw.
     pub sprite_texture: Option<particle::ParticleSprite>,
-    /// This object's position in `scene.visible_objects()` (already the
-    /// scene's topological/declaration render order) — lets render loops
-    /// interleave particle systems with image layers in true scene z-order
-    /// instead of drawing all particles after all images.
+    /// True when the material's own pass declares `"blending":"additive"`
+    /// (the overwhelming majority of real particle materials — fog, smoke,
+    /// embers, rain, lightning). Composited additively onto the scene
+    /// instead of the default alpha-over, which otherwise makes a sprite's
+    /// near-black background visibly darken/box the scene behind it.
+    pub additive_blend: bool,
+    /// This object's raw index in `scene.objects` (already the scene's
+    /// topological/declaration render order) — lets render loops interleave
+    /// particle systems with image layers in true scene z-order, and lets
+    /// effect instances (which record the same raw object index) find their
+    /// owning layer regardless of how many particles/skipped/invisible
+    /// objects precede it.
     pub order_index: usize,
 }
 
@@ -83,7 +91,7 @@ pub struct Layer {
     pub no_interpolation: bool,
     /// `.tex` `ClampUVs`/`ClampUVsBorder` flag: clamp-to-edge instead of repeat.
     pub clamp_uvs: bool,
-    /// This object's position in `scene.visible_objects()` — see
+    /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
 }
@@ -173,7 +181,13 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
-        for (obj_index, obj) in scene.visible_objects().enumerate() {
+        // Raw `scene.objects` index (not a visible-only count): effect
+        // instances record the same raw index, so layers and effects agree
+        // on object identity no matter what gets skipped in between.
+        for (obj_index, obj) in scene.objects.iter().enumerate() {
+            if !obj.is_visible() {
+                continue;
+            }
             if obj.particle.is_some() {
                 if let Some(mut pl) = particle_layer_from_object(obj, Some(dir), None) {
                     pl.order_index = obj_index;
@@ -240,7 +254,13 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
-        for (obj_index, obj) in scene.visible_objects().enumerate() {
+        // Raw `scene.objects` index (not a visible-only count): effect
+        // instances record the same raw index, so layers and effects agree
+        // on object identity no matter what gets skipped in between.
+        for (obj_index, obj) in scene.objects.iter().enumerate() {
+            if !obj.is_visible() {
+                continue;
+            }
             if obj.particle.is_some() {
                 if let Some(mut pl) = particle_layer_from_object(obj, Some(dir), Some(pkg)) {
                     pl.order_index = obj_index;
@@ -309,7 +329,13 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
-        for (obj_index, obj) in scene.visible_objects().enumerate() {
+        // Raw `scene.objects` index (not a visible-only count): effect
+        // instances record the same raw index, so layers and effects agree
+        // on object identity no matter what gets skipped in between.
+        for (obj_index, obj) in scene.objects.iter().enumerate() {
+            if !obj.is_visible() {
+                continue;
+            }
             if obj.particle.is_some() {
                 if let Some(mut pl) = particle_layer_from_object(obj, None, Some(pkg)) {
                     pl.order_index = obj_index;
@@ -413,7 +439,15 @@ impl ResolvedScene {
                     for _ in 0..150 {
                         system.step(1.0 / 30.0);
                     }
-                    system.render_onto(&mut canvas, pl.sprite_texture.as_ref(), [0.0, 0.0]);
+                    // The canvas here *is* the opaque scene, so additive
+                    // accumulation directly implements the reference's
+                    // GL_SRC_ALPHA/GL_ONE quad blending against it.
+                    system.render_onto_blended(
+                        &mut canvas,
+                        pl.sprite_texture.as_ref(),
+                        [0.0, 0.0],
+                        pl.additive_blend,
+                    );
                 }
             }
         }
@@ -706,13 +740,17 @@ fn particle_layer_from_object(
         .map(parse_parallax_depth)
         .unwrap_or([0.0, 0.0]);
 
-    let sprite_texture = config.material.as_deref().and_then(|mat_path| {
+    let resolved_sprite = config.material.as_deref().and_then(|mat_path| {
         if let Some(pkg) = pkg {
             resolve_particle_sprite_pkg(pkg, mat_path).ok()
         } else {
             dir.and_then(|dir| resolve_particle_sprite_dir(dir, mat_path).ok())
         }
     });
+    let additive_blend = resolved_sprite
+        .as_ref()
+        .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
+    let sprite_texture = resolved_sprite.map(|(sprite, _)| sprite);
 
     Some(ParticleLayer {
         name: obj.name.clone().unwrap_or_default(),
@@ -721,6 +759,7 @@ fn particle_layer_from_object(
         config,
         overrides,
         sprite_texture,
+        additive_blend,
         order_index: 0,
     })
 }
@@ -877,7 +916,11 @@ fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.join(rel_path)).ok()
 }
 
-fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<TexFile> {
+/// Returns the resolved texture plus the material pass's own `"blending"`
+/// string (e.g. `"additive"`), if any — particles need this to composite
+/// correctly (see `resolve_particle_sprite_{pkg,dir}`); plain image layers
+/// just discard it.
+fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, Option<String>)> {
     let data = pkg
         .get(json_path)
         .map(|d| d.to_vec())
@@ -892,6 +935,10 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<TexFile> {
 
     if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
         for pass in passes {
+            let blending = pass
+                .get("blending")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
@@ -901,8 +948,9 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<TexFile> {
                             .map(|d| d.to_vec())
                             .or_else(|| read_from_global_assets(&tex_path))
                         {
-                            return TexFile::parse(&tex_data)
-                                .with_context(|| format!("parsing {tex_path}"));
+                            let tex = TexFile::parse(&tex_data)
+                                .with_context(|| format!("parsing {tex_path}"))?;
+                            return Ok((tex, blending));
                         }
 
                         let alt_path = format!("{tex_name}.tex");
@@ -911,7 +959,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<TexFile> {
                             .map(|d| d.to_vec())
                             .or_else(|| read_from_global_assets(&alt_path))
                         {
-                            return TexFile::parse(&tex_data);
+                            return Ok((TexFile::parse(&tex_data)?, blending));
                         }
                     }
                 }
@@ -923,7 +971,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<TexFile> {
 }
 
 /// Follow the model -> material -> texture chain for loose files on disk.
-fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<TexFile> {
+fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>)> {
     let data = std::fs::read(dir.join(json_path))
         .ok()
         .or_else(|| read_from_global_assets(json_path))
@@ -937,6 +985,10 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<TexFile> {
 
     if let Some(passes) = val.get("passes").and_then(|v| v.as_array()) {
         for pass in passes {
+            let blending = pass
+                .get("blending")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
@@ -945,7 +997,7 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<TexFile> {
                             .ok()
                             .or_else(|| read_from_global_assets(&tex_path))
                         {
-                            return TexFile::parse(&tex_data);
+                            return Ok((TexFile::parse(&tex_data)?, blending));
                         }
                     }
                 }
@@ -957,34 +1009,51 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<TexFile> {
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
-    find_model_chain_tex_pkg(pkg, json_path)?.to_rgba()
+    find_model_chain_tex_pkg(pkg, json_path)?.0.to_rgba()
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
-    find_model_chain_tex_dir(dir, json_path)?.to_rgba()
+    find_model_chain_tex_dir(dir, json_path)?.0.to_rgba()
 }
 
 /// Same model -> material -> texture chain as `resolve_model_chain_{pkg,dir}`,
 /// but for particle sprites: keeps every sprite-sheet frame (sliced from the
 /// `.tex`'s TEXS table, if any) instead of collapsing to one flat image, plus
 /// the animation's total loop duration so `ParticleSystem::set_sprite_frames`
-/// can drive per-particle frame advance.
-fn resolve_particle_sprite_pkg(pkg: &Package, json_path: &str) -> Result<particle::ParticleSprite> {
-    let tex = find_model_chain_tex_pkg(pkg, json_path)?;
+/// can drive per-particle frame advance, and the material pass's own
+/// `"blending"` string so the caller can composite additive-glow presets
+/// (fog/smoke/embers/rain/lightning — the overwhelming majority of real
+/// particle materials) correctly instead of always alpha-blending, which
+/// makes a sprite's near-black background visibly darken the scene instead
+/// of contributing nothing.
+fn resolve_particle_sprite_pkg(
+    pkg: &Package,
+    json_path: &str,
+) -> Result<(particle::ParticleSprite, Option<String>)> {
+    let (tex, blending) = find_model_chain_tex_pkg(pkg, json_path)?;
     let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
-    Ok(particle::ParticleSprite {
-        frames: tex.to_rgba_frames()?,
-        duration,
-    })
+    Ok((
+        particle::ParticleSprite {
+            frames: tex.to_particle_rgba_frames()?,
+            duration,
+        },
+        blending,
+    ))
 }
 
-fn resolve_particle_sprite_dir(dir: &Path, json_path: &str) -> Result<particle::ParticleSprite> {
-    let tex = find_model_chain_tex_dir(dir, json_path)?;
+fn resolve_particle_sprite_dir(
+    dir: &Path,
+    json_path: &str,
+) -> Result<(particle::ParticleSprite, Option<String>)> {
+    let (tex, blending) = find_model_chain_tex_dir(dir, json_path)?;
     let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
-    Ok(particle::ParticleSprite {
-        frames: tex.to_rgba_frames()?,
-        duration,
-    })
+    Ok((
+        particle::ParticleSprite {
+            frames: tex.to_particle_rgba_frames()?,
+            duration,
+        },
+        blending,
+    ))
 }
 
 fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
@@ -1121,6 +1190,7 @@ mod tests {
                 config: solid_particle_config("0 0 255"),
                 overrides: None,
                 sprite_texture: None,
+                additive_blend: false,
                 order_index: 0,
             },
             ParticleLayer {
@@ -1130,6 +1200,7 @@ mod tests {
                 config: solid_particle_config("0 255 0"),
                 overrides: None,
                 sprite_texture: None,
+                additive_blend: false,
                 order_index: 2,
             },
         ];
