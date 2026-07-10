@@ -127,9 +127,40 @@ pub struct Initializer {
     pub max: Option<serde_json::Value>,
     #[serde(default)]
     pub min: Option<serde_json::Value>,
+    /// `turbulentvelocityrandom` (CParticle.cpp
+    /// createTurbulentVelocityRandomInitializer): a curl-noise-directed
+    /// spawn velocity. `forward`/`right` are `"x y z"` vector strings;
+    /// `offset` here is the scalar tilt angle around `right`, unrelated to
+    /// an emitter's positional offset. `speedmin`/`speedmax` are untyped
+    /// because turbulentvelocityrandom uses plain numbers but
+    /// `mapsequencearoundcontrolpoint` uses `"x y z"` vector strings.
+    #[serde(default)]
+    pub speedmin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub speedmax: Option<serde_json::Value>,
+    /// `mapsequencearoundcontrolpoint`: spawn the Nth particle at the
+    /// control point, launched at angle `(N % count) / count * 2pi`.
+    #[serde(default)]
+    pub controlpoint: Option<i64>,
+    #[serde(default)]
+    pub count: Option<f64>,
+    #[serde(default)]
+    pub offset: Option<f64>,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub forward: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timescale: Option<f64>,
+    #[serde(default)]
+    pub phasemin: Option<f64>,
+    #[serde(default)]
+    pub phasemax: Option<f64>,
+    #[serde(default)]
+    pub right: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Operator {
     #[serde(default)]
     pub name: String,
@@ -188,6 +219,43 @@ pub struct Operator {
     pub drag: Option<f64>,
     #[serde(default)]
     pub force: Option<serde_json::Value>,
+    /// `turbulence` (CParticle.cpp createTurbulenceOperator): curl-noise
+    /// acceleration. Shares `scale`/`phasemin`/`phasemax` above.
+    #[serde(default)]
+    pub speedmin: Option<f64>,
+    #[serde(default)]
+    pub speedmax: Option<f64>,
+    #[serde(default)]
+    pub timescale: Option<f64>,
+    #[serde(default)]
+    pub mask: Option<serde_json::Value>,
+    /// `vortex` (CParticle.cpp createVortexOperator): tangential spin around
+    /// a control point. `flags`: 1 = infinite axis, 2 = maintain distance,
+    /// 4 = ring shape.
+    #[serde(default)]
+    pub flags: Option<serde_json::Value>,
+    #[serde(default)]
+    pub axis: Option<serde_json::Value>,
+    #[serde(default)]
+    pub offset: Option<serde_json::Value>,
+    #[serde(default)]
+    pub distanceinner: Option<f64>,
+    #[serde(default)]
+    pub distanceouter: Option<f64>,
+    #[serde(default)]
+    pub speedinner: Option<f64>,
+    #[serde(default)]
+    pub speedouter: Option<f64>,
+    #[serde(default)]
+    pub centerforce: Option<f64>,
+    #[serde(default)]
+    pub ringradius: Option<f64>,
+    #[serde(default)]
+    pub ringwidth: Option<f64>,
+    #[serde(default)]
+    pub ringpulldistance: Option<f64>,
+    #[serde(default)]
+    pub ringpullforce: Option<f64>,
 }
 
 /// Scene.json's per-instance `instanceoverride` on a particle object —
@@ -360,6 +428,94 @@ pub struct ParticleSystem {
     sprite_duration: f32,
     animation_mode: AnimationMode,
     sequence_multiplier: f32,
+    /// `rotationrandom` initializer range (z-axis component, radians) —
+    /// `None` leaves spawn rotation at 0, matching the reference's absent-
+    /// initializer default.
+    rotation_range: Option<(f32, f32)>,
+    /// `spritetrail` renderer parameters.
+    sprite_trail: Option<SpriteTrailParams>,
+    /// `mapsequencearoundcontrolpoint` initializer + its running sequence
+    /// counter (shared across spawns, wraps at `count`).
+    map_sequence: Option<MapSequenceParams>,
+    map_sequence_index: u32,
+    /// `turbulentvelocityrandom` initializer parameters.
+    turbulent_velocity: Option<TurbulentVelocityParams>,
+    /// `turbulence` operator parameters.
+    turbulence: Option<TurbulenceParams>,
+    /// `vortex` operator parameters.
+    vortex: Option<VortexParams>,
+    /// Simulation clock (sum of `step` dts) — drives the time-scrolled
+    /// noise fields, the reference's `m_time`/`currentTime`.
+    time: f32,
+}
+
+/// `turbulentvelocityrandom` (CParticle.cpp): spawn velocity picked from a
+/// curl-noise field, angle-limited around `forward`.
+#[derive(Clone, Copy)]
+struct TurbulentVelocityParams {
+    speed_min: f32,
+    speed_max: f32,
+    /// Tilt angle (radians) around `right`.
+    offset: f32,
+    /// Direction cone: `< 2` limits deviation from `forward` to
+    /// `scale/2 * pi`.
+    scale: f32,
+    forward: [f32; 3],
+    right: [f32; 3],
+    timescale: f32,
+    phase_min: f32,
+    phase_max: f32,
+}
+
+/// `turbulence` operator (CParticle.cpp): curl-noise acceleration. `phase`
+/// and `speed` are drawn once per operator instance, not per particle.
+#[derive(Clone, Copy)]
+struct TurbulenceParams {
+    noise_scale: f32,
+    timescale: f32,
+    mask: [f32; 3],
+    phase: f32,
+    speed: f32,
+}
+
+/// `spritetrail` renderer: velocity-aligned, velocity-stretched sprite quad.
+#[derive(Clone, Copy)]
+struct SpriteTrailParams {
+    length: f32,
+    max_length: f32,
+    min_length: f32,
+}
+
+/// `mapsequencearoundcontrolpoint` initializer (CParticle.cpp): spawns each
+/// particle at the control point with a velocity rotated by the next angle
+/// in an evenly-divided circle (`sequence / count * 2pi`).
+#[derive(Clone, Copy)]
+struct MapSequenceParams {
+    control_point: usize,
+    count: u32,
+    speed_min: [f32; 3],
+    speed_max: [f32; 3],
+}
+
+/// `vortex` operator (CParticle.cpp): tangential spin around a control
+/// point, with optional ring shape and center attraction.
+#[derive(Clone, Copy)]
+struct VortexParams {
+    control_point: i64,
+    infinite_axis: bool,
+    maintain_distance: bool,
+    ring_shape: bool,
+    axis: [f32; 3],
+    offset: [f32; 3],
+    distance_inner: f32,
+    distance_outer: f32,
+    speed_inner: f32,
+    speed_outer: f32,
+    center_force: f32,
+    ring_radius: f32,
+    ring_width: f32,
+    ring_pull_distance: f32,
+    ring_pull_force: f32,
 }
 
 struct EmitterState {
@@ -396,7 +552,7 @@ impl ParticleSystem {
                 let local_origin = parse_f32_vec3(e.origin.as_deref());
                 let directions = parse_f32_vec3(e.directions.as_deref());
                 let sign = parse_f32_vec3(e.sign.as_deref());
-                let is_sphere = e.name.contains("sphere");
+                let is_sphere = e.name == "sphererandom";
 
                 // Sphere emitters use a scalar radius for distancemin/max;
                 // box emitters use an "x y z" extent vector — mixing the two
@@ -445,23 +601,24 @@ impl ParticleSystem {
         };
 
         let (life_min, life_max) =
-            scalar_range_from_initializers(&config.initializer, "lifetime", 2.0, 6.0);
+            scalar_range_from_initializers(&config.initializer, "lifetimerandom", 2.0, 6.0);
         let (size_min, size_max) =
-            scalar_range_from_initializers(&config.initializer, "size", 2.0, 6.0);
+            scalar_range_from_initializers(&config.initializer, "sizerandom", 2.0, 6.0);
         let (alpha_min, alpha_max) =
-            scalar_range_from_initializers(&config.initializer, "alpha", 1.0, 1.0);
-        let velocity_range = vec3_range_from_initializers(&config.initializer, "velocity");
+            scalar_range_from_initializers(&config.initializer, "alpharandom", 1.0, 1.0);
+        let velocity_range = vec3_range_from_initializers(&config.initializer, "velocityrandom");
         let (velocity_min, velocity_max) = match velocity_range {
             Some((min, max)) => (Some(min), Some(max)),
             None => (None, None),
         };
-        let (color_min, color_max) = vec3_range_from_initializers(&config.initializer, "color")
-            .unwrap_or(([255.0; 3], [255.0; 3]));
+        let (color_min, color_max) =
+            vec3_range_from_initializers(&config.initializer, "colorrandom")
+                .unwrap_or(([255.0; 3], [255.0; 3]));
 
         let gravity = config
             .operator
             .iter()
-            .find(|op| op.name.contains("movement"))
+            .find(|op| op.name == "movement")
             .and_then(|op| op.gravity.as_deref())
             .map(|s| parse_f32_vec3(Some(s)))
             .map(|v| [v[0], v[1]])
@@ -475,7 +632,7 @@ impl ParticleSystem {
         let alphafade = config
             .operator
             .iter()
-            .find(|op| op.name.contains("alphafade"))
+            .find(|op| op.name == "alphafade")
             .map(|op| {
                 (
                     op.fadeintime.unwrap_or(0.0) as f32,
@@ -486,7 +643,7 @@ impl ParticleSystem {
             config
                 .operator
                 .iter()
-                .find(|op| op.name.contains(name))
+                .find(|op| op.name == name)
                 .map(|op| {
                     (
                         op.starttime.unwrap_or(0.0) as f32,
@@ -501,7 +658,7 @@ impl ParticleSystem {
         let colorchange = config
             .operator
             .iter()
-            .find(|op| op.name.contains("colorchange"))
+            .find(|op| op.name == "colorchange")
             .map(|op| {
                 (
                     op.starttime.unwrap_or(0.0) as f32,
@@ -520,7 +677,7 @@ impl ParticleSystem {
             config
                 .operator
                 .iter()
-                .find(|op| op.name.contains(name))
+                .find(|op| op.name == name)
                 .map(OscillateParams::from_operator)
         };
         let oscillate_alpha = oscillate_op("oscillatealpha");
@@ -551,7 +708,7 @@ impl ParticleSystem {
         let control_point_attract = config
             .operator
             .iter()
-            .find(|op| op.name.contains("controlpointattract"))
+            .find(|op| op.name == "controlpointattract")
             .map(|op| {
                 let idx = op.controlpoint.unwrap_or(0).max(0) as usize;
                 let origin = op
@@ -577,6 +734,27 @@ impl ParticleSystem {
             .unwrap_or(1)
             .max(1) as usize;
 
+        // `spritetrail` renderer: each particle draws as a quad stretched
+        // along its velocity by `clamp(|v| * length, minlength, maxlength)`
+        // (genericparticle.vert's TRAILRENDERER `ComputeParticleTrailTangents`;
+        // parser defaults from ObjectParser::parseParticleRenderer).
+        let sprite_trail = config
+            .renderer
+            .iter()
+            .find(|r| {
+                r.get("name").and_then(|n| n.as_str()) == Some("spritetrail")
+            })
+            .map(|r| {
+                let f = |key: &str, default: f32| -> f32 {
+                    r.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
+                };
+                SpriteTrailParams {
+                    length: f("length", 0.05),
+                    max_length: f("maxlength", 10.0),
+                    min_length: f("minlength", 0.0),
+                }
+            });
+
         // `angularvelocityrandom`'s min/max are vec3 (reference default
         // `(0,0,-5)`/`(0,0,5)`) — we only model the z-axis (screen-space)
         // component, matching how `rotation.z` is the only axis our flat
@@ -584,7 +762,7 @@ impl ParticleSystem {
         let (angular_velocity_min, angular_velocity_max) = config
             .initializer
             .iter()
-            .find(|init| init.name.contains("angularvelocity"))
+            .find(|init| init.name == "angularvelocityrandom")
             .map(|init| {
                 let min = init.min.as_ref().and_then(value_as_vec3).unwrap_or([0.0, 0.0, -5.0]);
                 let max = init.max.as_ref().and_then(value_as_vec3).unwrap_or([0.0, 0.0, 5.0]);
@@ -595,13 +773,139 @@ impl ParticleSystem {
         let angular_op = config
             .operator
             .iter()
-            .find(|op| op.name.contains("angularmovement"));
+            .find(|op| op.name == "angularmovement");
         let angular_drag = angular_op.and_then(|op| op.drag).unwrap_or(0.0) as f32;
         let angular_force = angular_op
             .and_then(|op| op.force.as_ref())
             .and_then(value_as_vec3)
             .map(|v| v[2])
             .unwrap_or(0.0);
+
+        // `rotationrandom`: z component of the random vec3 (our renderer is
+        // flat 2D, same reduction as `angularvelocityrandom`). Reference
+        // defaults: min (0,0,0), max (0,0,2pi).
+        let rotation_range = config
+            .initializer
+            .iter()
+            .find(|init| init.name == "rotationrandom")
+            .map(|init| {
+                let min = init.min.as_ref().and_then(value_as_vec3).unwrap_or([0.0; 3]);
+                let max = init
+                    .max
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0, 0.0, std::f32::consts::TAU]);
+                (min[2], max[2])
+            });
+
+        let turbulent_velocity = config
+            .initializer
+            .iter()
+            .find(|init| init.name == "turbulentvelocityrandom")
+            .map(|init| TurbulentVelocityParams {
+                speed_min: init
+                    .speedmin
+                    .as_ref()
+                    .and_then(value_as_f32)
+                    .unwrap_or(100.0),
+                speed_max: init
+                    .speedmax
+                    .as_ref()
+                    .and_then(value_as_f32)
+                    .unwrap_or(250.0),
+                offset: init.offset.unwrap_or(0.0) as f32,
+                scale: init.scale.unwrap_or(1.0) as f32,
+                forward: init
+                    .forward
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0, 1.0, 0.0]),
+                timescale: init.timescale.unwrap_or(1.0) as f32,
+                phase_min: init.phasemin.unwrap_or(0.0) as f32,
+                phase_max: init.phasemax.unwrap_or(0.1) as f32,
+                right: init
+                    .right
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0, 0.0, 1.0]),
+            });
+
+        // `turbulence`: phase and speed are randomized once per operator
+        // instance (the reference draws them in the factory, not per
+        // particle or per frame).
+        let turbulence = config
+            .operator
+            .iter()
+            .find(|op| op.name == "turbulence")
+            .map(|op| {
+                let phase_min = op.phasemin.unwrap_or(0.0) as f32;
+                let phase_max = op.phasemax.unwrap_or(0.0) as f32;
+                let speed_min = op.speedmin.unwrap_or(500.0) as f32;
+                let speed_max = op.speedmax.unwrap_or(1000.0) as f32;
+                TurbulenceParams {
+                    noise_scale: op.scale.unwrap_or(0.005) as f32 * 2.0,
+                    timescale: op.timescale.unwrap_or(0.01) as f32,
+                    mask: op
+                        .mask
+                        .as_ref()
+                        .and_then(value_as_vec3)
+                        .unwrap_or([1.0, 1.0, 0.0]),
+                    phase: phase_min + fastrand::f32() * (phase_max - phase_min).max(0.0),
+                    speed: speed_min + fastrand::f32() * (speed_max - speed_min).max(0.0),
+                }
+            });
+
+        let map_sequence = config
+            .initializer
+            .iter()
+            .find(|init| init.name == "mapsequencearoundcontrolpoint")
+            .map(|init| MapSequenceParams {
+                control_point: init.controlpoint.unwrap_or(0).max(0) as usize,
+                count: (init.count.unwrap_or(1.0) as u32).max(1),
+                speed_min: init
+                    .speedmin
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0; 3]),
+                speed_max: init
+                    .speedmax
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([100.0; 3]),
+            });
+
+        let vortex = config
+            .operator
+            .iter()
+            .find(|op| op.name == "vortex" || op.name == "vortex_v2")
+            .map(|op| {
+                let flags = op.flags.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
+                VortexParams {
+                    control_point: op.controlpoint.unwrap_or(0),
+                    infinite_axis: flags & 1 != 0,
+                    maintain_distance: flags & 2 != 0,
+                    ring_shape: flags & 4 != 0,
+                    axis: op
+                        .axis
+                        .as_ref()
+                        .and_then(value_as_vec3)
+                        .unwrap_or([0.0, 0.0, 1.0]),
+                    offset: op
+                        .offset
+                        .as_ref()
+                        .and_then(value_as_vec3)
+                        .unwrap_or([0.0; 3]),
+                    distance_inner: op.distanceinner.unwrap_or(500.0) as f32,
+                    distance_outer: op.distanceouter.unwrap_or(650.0) as f32,
+                    speed_inner: op.speedinner.unwrap_or(2500.0) as f32,
+                    speed_outer: op.speedouter.unwrap_or(0.0) as f32,
+                    center_force: op.centerforce.unwrap_or(1.0) as f32,
+                    ring_radius: op.ringradius.unwrap_or(300.0) as f32,
+                    ring_width: op.ringwidth.unwrap_or(50.0) as f32,
+                    ring_pull_distance: op.ringpulldistance.unwrap_or(50.0) as f32,
+                    ring_pull_force: op.ringpullforce.unwrap_or(10.0) as f32,
+                }
+            });
 
         Self {
             particles: Vec::with_capacity(max_count),
@@ -646,6 +950,14 @@ impl ParticleSystem {
                 .map(|v| v as f32)
                 .filter(|v| *v > 0.0)
                 .unwrap_or(1.0),
+            rotation_range,
+            sprite_trail,
+            map_sequence,
+            map_sequence_index: 0,
+            turbulent_velocity,
+            turbulence,
+            vortex,
+            time: 0.0,
         }
     }
 
@@ -661,9 +973,110 @@ impl ParticleSystem {
     }
 
     pub fn step(&mut self, dt: f32) {
+        self.time += dt;
         for p in &mut self.particles {
             p.vx += self.gravity[0] * dt;
             p.vy += self.gravity[1] * dt;
+
+            // `turbulence` operator (CParticle.cpp createTurbulenceOperator):
+            // normalized curl-noise direction, sampled at a time-scrolled,
+            // scaled particle position, masked per axis, added to velocity.
+            if let Some(t) = self.turbulence {
+                if t.speed > 0.0001 {
+                    let noise_pos = [
+                        (p.x + t.phase + t.timescale * self.time) * t.noise_scale,
+                        p.y * t.noise_scale,
+                        0.0,
+                    ];
+                    let curl = crate::engine::noise::curl_noise(noise_pos);
+                    let len = vec3_length(curl);
+                    if len > 0.0001 {
+                        let s = t.speed / len * dt * self.speed_mult;
+                        p.vx += curl[0] * t.mask[0] * s;
+                        p.vy += curl[1] * t.mask[1] * s;
+                    }
+                }
+            }
+
+            // `vortex` operator (CParticle.cpp createVortexOperator).
+            if let Some(v) = self.vortex {
+                let center_base = self
+                    .control_points
+                    .get(v.control_point.max(0) as usize)
+                    .copied()
+                    .unwrap_or([0.0; 3]);
+                let center = [
+                    center_base[0] + v.offset[0],
+                    center_base[1] + v.offset[1],
+                    center_base[2] + v.offset[2],
+                ];
+                let axis = vec3_normalize_or(v.axis, [0.0, 0.0, 1.0]);
+                let to_particle = [p.x - center[0], p.y - center[1], -center[2]];
+
+                // Infinite axis: cylinder shape (project out the axis
+                // component); else full 3D distance (sphere shape).
+                let radial = if v.infinite_axis {
+                    let axial = vec3_dot(to_particle, axis);
+                    [
+                        to_particle[0] - axis[0] * axial,
+                        to_particle[1] - axis[1] * axial,
+                        to_particle[2] - axis[2] * axial,
+                    ]
+                } else {
+                    to_particle
+                };
+                let distance = vec3_length(radial);
+
+                let tangent = vec3_cross(axis, radial);
+                let tangent_len = vec3_length(tangent);
+                if tangent_len > 0.001 {
+                    let tangent = [
+                        tangent[0] / tangent_len,
+                        tangent[1] / tangent_len,
+                        tangent[2] / tangent_len,
+                    ];
+
+                    let mut speed = 0.0;
+                    let mut radial_force = [0.0f32; 3];
+                    if v.ring_shape {
+                        let ring_inner = v.ring_radius - v.ring_width * 0.5;
+                        let ring_outer = v.ring_radius + v.ring_width * 0.5;
+                        if distance < ring_inner {
+                            // Hollow center: no spin.
+                        } else if distance <= ring_outer {
+                            let t = (distance - ring_inner) / v.ring_width;
+                            speed = v.speed_inner + (v.speed_outer - v.speed_inner) * t;
+                        } else if distance <= ring_outer + v.ring_pull_distance {
+                            let pull_t = (distance - ring_outer) / v.ring_pull_distance;
+                            speed = v.speed_outer * (1.0 - pull_t);
+                            if distance > 0.001 {
+                                let toward = vec3_normalize_or(radial, [0.0; 3]);
+                                let f = -v.ring_pull_force * pull_t;
+                                radial_force = [toward[0] * f, toward[1] * f, toward[2] * f];
+                            }
+                        }
+                    } else {
+                        let dis_mid = v.distance_outer - v.distance_inner + 0.1;
+                        speed = if dis_mid < 0.0 || distance < v.distance_inner {
+                            v.speed_inner
+                        } else if distance > v.distance_outer {
+                            v.speed_outer
+                        } else {
+                            let t = (distance - v.distance_inner) / dis_mid;
+                            v.speed_inner + (v.speed_outer - v.speed_inner) * t
+                        };
+                    }
+
+                    let k = dt * self.speed_mult;
+                    p.vx += (tangent[0] * speed + radial_force[0]) * k;
+                    p.vy += (tangent[1] * speed + radial_force[1]) * k;
+                    if v.maintain_distance && distance > 0.001 {
+                        let toward = vec3_normalize_or(radial, [0.0; 3]);
+                        p.vx -= toward[0] * v.center_force * k;
+                        p.vy -= toward[1] * v.center_force * k;
+                    }
+                }
+            }
 
             // Position-oscillate integrates a velocity (derivative of
             // scale*cos(w*t+phase)) into position each frame, matching
@@ -824,7 +1237,7 @@ impl ParticleSystem {
                 let ox = emitter.origin[0];
                 let oy = emitter.origin[1];
 
-                let (vx, vy) = if let (Some(min), Some(max)) =
+                let (mut vx, mut vy) = if let (Some(min), Some(max)) =
                     (self.velocity_min, self.velocity_max)
                 {
                     (
@@ -854,6 +1267,91 @@ impl ParticleSystem {
                 };
 
                 let (spread_x, spread_y) = (emitter.spread[0], emitter.spread[1]);
+                let mut spawn_x = ox + (fastrand::f32() - 0.5) * spread_x;
+                let mut spawn_y = oy + (fastrand::f32() - 0.5) * spread_y;
+
+                // `mapsequencearoundcontrolpoint` (CParticle.cpp): spawn at
+                // the control point, launching successive particles at
+                // evenly-spaced angles around a circle (the initializer
+                // *assigns* position/velocity, unlike the additive ones).
+                if let Some(ms) = self.map_sequence {
+                    let angle = (self.map_sequence_index as f32 / ms.count as f32)
+                        * std::f32::consts::TAU;
+                    self.map_sequence_index = (self.map_sequence_index + 1) % ms.count;
+                    if let Some(cp) = self.control_points.get(ms.control_point) {
+                        spawn_x = cp[0];
+                        spawn_y = cp[1];
+                    }
+                    let sx = ms.speed_min[0]
+                        + fastrand::f32() * (ms.speed_max[0] - ms.speed_min[0]).max(0.0);
+                    let sy = ms.speed_min[1]
+                        + fastrand::f32() * (ms.speed_max[1] - ms.speed_min[1]).max(0.0);
+                    let (sin, cos) = angle.sin_cos();
+                    // The reference's glm::mat3 is column-major:
+                    // v' = (cos*x + sin*y, -sin*x + cos*y).
+                    vx = (cos * sx + sin * sy) * self.speed_mult;
+                    vy = (-sin * sx + cos * sy) * self.speed_mult;
+                }
+
+                // `turbulentvelocityrandom` (CParticle.cpp): curl-noise
+                // spawn velocity, angle-limited around `forward`, added on
+                // top of any plain `velocityrandom` contribution.
+                if let Some(t) = self.turbulent_velocity {
+                    let forward = vec3_normalize_or(t.forward, [0.0, 1.0, 0.0]);
+                    let right = vec3_normalize_or(t.right, [1.0, 0.0, 0.0]);
+                    let speed =
+                        t.speed_min + fastrand::f32() * (t.speed_max - t.speed_min).max(0.0);
+                    let phase =
+                        t.phase_min + fastrand::f32() * (t.phase_max - t.phase_min).max(0.0);
+                    let time_shift = self.time * t.timescale;
+                    let sample = [
+                        spawn_x * 0.1 + time_shift + phase,
+                        spawn_y * 0.1 + time_shift + phase * 0.7,
+                        time_shift + phase * 1.3,
+                    ];
+                    let curl = crate::engine::noise::curl_noise(sample);
+                    let mut dir = vec3_normalize_or(curl, forward);
+
+                    // `scale` < 2 limits how far the direction may deviate
+                    // from `forward` (normalized angle, max = scale/2).
+                    if t.scale < 2.0 {
+                        let cos_angle = vec3_dot(dir, forward).clamp(-1.0, 1.0);
+                        let angle = cos_angle.acos() / std::f32::consts::PI;
+                        let max_angle = t.scale / 2.0;
+                        if angle > max_angle && max_angle > 0.0001 {
+                            let axis = vec3_cross(dir, forward);
+                            if vec3_length(axis) > 0.0001 {
+                                let axis = vec3_normalize_or(axis, [0.0, 0.0, 1.0]);
+                                let rot = (angle - max_angle) * std::f32::consts::PI;
+                                dir = vec3_rotate_axis(dir, axis, rot);
+                            }
+                        }
+                    }
+
+                    // `offset` tilts the result around `right`.
+                    if t.offset.abs() > 0.0001 {
+                        dir = vec3_rotate_axis(dir, right, -t.offset);
+                    }
+
+                    // 2D particles: project onto the XY plane and
+                    // renormalize (the reference's `flags & 4 == 0` branch —
+                    // our renderer is always orthographic/2D).
+                    dir[2] = 0.0;
+                    let dir = vec3_normalize_or(dir, forward);
+
+                    vx += dir[0] * speed * self.speed_mult;
+                    vy += dir[1] * speed * self.speed_mult;
+                }
+
+                // `rotationrandom`: uniform in [min.z, max.z], scaled by the
+                // instance speed override (the reference multiplies rotation
+                // by `speedOverride` too, odd as that reads).
+                let spawn_rotation = self
+                    .rotation_range
+                    .map(|(min, max)| {
+                        (min + fastrand::f32() * (max - min).max(0.0)) * self.speed_mult
+                    })
+                    .unwrap_or(0.0);
 
                 let color = self.color_override.unwrap_or_else(|| {
                     [
@@ -870,8 +1368,8 @@ impl ParticleSystem {
                     * self.alpha_mult;
 
                 self.particles.push(Particle {
-                    x: ox + (fastrand::f32() - 0.5) * spread_x,
-                    y: oy + (fastrand::f32() - 0.5) * spread_y,
+                    x: spawn_x,
+                    y: spawn_y,
                     vx,
                     vy,
                     life,
@@ -897,7 +1395,7 @@ impl ParticleSystem {
                             phase: [a.phase, b.phase],
                         }
                     }),
-                    rotation: 0.0,
+                    rotation: spawn_rotation,
                     angular_velocity: self.angular_velocity_min
                         + fastrand::f32() * (self.angular_velocity_max - self.angular_velocity_min),
                     frame: -1.0,
@@ -984,8 +1482,28 @@ impl ParticleSystem {
                     0
                 };
                 let tex = &sprite.frames[frame_idx];
+                // `spritetrail`: align the quad's V axis with the particle's
+                // velocity and stretch it by clamp(|v|*length, min, max) —
+                // genericparticle.vert's TRAILRENDERER path, where `up` =
+                // normalized velocity scaled by that clamp and texture-top
+                // (v=0) points along it.
+                let (half_w, half_h, rotation) = match self.sprite_trail {
+                    Some(t) => {
+                        let vel_len = (p.vx * p.vx + p.vy * p.vy).sqrt();
+                        let trail = (vel_len * t.length)
+                            .clamp(t.min_length.min(t.max_length), t.max_length)
+                            .max(0.05);
+                        let angle = if vel_len > 0.0001 {
+                            p.vy.atan2(p.vx) + std::f32::consts::FRAC_PI_2
+                        } else {
+                            p.rotation
+                        };
+                        (p.size, p.size * trail, angle)
+                    }
+                    None => (p.size, p.size, p.rotation),
+                };
                 draw_textured_particle(
-                    canvas, px_pos, py_pos, p.size, p.rotation, p.color, alpha, tex, additive,
+                    canvas, px_pos, py_pos, half_w, half_h, rotation, p.color, alpha, tex, additive,
                 );
                 continue;
             }
@@ -1234,6 +1752,49 @@ fn wrap_angle(a: f32) -> f32 {
     a
 }
 
+// Minimal vec3 math for the turbulent/vortex ports (the reference uses glm;
+// pulling in a linear-algebra crate for five one-liners isn't worth it).
+
+fn vec3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn vec3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn vec3_length(v: [f32; 3]) -> f32 {
+    vec3_dot(v, v).sqrt()
+}
+
+/// Normalize, or return `fallback` for a (near-)zero vector — the
+/// reference's recurring `length > 0.0001 ? normalize(v) : default` guard.
+fn vec3_normalize_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let len = vec3_length(v);
+    if len > 0.0001 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        fallback
+    }
+}
+
+/// Rotate `v` by `angle` radians around unit-length `axis` (Rodrigues'
+/// formula — equivalent to the reference's `glm::rotate` mat3 use).
+fn vec3_rotate_axis(v: [f32; 3], axis: [f32; 3], angle: f32) -> [f32; 3] {
+    let (sin, cos) = angle.sin_cos();
+    let cross = vec3_cross(axis, v);
+    let dot = vec3_dot(axis, v) * (1.0 - cos);
+    [
+        v[0] * cos + cross[0] * sin + axis[0] * dot,
+        v[1] * cos + cross[1] * sin + axis[1] * dot,
+        v[2] * cos + cross[2] * sin + axis[2] * dot,
+    ]
+}
+
 /// Draws one particle as a rotated, textured quad: inverse-rotates each
 /// destination pixel in the quad's bounding box back into texture space,
 /// bilinear-samples, and composites tinted-by-`color`/scaled-by-`alpha_byte`
@@ -1242,11 +1803,13 @@ fn wrap_angle(a: f32) -> f32 {
 /// open-source reference repo) — this CPU inverse-mapping is our own design
 /// for the same visual effect.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn draw_textured_particle(
     canvas: &mut RgbaImage,
     cx: f32,
     cy: f32,
-    size: f32,
+    half_w: f32,
+    half_h: f32,
     rotation: f32,
     color: [u8; 3],
     alpha_byte: u8,
@@ -1256,14 +1819,16 @@ fn draw_textured_particle(
     // `p.size` is already a radius, not a diameter (see `sizerandom`'s
     // comment on the halving done at spawn) — matches the flat-color circle
     // draw's `sz = p.size` convention, so a particle looks the same size
-    // whether or not it has a material/texture.
-    let half = size.max(0.5);
+    // whether or not it has a material/texture. The two half-extents differ
+    // only for `spritetrail` quads (stretched along velocity).
+    let half_w = half_w.max(0.5);
+    let half_h = half_h.max(0.5);
     let cos_r = rotation.cos();
     let sin_r = rotation.sin();
 
     // Bounding box of the rotated quad: the diagonal half-extent covers any
     // rotation angle.
-    let diag = half * std::f32::consts::SQRT_2;
+    let diag = (half_w * half_w + half_h * half_h).sqrt();
     let w = canvas.width() as i32;
     let h = canvas.height() as i32;
     let min_x = ((cx - diag).floor() as i32).max(0);
@@ -1279,11 +1844,11 @@ fn draw_textured_particle(
             // (unrotated) local space.
             let lx = dx * cos_r + dy * sin_r;
             let ly = -dx * sin_r + dy * cos_r;
-            if lx < -half || lx > half || ly < -half || ly > half {
+            if lx < -half_w || lx > half_w || ly < -half_h || ly > half_h {
                 continue;
             }
-            let u = (lx + half) / (2.0 * half);
-            let v = (ly + half) / (2.0 * half);
+            let u = (lx + half_w) / (2.0 * half_w);
+            let v = (ly + half_h) / (2.0 * half_h);
             let sample = sample_bilinear(tex, u, v);
             let src_a = (sample[3] as f32 / 255.0) * (alpha_byte as f32 / 255.0);
             if src_a <= 0.0 {
@@ -1378,13 +1943,18 @@ fn fade_value(t: f32, start: f32, end: f32, start_val: f32, end_val: f32) -> f32
     }
 }
 
+/// Initializer names are matched exactly — they're fixed strings in the
+/// reference's ObjectParser, and substring matching let
+/// `turbulentvelocityrandom`/`angularvelocityrandom` shadow
+/// `velocityrandom` (or `angularmovement` shadow `movement`) depending on
+/// declaration order.
 fn scalar_range_from_initializers(
     initializers: &[Initializer],
-    needle: &str,
+    name: &str,
     default_min: f32,
     default_max: f32,
 ) -> (f32, f32) {
-    let Some(init) = initializers.iter().find(|init| init.name.contains(needle)) else {
+    let Some(init) = initializers.iter().find(|init| init.name == name) else {
         return (default_min, default_max);
     };
     (
@@ -1401,13 +1971,12 @@ fn scalar_range_from_initializers(
 
 /// Returns `Some((min, max))` when the named initializer exists and both
 /// bounds parse as a 3-component vector (e.g. `velocityrandom`/`colorrandom`).
+/// Exact-name matching for the same reason as `scalar_range_from_initializers`.
 fn vec3_range_from_initializers(
     initializers: &[Initializer],
-    needle: &str,
+    name: &str,
 ) -> Option<([f32; 3], [f32; 3])> {
-    let init = initializers
-        .iter()
-        .find(|init| init.name.contains(needle))?;
+    let init = initializers.iter().find(|init| init.name == name)?;
     let min = init.min.as_ref().and_then(value_as_vec3)?;
     let max = init.max.as_ref().and_then(value_as_vec3)?;
     Some((min, max))
@@ -1802,6 +2371,192 @@ mod tests {
         );
     }
 
+    /// `rotationrandom` with a degenerate `[min.z, max.z]` range must spawn
+    /// every particle at exactly that rotation (CParticle.cpp
+    /// createRotationRandomInitializer, z-axis reduction); absent, spawn
+    /// rotation stays 0.
+    #[test]
+    fn rotationrandom_sets_spawn_rotation() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [{"id":1,"name":"rotationrandom","min":"0 0 1","max":"0 0 1"}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(0.001);
+        assert!((sys.particles[0].rotation - 1.0).abs() < 1e-4);
+
+        let plain: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":1000}]}"#)
+                .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&plain, [0.0, 0.0], None);
+        sys.step(0.001);
+        assert_eq!(sys.particles[0].rotation, 0.0);
+    }
+
+    /// `turbulentvelocityrandom` adds a curl-noise-directed velocity of
+    /// magnitude in `[speedmin, speedmax]` on top of the plain velocity —
+    /// with a zero base velocity, the spawn speed must equal the turbulent
+    /// speed exactly (the direction is noise, the magnitude is not).
+    #[test]
+    fn turbulentvelocityrandom_sets_spawn_speed_magnitude() {
+        let json = r#"{
+            "maxcount": 8,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [
+                {"id":1,"name":"velocityrandom","min":"0 0 0","max":"0 0 0"},
+                {"id":2,"name":"turbulentvelocityrandom","speedmin":100,"speedmax":100}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(0.001);
+        assert!(!sys.particles.is_empty());
+        for p in &sys.particles {
+            let speed = (p.vx * p.vx + p.vy * p.vy).sqrt();
+            assert!(
+                (speed - 100.0).abs() < 0.5,
+                "expected turbulent spawn speed 100, got {speed}"
+            );
+        }
+    }
+
+    /// The `turbulence` operator must push otherwise-motionless particles
+    /// around (curl-noise acceleration, CParticle.cpp
+    /// createTurbulenceOperator).
+    #[test]
+    fn turbulence_operator_accelerates_particles() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [{"id":1,"name":"velocityrandom","min":"0 0 0","max":"0 0 0"}],
+            "operator": [{"id":1,"name":"turbulence","speedmin":500,"speedmax":500,"scale":0.01}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [10.0, 20.0], None);
+        for _ in 0..10 {
+            sys.step(1.0 / 30.0);
+        }
+        let moving = sys
+            .particles
+            .iter()
+            .any(|p| (p.vx * p.vx + p.vy * p.vy).sqrt() > 1.0);
+        assert!(moving, "turbulence should have accelerated particles");
+    }
+
+    /// `vortex` spins particles tangentially around its control point: a
+    /// particle at +X from the center with a +Z axis must gain +Y velocity
+    /// (cross(axis, radial)), scaled by speedinner inside distanceinner.
+    #[test]
+    fn vortex_operator_adds_tangential_velocity() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":0}],
+            "controlpoint": [{"id":0,"offset":"0 0 0"}],
+            "operator": [{"id":1,"name":"vortex","controlpoint":0,
+                          "distanceinner":500,"distanceouter":650,
+                          "speedinner":100,"speedouter":0}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.particles.push(make_particle(10.0, 0.0, 5.0, 0.0));
+        sys.step(0.1);
+        let p = &sys.particles[0];
+        assert!(
+            p.vy > 0.5,
+            "expected tangential +Y velocity from vortex, got vy={}",
+            p.vy
+        );
+        assert!(p.vx.abs() < 1e-3, "no radial force expected, got vx={}", p.vx);
+    }
+
+    /// `mapsequencearoundcontrolpoint` spawns at the control point and
+    /// launches successive particles at evenly-divided angles: with
+    /// `count: 4` and a +X-only speed, consecutive spawn velocities must
+    /// point right/down-rotated/left/up-rotated (the reference's clockwise
+    /// mat3), all with the same magnitude.
+    #[test]
+    fn mapsequence_spawns_at_control_point_with_rotating_velocity() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":100000}],
+            "controlpoint": [{"id":0,"offset":"50 60 0"}],
+            "initializer": [{"id":1,"name":"mapsequencearoundcontrolpoint",
+                             "controlpoint":0,"count":4,
+                             "speedmin":"80 0 0","speedmax":"80 0 0"}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(0.001);
+        assert!(sys.particles.len() >= 4, "expected at least 4 spawns");
+        for p in &sys.particles {
+            assert_eq!((p.x, p.y), (50.0, 60.0), "must spawn at the control point");
+            let speed = (p.vx * p.vx + p.vy * p.vy).sqrt();
+            assert!((speed - 80.0).abs() < 1e-3, "speed must stay 80, got {speed}");
+        }
+        // First two spawns: angle 0 (+X) then 2pi/4 = 90deg rotated.
+        assert!((sys.particles[0].vx - 80.0).abs() < 1e-3);
+        assert!(sys.particles[0].vy.abs() < 1e-3);
+        assert!(sys.particles[1].vx.abs() < 1e-3);
+        assert!(sys.particles[1].vy.abs() > 79.0);
+    }
+
+    /// `spritetrail` stretches the quad along the particle's velocity:
+    /// a fast horizontal particle must paint a footprint wider than tall
+    /// (its quad's long axis lies along X), unlike the square default.
+    #[test]
+    fn spritetrail_stretches_quad_along_velocity() {
+        let json = r#"{
+            "maxcount": 1,
+            "emitter": [{"name":"box","rate":0}],
+            "renderer": [{"name":"spritetrail","length":1.0,"maxlength":10}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        let mut p = make_particle(50.0, 50.0, 5.0, 0.0);
+        p.vx = 8.0; // trail = clamp(8 * 1.0, 0, 10) = 8 -> half-height 40 along X
+        let mut sys = sys;
+        sys.particles.push(p);
+
+        let tex = RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        let sprite = ParticleSprite::single(tex);
+        let mut canvas = RgbaImage::new(100, 100);
+        sys.render_onto(&mut canvas, Some(&sprite), [0.0, 0.0]);
+
+        let painted_x = canvas.get_pixel(80, 50)[3] > 0; // 30px right of center
+        let painted_y = canvas.get_pixel(50, 80)[3] > 0; // 30px below center
+        assert!(painted_x, "trail should extend along +X (velocity)");
+        assert!(!painted_y, "trail should stay narrow across velocity");
+    }
+
+    /// Name matching must be exact: `turbulentvelocityrandom` declared
+    /// before `velocityrandom` (and `angularmovement` before `movement`)
+    /// must not shadow them — the old substring matcher (`contains`)
+    /// read the turbulent initializer's fields as the plain velocity
+    /// range and the angular operator's (absent) gravity as movement's.
+    #[test]
+    fn similarly_named_initializers_do_not_shadow_each_other() {
+        let json = r#"{
+            "maxcount": 4,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [
+                {"id":1,"name":"turbulentvelocityrandom","speedmin":500,"speedmax":900},
+                {"id":2,"name":"velocityrandom","min":"3 3 0","max":"3 3 0"}
+            ],
+            "operator": [
+                {"id":1,"name":"angularmovement","drag":0.5},
+                {"id":2,"name":"movement","gravity":"0 -7 0"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        assert_eq!(sys.velocity_min, Some([3.0, 3.0, 0.0]));
+        assert_eq!(sys.velocity_max, Some([3.0, 3.0, 0.0]));
+        // WE Y-up gravity -7 maps to our Y-down +7.
+        assert_eq!(sys.gravity[1].abs(), 7.0);
+    }
+
     /// A config with no `alpharandom` initializer at all must stay a no-op
     /// (full alpha, matching `ParticleInstance::alpha`'s `1.0` default) —
     /// the common case, and the one that must not regress.
@@ -2023,25 +2778,10 @@ mod tests {
     fn oscillate_params_defaults_scale_min_from_scale_max_when_absent() {
         let op = Operator {
             name: "oscillatealpha".to_string(),
-            gravity: None,
-            fadeintime: None,
-            fadeouttime: None,
-            starttime: None,
-            endtime: None,
-            startvalue: None,
-            endvalue: None,
             frequencymin: Some(0.5),
             frequencymax: Some(1.0),
-            scalemin: None,
             scalemax: Some(10.0),
-            phasemin: None,
-            phasemax: None,
-            controlpoint: None,
-            origin: None,
-            scale: None,
-            threshold: None,
-            drag: None,
-            force: None,
+            ..Default::default()
         };
         let params = OscillateParams::from_operator(&op);
         assert_eq!(params.scale_min, 10.0);
@@ -2054,25 +2794,11 @@ mod tests {
     fn oscillate_sample_phase_covers_full_circle_when_unspecified() {
         let op = Operator {
             name: "oscillatealpha".to_string(),
-            gravity: None,
-            fadeintime: None,
-            fadeouttime: None,
-            starttime: None,
-            endtime: None,
-            startvalue: None,
-            endvalue: None,
             frequencymin: Some(1.0),
             frequencymax: Some(1.0),
             scalemin: Some(1.0),
             scalemax: Some(1.0),
-            phasemin: None,
-            phasemax: None,
-            controlpoint: None,
-            origin: None,
-            scale: None,
-            threshold: None,
-            drag: None,
-            force: None,
+            ..Default::default()
         };
         let params = OscillateParams::from_operator(&op);
         for _ in 0..50 {

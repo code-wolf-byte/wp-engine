@@ -18,6 +18,7 @@ pub mod gpu_renderer;
 pub mod graph;
 pub mod material;
 pub mod model;
+pub mod noise;
 pub mod particle;
 pub mod pass;
 pub mod pkg;
