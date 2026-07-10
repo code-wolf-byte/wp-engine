@@ -991,6 +991,11 @@ struct EffectPassRuntime {
     /// Pipeline lookup key: the effect name for hardcoded kernels,
     /// `"fx{instance}:{effect}#{pass}"` for translated WE shaders.
     key: String,
+    /// `dynamic_textures` lookup key. Equals `key` for translated shaders;
+    /// hardcoded kernels get their own `"fx{instance}:{effect}#0"` since
+    /// their pipeline `key` (the bare effect name) is shared across every
+    /// instance and would collide (e.g. two masked waterwaves on one layer).
+    tex_key: String,
     hardcoded: bool,
     /// Named FBO to render into (skips the ping-pong advance).
     target: Option<String>,
@@ -1641,7 +1646,7 @@ impl GpuSceneInstance {
                     // Extra texture slots: shader/material textures first,
                     // FBO binds override.
                     let mut extra: Vec<Option<wgpu::TextureView>> = vec![None; 6];
-                    if let Some(texs) = self.renderer.dynamic_textures.get(&pass.key) {
+                    if let Some(texs) = self.renderer.dynamic_textures.get(&pass.tex_key) {
                         for (i, tex) in texs.iter().enumerate().take(6) {
                             extra[i] = Some(tex.create_view(&Default::default()));
                             engine.resolutions[i + 1] = tex_res(tex);
@@ -2215,9 +2220,36 @@ fn load_effect_instance(
 ) -> Option<EffectRuntime> {
     let effect_name = &inst.name;
     if HARDCODED_EFFECTS.contains(&effect_name.as_str()) {
+        // Scene instances may override secondary texture slots (typically
+        // slot 1 = an opacity mask, e.g. waterwaves/shake masks) — load
+        // them under a per-instance key so the kernel's extra-slot binding
+        // sees the real mask instead of the white 1×1 dummy.
+        let tex_key = format!("fx{instance_idx}:{effect_name}#0");
+        let mut textures: Vec<wgpu::Texture> = Vec::new();
+        if let Some(over) = inst.pass_overrides.first() {
+            for name in over.textures.iter().skip(1) {
+                let img = name
+                    .as_deref()
+                    .filter(|n| !n.is_empty() && !n.starts_with("_rt_"))
+                    .and_then(|n| {
+                        let candidates = [format!("materials/{n}.tex"), format!("{n}.tex")];
+                        candidates.iter().find_map(|rel| {
+                            let bytes = resolver.read(rel)?;
+                            crate::engine::tex::TexFile::parse(&bytes).ok()?.to_rgba().ok()
+                        })
+                    });
+                textures.push(renderer.upload_texture(&img.unwrap_or_else(|| {
+                    RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))
+                })));
+            }
+        }
+        if !textures.is_empty() {
+            renderer.dynamic_textures.insert(tex_key.clone(), textures);
+        }
         return Some(EffectRuntime {
             passes: vec![EffectPassRuntime {
                 key: effect_name.clone(),
+                tex_key,
                 hardcoded: true,
                 target: None,
                 binds: Vec::new(),
@@ -2486,6 +2518,7 @@ fn load_effect_instance(
         renderer.dynamic_textures.insert(key.clone(), textures);
 
         passes.push(EffectPassRuntime {
+            tex_key: key.clone(),
             key,
             hardcoded: false,
             target: pass.target.clone(),
@@ -2750,8 +2783,17 @@ fn make_params_from_translated_typed(
 }
 
 fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
+    // Scene `constantshadervalues` are keyed by the shader annotation's
+    // *material key* ("speed", "scale", ...), not its ui_editor_properties_*
+    // label — look the bare key up first and keep the label as a fallback
+    // for any older call sites below that still pass the long form.
     fn get(vals: &ShaderVals, key: &str, default: f32) -> f32 {
-        vals.get(key).copied().unwrap_or(default)
+        if let Some(v) = vals.get(key) {
+            return *v;
+        }
+        key.strip_prefix("ui_editor_properties_")
+            .and_then(|bare| vals.get(bare).copied())
+            .unwrap_or(default)
     }
     fn pack(floats: &[f32]) -> Vec<u8> {
         floats.iter().flat_map(|f| f.to_le_bytes()).collect()
@@ -2814,15 +2856,17 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "ui_editor_properties_scale", 1.0),
         ]),
         "waterwaves" => {
-            let dir = get(vals, "ui_editor_properties_direction", 0.0);
+            // Direction is the reference's rotateVec2((0, 1), angle) —
+            // base vector (0, 1), not (1, 0).
+            let dir = get(vals, "direction", 0.0);
             pack(&[
                 time,
-                get(vals, "ui_editor_properties_speed", 5.0),
-                get(vals, "ui_editor_properties_scale", 200.0),
-                get(vals, "ui_editor_properties_strength", 0.1),
+                get(vals, "speed", 5.0),
+                get(vals, "scale", 200.0),
+                get(vals, "strength", 0.1),
+                -dir.sin(),
                 dir.cos(),
-                dir.sin(),
-                0.0,
+                get(vals, "exponent", 1.0),
                 0.0,
             ])
         }

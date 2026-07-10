@@ -501,18 +501,26 @@ struct WavesParams {
     strength: f32,
     dir_x: f32,
     dir_y: f32,
-    _p1: f32,
+    exponent: f32,
     _p2: f32,
 }
 @group(1) @binding(0) var<uniform> waves: WavesParams;
 
+// Mirrors the real waterwaves.frag: displacement along the wave direction's
+// perpendicular, shaped by pow(|sin|, exponent)·sign(sin), scaled by
+// strength² and the opacity mask. The mask (g_Texture1 in the real
+// material) arrives in extra slot 0 — `dest_copy_tex` is just that slot's
+// binding, and its white-1×1 fallback makes an unbound mask read 1.0,
+// matching the shader's `#else mask = 1.0` branch.
 @fragment
 fn fs_waterwaves(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let dir = normalize(vec2(waves.dir_x, waves.dir_y));
+    let mask = textureSample(dest_copy_tex, src_sampler, uv).r;
+    let dir = vec2(waves.dir_x, waves.dir_y);
     let perp = vec2(dir.y, -dir.x);
     let d = waves.time * waves.speed + dot(uv, dir) * waves.scale;
-    let wave = sin(d) * waves.strength * waves.strength;
-    let tc = uv + perp * wave;
+    let s = sin(d);
+    let val = pow(abs(s), waves.exponent) * sign(s);
+    let tc = uv + perp * val * waves.strength * waves.strength * mask;
     return textureSample(src_tex, src_sampler, tc);
 }
 
