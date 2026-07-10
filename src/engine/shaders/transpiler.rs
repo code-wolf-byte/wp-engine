@@ -693,7 +693,7 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
         .unwrap_or_default();
 
     let glsl = preprocess_frag(model, &vert_only_scalars);
-    let spv = glsl_to_spirv(&glsl, naga::ShaderStage::Fragment)
+    let spv = glsl_to_spirv_with_repairs(&glsl, naga::ShaderStage::Fragment)
         .context("GLSL→SPIR-V compilation failed")?;
     let wgsl = spirv_to_wgsl(&spv).context("SPIR-V→WGSL conversion failed")?;
 
@@ -755,7 +755,7 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
             .collect();
         match preprocess_vert_matched(v, &union_scalars, &inputs, &model.effective_combos()) {
             Ok((vsrc, attrs)) => {
-                match glsl_to_spirv(&vsrc, naga::ShaderStage::Vertex)
+                match glsl_to_spirv_with_repairs(&vsrc, naga::ShaderStage::Vertex)
                     .and_then(|spv| spirv_to_wgsl(&spv))
                 {
                     Ok(w) => {
@@ -821,6 +821,166 @@ fn json_default_vec4(val: &serde_json::Value) -> [f32; 4] {
 //
 // shaderc wraps glslangValidator as a linkable library — no external binary
 // required, works identically on Linux (Vulkan) and macOS (Metal via wgpu).
+
+/// `glsl_to_spirv` with a bounded repair loop for HLSL-style implicit
+/// conversions that strict GLSL rejects but Wallpaper Engine's own (D3D)
+/// compiler accepts silently — e.g. `float p = vec2Expr;` (truncates to .x),
+/// `int i = -floatVar;`, or a scalar assigned to a vec3. shaderc's error
+/// messages carry the line number and both types, which is exactly enough
+/// to wrap the right-hand side in the coercion HLSL would have applied,
+/// then recompile. Bails out (returning the latest error) once a round
+/// fixes nothing or after a few rounds, so pathological shaders still fail
+/// cleanly instead of looping.
+fn glsl_to_spirv_with_repairs(glsl: &str, stage: naga::ShaderStage) -> Result<Vec<u8>> {
+    let mut src: Option<String> = None;
+    let mut last_err = match glsl_to_spirv(glsl, stage) {
+        Ok(spv) => return Ok(spv),
+        Err(e) => e,
+    };
+    for _ in 0..4 {
+        let current = src.as_deref().unwrap_or(glsl);
+        let Some(patched) = repair_assignment_conversions(current, &format!("{last_err:#}"))
+        else {
+            return Err(last_err);
+        };
+        match glsl_to_spirv(&patched, stage) {
+            Ok(spv) => return Ok(spv),
+            Err(e) => last_err = e,
+        }
+        src = Some(patched);
+    }
+    Err(last_err)
+}
+
+/// Best-effort classification of a shaderc type description ("temp highp
+/// 2-component vector of float", "const float", "temp highp int", ...).
+fn parse_shaderc_type(desc: &str) -> Option<(&'static str, u8)> {
+    if let Some(pos) = desc.find("-component vector of float") {
+        let n: u8 = desc[..pos].split_whitespace().last()?.parse().ok()?;
+        return Some(("vec", n));
+    }
+    if desc.ends_with("float") {
+        return Some(("float", 1));
+    }
+    if desc.ends_with("uint") {
+        return Some(("uint", 1));
+    }
+    if desc.ends_with("int") {
+        return Some(("int", 1));
+    }
+    None
+}
+
+/// Parse `shader.frag:N: error: '=' : cannot convert from ' X' to ' Y'`
+/// messages and wrap the offending line's assignment RHS in the conversion
+/// HLSL would apply implicitly. Returns `None` when nothing was repaired.
+fn repair_assignment_conversions(glsl: &str, err_text: &str) -> Option<String> {
+    let mut lines: Vec<String> = glsl.lines().map(str::to_string).collect();
+    let mut repaired = false;
+
+    for msg in err_text.lines() {
+        let Some(rest) = msg
+            .split_once("shader.frag:")
+            .or_else(|| msg.split_once("shader.vert:"))
+            .map(|(_, r)| r)
+        else {
+            continue;
+        };
+        let Some((line_str, detail)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(line_no) = line_str.trim().parse::<usize>() else {
+            continue;
+        };
+        let Some(conv) = detail.split("cannot convert from '").nth(1) else {
+            continue;
+        };
+        // detail shape: ` <from>' to ' <to>'`
+        let mut parts = conv.split('\'');
+        let from_desc = parts.next().unwrap_or("").trim();
+        let to_desc = parts.nth(1).unwrap_or("").trim();
+        let (Some(from), Some(to)) = (parse_shaderc_type(from_desc), parse_shaderc_type(to_desc))
+        else {
+            continue;
+        };
+
+        // Pick the wrapper HLSL's implicit conversion corresponds to.
+        let wrap: (String, String) = match (from, to) {
+            // vecN -> scalar: HLSL truncation warning, takes the leading
+            // component(s).
+            (("vec", _), ("float", _)) => ("(".into(), ").x".into()),
+            (("vec", m), ("vec", n)) if m > n => {
+                ("(".into(), format!(").{}", &"xyzw"[..n as usize]))
+            }
+            // scalar -> vecN: HLSL splats.
+            (("float", _) | ("int", _), ("vec", n)) => (format!("vec{n}("), ")".into()),
+            // float -> int/uint: HLSL truncates toward zero, same as GLSL's
+            // explicit constructor.
+            (("float", _), ("int", _)) => ("int(".into(), ")".into()),
+            (("float", _), ("uint", _)) => ("uint(".into(), ")".into()),
+            _ => continue,
+        };
+
+        let Some(line) = lines.get_mut(line_no.saturating_sub(1)) else {
+            continue;
+        };
+        if let Some(patched) = wrap_assignment_rhs(line, &wrap.0, &wrap.1) {
+            *line = patched;
+            repaired = true;
+        }
+    }
+
+    repaired.then(|| lines.join("\n"))
+}
+
+/// Wrap the right-hand side of the first plain assignment on `line` in
+/// `prefix`/`suffix`. The RHS runs from the `=` to the first `;` or `,` at
+/// paren depth zero relative to the RHS start (so a `for (int i = x; ...)`
+/// init terminates at its own `;`). Compound (`+=`) and comparison
+/// (`==`/`<=`/...) operators are not assignments and are skipped.
+fn wrap_assignment_rhs(line: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut eq = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'=' {
+            continue;
+        }
+        let prev = if i > 0 { bytes[i - 1] } else { b' ' };
+        let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+        if matches!(prev, b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'&' | b'|')
+            || next == b'='
+        {
+            continue;
+        }
+        eq = Some(i);
+        break;
+    }
+    let eq = eq?;
+
+    let rhs_start = eq + 1;
+    let mut depth = 0i32;
+    let mut rhs_end = line.len();
+    for (i, ch) in line[rhs_start..].char_indices() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ';' | ',' if depth <= 0 => {
+                rhs_end = rhs_start + i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let rhs = line[rhs_start..rhs_end].trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {prefix}{rhs}{suffix}{}",
+        &line[..rhs_start],
+        &line[rhs_end..]
+    ))
+}
 
 fn glsl_to_spirv(glsl: &str, stage: naga::ShaderStage) -> Result<Vec<u8>> {
     let (kind, filename) = match stage {
@@ -1124,6 +1284,24 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
     out.push_str("#ifndef M_PI\n#define M_PI 3.14159265359\n#endif\n");
     out.push_str("#ifndef M_PI_2\n#define M_PI_2 6.28318530718\n#endif\n");
 
+    // HLSL's pow() broadcasts scalar arguments to the other side's vector
+    // width; strict GLSL only defines pow(genType, genType). Real workshop
+    // shaders (e.g. color_grading.frag's `pow(vec3, float)`) rely on the
+    // lenient form, so every body call site is renamed to these overloads —
+    // the same-shape ones are passthroughs, so legal calls are unaffected.
+    out.push_str(concat!(
+        "float _wp_pow(float a, float b) { return pow(a, b); }\n",
+        "vec2 _wp_pow(vec2 a, vec2 b) { return pow(a, b); }\n",
+        "vec3 _wp_pow(vec3 a, vec3 b) { return pow(a, b); }\n",
+        "vec4 _wp_pow(vec4 a, vec4 b) { return pow(a, b); }\n",
+        "vec2 _wp_pow(vec2 a, float b) { return pow(a, vec2(b)); }\n",
+        "vec3 _wp_pow(vec3 a, float b) { return pow(a, vec3(b)); }\n",
+        "vec4 _wp_pow(vec4 a, float b) { return pow(a, vec4(b)); }\n",
+        "vec2 _wp_pow(float a, vec2 b) { return pow(vec2(a), b); }\n",
+        "vec3 _wp_pow(float a, vec3 b) { return pow(vec3(a), b); }\n",
+        "vec4 _wp_pow(float a, vec4 b) { return pow(vec4(a), b); }\n",
+    ));
+
     // Separate texture2D declarations with matching bindings
     for (i, name) in sampler_names.iter().enumerate() {
         let b = tex_binding(i, name);
@@ -1191,6 +1369,8 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
 
         let coerced = coerce_vector_widths(line, &mut var_width);
         let renamed = rename_reserved_word(&coerced, "sample", "_wp_s");
+        // Route pow through the scalar-broadcasting overload shims above.
+        let renamed = rename_reserved_word(&renamed, "pow", "_wp_pow");
         let l = renamed
             .replace("gl_FragColor", "fragColor")
             .replace("gl_FragData[0]", "fragColor");
@@ -1738,5 +1918,73 @@ mod tests {
         );
         let twice = coerce_vector_widths(&once, &mut vw);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn wrap_assignment_rhs_handles_for_loop_init() {
+        // The RHS must stop at the for-init's own `;`, and `<=` must not be
+        // mistaken for an assignment (blur_gaussian.frag's exact shape).
+        let line = "for (int i = -iterations; i <= iterations; i++)";
+        let out = wrap_assignment_rhs(line, "int(", ")").unwrap();
+        assert_eq!(out, "for (int i = int(-iterations); i <= iterations; i++)");
+    }
+
+    #[test]
+    fn wrap_assignment_rhs_skips_lines_without_plain_assignment() {
+        assert!(wrap_assignment_rhs("if (a == b) return;", "(", ").x").is_none());
+        assert!(wrap_assignment_rhs("x += y;", "(", ").x").is_none());
+    }
+
+    #[test]
+    fn repair_patches_lines_named_in_shaderc_errors() {
+        let glsl = "float pointer = g_PointerPosition.xy * u_pointerSpeed;\n\
+                    int i = -iterations;\n\
+                    vec3 c = 0.5;";
+        let errs = "shader.frag:1: error: '=' : cannot convert from ' temp highp 2-component vector of float' to ' temp highp float'\n\
+                    shader.frag:2: error: '=' : cannot convert from ' temp highp float' to ' temp highp int'\n\
+                    shader.frag:3: error: '=' : cannot convert from ' const float' to ' temp highp 3-component vector of float'";
+        let out = repair_assignment_conversions(glsl, errs).expect("should repair");
+        assert!(out.contains("float pointer = (g_PointerPosition.xy * u_pointerSpeed).x;"));
+        assert!(out.contains("int i = int(-iterations);"));
+        assert!(out.contains("vec3 c = vec3(0.5);"));
+    }
+
+    /// End-to-end: a shader with the HLSL-leniency patterns from real
+    /// workshop content (lens_flare_sun's vec2→float, blur_gaussian's
+    /// float→int loop bound) must compile after the repair loop.
+    #[test]
+    fn repairs_implicit_conversions_through_real_compile() {
+        let glsl = "#version 450\n\
+            layout(location=0) out vec4 fragColor;\n\
+            void main() {\n\
+            \tvec2 v = vec2(1.5, 2.5);\n\
+            \tfloat pointer = v * 2.0;\n\
+            \tfloat iterations = 3.0;\n\
+            \tfloat acc = 0.0;\n\
+            \tfor (int i = -iterations; i <= iterations; i++) { acc += float(i) + pointer; }\n\
+            \tfragColor = vec4(acc);\n\
+            }\n";
+        assert!(glsl_to_spirv(glsl, naga::ShaderStage::Fragment).is_err());
+        glsl_to_spirv_with_repairs(glsl, naga::ShaderStage::Fragment)
+            .expect("repair loop should make this compile");
+    }
+
+    /// `pow(vec3, float)` (color_grading.frag's shape) is illegal in strict
+    /// GLSL; the `_wp_pow` overload shims must let it translate.
+    #[test]
+    fn pow_scalar_broadcast_translates() {
+        let src = "uniform sampler2D g_Texture0;\n\
+                   varying vec2 v_TexCoord;\n\
+                   void main() {\n\
+                   \tvec3 c = pow(texSample2D(g_Texture0, v_TexCoord).rgb, 2.2);\n\
+                   \tgl_FragColor = vec4(c, 1.0);\n\
+                   }\n";
+        let model = ShaderModel::from_resolved_glsl(
+            "pow_test".to_string(),
+            src.to_string(),
+            HashMap::new(),
+            crate::engine::model::shader_model::WEBlending::Normal,
+        );
+        translate(&model).expect("pow(vec3, float) should translate via _wp_pow shims");
     }
 }
