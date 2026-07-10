@@ -1009,11 +1009,54 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
-    find_model_chain_tex_pkg(pkg, json_path)?.0.to_rgba()
+    let atlas = find_model_chain_tex_pkg(pkg, json_path)?.0.to_rgba()?;
+    Ok(apply_puppet_mesh(atlas, json_path, |rel| {
+        pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
+    }))
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
-    find_model_chain_tex_dir(dir, json_path)?.0.to_rgba()
+    let atlas = find_model_chain_tex_dir(dir, json_path)?.0.to_rgba()?;
+    Ok(apply_puppet_mesh(atlas, json_path, |rel| {
+        std::fs::read(dir.join(rel))
+            .ok()
+            .or_else(|| read_from_global_assets(rel))
+    }))
+}
+
+/// If the model JSON names a `"puppet"` mesh, its texture is a packed UV
+/// atlas — reassemble it by rasterizing the rest-pose mesh (see
+/// `engine::puppet`); otherwise (or on any parse failure) the decoded
+/// texture passes through unchanged, so a malformed .mdl degrades to the
+/// old scrambled-quad behavior instead of dropping the layer.
+fn apply_puppet_mesh(
+    atlas: RgbaImage,
+    model_json_path: &str,
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+) -> RgbaImage {
+    let Some(model_bytes) = read(model_json_path) else {
+        return atlas;
+    };
+    let Ok(model) = serde_json::from_slice::<serde_json::Value>(&model_bytes) else {
+        return atlas;
+    };
+    let Some(puppet_path) = model.get("puppet").and_then(|v| v.as_str()) else {
+        return atlas;
+    };
+    let Some(mdl_bytes) = read(puppet_path) else {
+        eprintln!("[scene] puppet mesh '{puppet_path}' not found — drawing raw atlas");
+        return atlas;
+    };
+    let Some(mesh) = crate::engine::puppet::parse_mdl(&mdl_bytes) else {
+        eprintln!("[scene] puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
+        return atlas;
+    };
+    eprintln!(
+        "[scene] puppet mesh '{puppet_path}': {} vertices, {} triangles",
+        mesh.positions.len(),
+        mesh.indices.len() / 3
+    );
+    crate::engine::puppet::rasterize(&mesh, &atlas, atlas.width(), atlas.height())
 }
 
 /// Same model -> material -> texture chain as `resolve_model_chain_{pkg,dir}`,

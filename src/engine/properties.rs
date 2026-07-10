@@ -123,9 +123,16 @@ impl SceneProperties {
     ///
     /// Wherever an object carries a `user` key naming a known property, its
     /// `value` is replaced by the property's effective value. The `{"value":X}`
-    /// wrapper is preserved because downstream parsers unwrap it. Conditional
-    /// references (`"user": {"name":..., "condition":...}`) resolve by name;
-    /// the condition expression itself is not evaluated yet.
+    /// wrapper is preserved because downstream parsers unwrap it.
+    ///
+    /// Conditional references (`"user": {"name":..., "condition":...}`)
+    /// evaluate to a boolean: the property's value, stringified, compared
+    /// against the condition string (the reference's DynamicValue equality —
+    /// `condition == newValue`, DynamicValue.cpp:176). Copying the raw
+    /// property value instead made e.g. a combo value of `1` read as
+    /// "truthy", turning layers visible whose scene default is
+    /// `"value": false` (wallpaper 2952574984's fullscreen white "Solid"
+    /// layer is gated on `areffects == 3`).
     pub fn resolve_scene_json(&self, node: &mut Value) {
         if self.properties.is_empty() {
             return;
@@ -136,20 +143,41 @@ impl SceneProperties {
     fn resolve_node(&self, node: &mut Value) {
         match node {
             Value::Object(map) => {
-                let user_name = match map.get("user") {
-                    Some(Value::String(s)) => Some(s.clone()),
-                    Some(Value::Object(user)) => user
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()),
-                    _ => None,
-                };
-                if let Some(name) = user_name {
-                    if let Some(prop) = self.properties.get(&name) {
-                        if !prop.value.is_null() {
-                            map.insert("value".into(), prop.value.clone());
+                enum UserRef {
+                    Plain(String),
+                    Conditional(String, String),
+                }
+                let user_ref = match map.get("user") {
+                    Some(Value::String(s)) => Some(UserRef::Plain(s.clone())),
+                    Some(Value::Object(user)) => {
+                        let name = user.get("name").and_then(|n| n.as_str());
+                        match (name, user.get("condition").and_then(|c| c.as_str())) {
+                            (Some(n), Some(c)) => {
+                                Some(UserRef::Conditional(n.to_string(), c.to_string()))
+                            }
+                            (Some(n), None) => Some(UserRef::Plain(n.to_string())),
+                            _ => None,
                         }
                     }
+                    _ => None,
+                };
+                match user_ref {
+                    Some(UserRef::Plain(name)) => {
+                        if let Some(prop) = self.properties.get(&name) {
+                            if !prop.value.is_null() {
+                                map.insert("value".into(), prop.value.clone());
+                            }
+                        }
+                    }
+                    Some(UserRef::Conditional(name, condition)) => {
+                        if let Some(prop) = self.properties.get(&name) {
+                            if !prop.value.is_null() {
+                                let matches = json_value_as_string(&prop.value) == condition;
+                                map.insert("value".into(), Value::Bool(matches));
+                            }
+                        }
+                    }
+                    None => {}
                 }
                 for (_, child) in map.iter_mut() {
                     self.resolve_node(child);
@@ -162,6 +190,30 @@ impl SceneProperties {
             }
             _ => {}
         }
+    }
+}
+
+/// Stringify a property value the way WE's condition equality sees it:
+/// integers without a decimal point (combo values are ints — condition
+/// strings like `"3"` must match a JSON `3` and a JSON `3.0` alike).
+fn json_value_as_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => i.to_string(),
+            None => n
+                .as_f64()
+                .map(|f| {
+                    if f.fract() == 0.0 {
+                        format!("{}", f as i64)
+                    } else {
+                        f.to_string()
+                    }
+                })
+                .unwrap_or_default(),
+        },
+        other => other.to_string(),
     }
 }
 
@@ -231,4 +283,57 @@ pub fn list_properties(dir: &Path) -> Result<Vec<SceneProperty>> {
     let mut props = SceneProperties::default();
     props.load_from_project_json(&json);
     Ok(props.iter().cloned().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props_with(name: &str, kind: &str, value: Value) -> SceneProperties {
+        let mut p = SceneProperties::default();
+        p.properties.insert(
+            name.to_string(),
+            SceneProperty {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                text: String::new(),
+                value,
+            },
+        );
+        p
+    }
+
+    /// Conditional user references (`{"user": {"name", "condition"}}`)
+    /// evaluate `stringify(property) == condition` into a boolean — copying
+    /// the raw combo value (e.g. `1`) instead made `is_visible`'s non-bool
+    /// fallback report `true` for layers whose scene default is `false`
+    /// (2952574984's fullscreen white "Solid" layer, gated on
+    /// `areffects == 3`).
+    #[test]
+    fn conditional_user_reference_evaluates_equality() {
+        let props = props_with("areffects", "combo", Value::from(1));
+        let mut node = serde_json::json!({
+            "visible": { "user": { "condition": "3", "name": "areffects" }, "value": false }
+        });
+        props.resolve_scene_json(&mut node);
+        assert_eq!(node["visible"]["value"], Value::Bool(false));
+
+        let props = props_with("areffects", "combo", Value::from(3));
+        let mut node = serde_json::json!({
+            "visible": { "user": { "condition": "3", "name": "areffects" }, "value": false }
+        });
+        props.resolve_scene_json(&mut node);
+        assert_eq!(node["visible"]["value"], Value::Bool(true));
+    }
+
+    /// Plain string references keep the existing copy-the-value behavior.
+    #[test]
+    fn plain_user_reference_copies_property_value() {
+        let props = props_with("logoopacity", "slider", Value::from(0.25));
+        let mut node = serde_json::json!({
+            "alpha": { "user": "logoopacity", "value": 0.6 }
+        });
+        props.resolve_scene_json(&mut node);
+        assert_eq!(node["alpha"]["value"], Value::from(0.25));
+    }
 }

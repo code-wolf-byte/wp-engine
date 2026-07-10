@@ -69,14 +69,21 @@ fn cli_overrides_replace_project_defaults() {
     assert_eq!(scene["b"]["value"], false);
 }
 
+/// Conditional references evaluate `stringify(property) == condition` into
+/// a boolean (the reference's DynamicValue equality, DynamicValue.cpp:176)
+/// — they never copy the raw property value like plain references do, and
+/// a non-matching condition must leave gated layers at `false` rather than
+/// letting a truthy combo value force them visible.
 #[test]
-fn conditional_user_reference_resolves_by_name() {
+fn conditional_user_reference_evaluates_condition_equality() {
     let props = props_from_project(sample_project(), &[]);
     let mut scene = serde_json::json!({
-        "x": { "user": { "name": "rate", "condition": "rate > 0" }, "value": 1.0 }
+        "matched": { "user": { "name": "rate", "condition": "0.25" }, "value": false },
+        "unmatched": { "user": { "name": "rate", "condition": "3" }, "value": false }
     });
     props.resolve_scene_json(&mut scene);
-    assert_eq!(scene["x"]["value"], 0.25);
+    assert_eq!(scene["matched"]["value"], true);
+    assert_eq!(scene["unmatched"]["value"], false);
 }
 
 #[test]
