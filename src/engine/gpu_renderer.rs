@@ -1070,6 +1070,13 @@ struct BloomSettings {
 
 struct SceneLayerGpu {
     frames: Vec<wgpu::Texture>,
+    /// Animated puppet runtime — `frames[0]` is re-rasterized from the
+    /// posed mesh at `PUPPET_UPDATE_INTERVAL` (skinning + CPU raster costs
+    /// ~30ms at 4K, so it runs at a capped rate rather than per frame;
+    /// idle-style puppet animations are slow enough not to notice).
+    puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    /// Last animation time `frames[0]` was posed at, seconds.
+    puppet_posed_at: f32,
     blend_mode: u32,
     alpha: f32,
     color: [f32; 3],
@@ -1257,6 +1264,8 @@ impl GpuSceneInstance {
 
                 SceneLayerGpu {
                     frames,
+                    puppet: l.puppet.clone(),
+                    puppet_posed_at: 0.0,
                     blend_mode: l.blend_mode,
                     alpha: l.alpha,
                     color: l.color,
@@ -1432,6 +1441,27 @@ impl GpuSceneInstance {
                 })],
                 ..Default::default()
             });
+        }
+
+        // Re-pose animated puppet layers at a capped rate: skin the mesh at
+        // the current animation time and re-upload frames[0]. CPU skinning +
+        // rasterization runs ~30ms at 4K, so this ticks at
+        // PUPPET_UPDATE_INTERVAL rather than every frame — the idle-style
+        // animations these carry (breathing, hair sway) are far slower than
+        // even that.
+        const PUPPET_UPDATE_INTERVAL: f32 = 1.0 / 15.0;
+        for i in 0..self.layers.len() {
+            let Some(runtime) = self.layers[i].puppet.clone() else {
+                continue;
+            };
+            if (time - self.layers[i].puppet_posed_at).abs() < PUPPET_UPDATE_INTERVAL {
+                continue;
+            }
+            let (w, h) = (runtime.atlas.width(), runtime.atlas.height());
+            let posed = runtime.render_at(time, w, h);
+            let tex = self.renderer.upload_texture(&posed);
+            self.layers[i].frames[0] = tex;
+            self.layers[i].puppet_posed_at = time;
         }
 
         // 2/3. Image layers and particle systems, interleaved by

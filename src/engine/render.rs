@@ -91,6 +91,9 @@ pub struct Layer {
     pub no_interpolation: bool,
     /// `.tex` `ClampUVs`/`ClampUVsBorder` flag: clamp-to-edge instead of repeat.
     pub clamp_uvs: bool,
+    /// Animated puppet runtime (mesh + skeleton + MDLA animations) — the
+    /// live GPU path re-poses and re-rasterizes `image` from this.
+    pub puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
@@ -104,6 +107,10 @@ struct LoadedImage {
     frame_duration_ms: u32,
     no_interpolation: bool,
     clamp_uvs: bool,
+    /// Present when the model is an animated puppet (mesh + skeleton +
+    /// MDLA animations): `image` holds the rest pose, and the live GPU
+    /// path re-poses/re-rasterizes from this over time.
+    puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
 }
 
 impl LoadedImage {
@@ -114,6 +121,7 @@ impl LoadedImage {
             frame_duration_ms: 0,
             no_interpolation: false,
             clamp_uvs: false,
+            puppet: None,
         }
     }
 
@@ -137,6 +145,7 @@ impl LoadedImage {
                         frame_duration_ms,
                         no_interpolation,
                         clamp_uvs,
+                        puppet: None,
                     });
                 }
             }
@@ -679,6 +688,7 @@ fn layer_from_object(
         copybackground: obj.copybackground,
         no_interpolation: loaded.no_interpolation,
         clamp_uvs: loaded.clamp_uvs,
+        puppet: loaded.puppet,
         order_index: 0,
     }
 }
@@ -819,7 +829,7 @@ fn text_layer_from_object(
 fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<LoadedImage> {
     // If it's a .json reference, resolve the model/material chain
     if image_path.ends_with(".json") {
-        return resolve_model_chain_dir(dir, image_path).map(LoadedImage::single);
+        return resolve_model_chain_dir(dir, image_path);
     }
 
     let full_path = dir.join(image_path);
@@ -860,7 +870,7 @@ fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<LoadedImage> {
 fn load_texture_from_pkg(pkg: &Package, image_path: &str) -> Result<LoadedImage> {
     // If the image path points to a .json model/material, resolve the chain.
     if image_path.ends_with(".json") {
-        return resolve_model_chain_pkg(pkg, image_path).map(LoadedImage::single);
+        return resolve_model_chain_pkg(pkg, image_path);
     }
 
     // Try as .tex
@@ -1008,14 +1018,14 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
     anyhow::bail!("could not resolve texture from {json_path}")
 }
 
-fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<RgbaImage> {
+fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
     let atlas = find_model_chain_tex_pkg(pkg, json_path)?.0.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
     }))
 }
 
-fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
+fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
     let atlas = find_model_chain_tex_dir(dir, json_path)?.0.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         std::fs::read(dir.join(rel))
@@ -1026,37 +1036,60 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<RgbaImage> {
 
 /// If the model JSON names a `"puppet"` mesh, its texture is a packed UV
 /// atlas — reassemble it by rasterizing the rest-pose mesh (see
-/// `engine::puppet`); otherwise (or on any parse failure) the decoded
+/// `engine::puppet`), and keep the parsed model + atlas around as a
+/// `PuppetRuntime` so the live render loop can re-pose it over time when
+/// the model carries MDLA animations. On any parse failure the decoded
 /// texture passes through unchanged, so a malformed .mdl degrades to the
 /// old scrambled-quad behavior instead of dropping the layer.
 fn apply_puppet_mesh(
     atlas: RgbaImage,
     model_json_path: &str,
     read: impl Fn(&str) -> Option<Vec<u8>>,
-) -> RgbaImage {
+) -> LoadedImage {
+    let plain = |atlas: RgbaImage| LoadedImage::single(atlas);
     let Some(model_bytes) = read(model_json_path) else {
-        return atlas;
+        return plain(atlas);
     };
-    let Ok(model) = serde_json::from_slice::<serde_json::Value>(&model_bytes) else {
-        return atlas;
+    let Ok(model_json) = serde_json::from_slice::<serde_json::Value>(&model_bytes) else {
+        return plain(atlas);
     };
-    let Some(puppet_path) = model.get("puppet").and_then(|v| v.as_str()) else {
-        return atlas;
+    let Some(puppet_path) = model_json.get("puppet").and_then(|v| v.as_str()) else {
+        return plain(atlas);
     };
     let Some(mdl_bytes) = read(puppet_path) else {
         eprintln!("[scene] puppet mesh '{puppet_path}' not found — drawing raw atlas");
-        return atlas;
+        return plain(atlas);
     };
-    let Some(mesh) = crate::engine::puppet::parse_mdl(&mdl_bytes) else {
+    let Some(model) = crate::engine::puppet::parse_model(&mdl_bytes) else {
         eprintln!("[scene] puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
-        return atlas;
+        return plain(atlas);
     };
     eprintln!(
-        "[scene] puppet mesh '{puppet_path}': {} vertices, {} triangles",
-        mesh.positions.len(),
-        mesh.indices.len() / 3
+        "[scene] puppet '{puppet_path}': {} vertices, {} triangles, {} bones, {} animations",
+        model.mesh.positions.len(),
+        model.mesh.indices.len() / 3,
+        model.bones.len(),
+        model.animations.len()
     );
-    crate::engine::puppet::rasterize(&mesh, &atlas, atlas.width(), atlas.height())
+    // With a skeleton + animation, frame 0 of the animation IS the
+    // assembled pose (skin = worldAnim * inverse(atlas-space bind)); the
+    // raw mesh alone only reproduces the packed atlas layout.
+    let runtime = crate::engine::puppet::PuppetRuntime { model, atlas };
+    let assembled = if runtime.model.has_animation() {
+        runtime.render_at(0.0, runtime.atlas.width(), runtime.atlas.height())
+    } else {
+        crate::engine::puppet::rasterize(
+            &runtime.model.mesh,
+            &runtime.atlas,
+            runtime.atlas.width(),
+            runtime.atlas.height(),
+        )
+    };
+    let mut loaded = LoadedImage::single(assembled);
+    if runtime.model.has_animation() {
+        loaded.puppet = Some(std::sync::Arc::new(runtime));
+    }
+    loaded
 }
 
 /// Same model -> material -> texture chain as `resolve_model_chain_{pkg,dir}`,
@@ -1222,6 +1255,7 @@ mod tests {
             copybackground: false,
             no_interpolation: true,
             clamp_uvs: false,
+            puppet: None,
             order_index: 1,
         }];
 
