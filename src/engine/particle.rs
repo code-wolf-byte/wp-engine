@@ -1537,10 +1537,25 @@ impl ParticleSystem {
                 // `p.frame` is only ever set (in `step`) when the sprite has
                 // more than one frame; a single-frame sprite always draws
                 // frame 0 regardless of its (unused, still -1.0) value.
-                let frame_idx = if sprite.frames.len() > 1 {
-                    (p.frame.max(0.0) as usize).min(sprite.frames.len() - 1)
+                //
+                // Cross-fade: the fractional part of `p.frame` blends toward
+                // the NEXT frame, clamped at the last frame (the real
+                // engine's ComputeSpriteFrame uses
+                // `nextFrame = min(numFrames - 1, currentFrame + 1)` — no
+                // wrap, in any animation mode). RandomFrame assigns integer
+                // frames, so its fraction is 0 and no second sample happens.
+                let (frame_idx, next_frame) = if sprite.frames.len() > 1 {
+                    let f = p.frame.max(0.0);
+                    let a = (f as usize).min(sprite.frames.len() - 1);
+                    let b = (a + 1).min(sprite.frames.len() - 1);
+                    let blend = f.fract();
+                    if b != a && blend > 1.0 / 255.0 {
+                        (a, Some((&sprite.frames[b], blend)))
+                    } else {
+                        (a, None)
+                    }
                 } else {
-                    0
+                    (0, None)
                 };
                 let tex = &sprite.frames[frame_idx];
                 // `spritetrail`: align the quad's V axis with the particle's
@@ -1565,7 +1580,7 @@ impl ParticleSystem {
                 };
                 draw_textured_particle(
                     canvas, px_pos, py_pos, half_w, half_h, rotation, p.color, alpha, tex,
-                    additive, scale < 0.9,
+                    next_frame, additive, scale < 0.9,
                 );
                 continue;
             }
@@ -1882,6 +1897,7 @@ fn draw_textured_particle(
     color: [u8; 3],
     alpha_byte: u8,
     tex: &RgbaImage,
+    next_frame: Option<(&RgbaImage, f32)>,
     additive: bool,
     nearest: bool,
 ) {
@@ -1918,11 +1934,24 @@ fn draw_textured_particle(
             }
             let u = (lx + half_w) / (2.0 * half_w);
             let v = (ly + half_h) / (2.0 * half_h);
-            let sample = if nearest {
+            let mut sample = if nearest {
                 sample_nearest(tex, u, v)
             } else {
                 sample_bilinear(tex, u, v)
             };
+            // Spritesheet cross-fade: mix toward the next frame's sample
+            // (genericparticle.frag's SPRITESHEETBLEND path).
+            if let Some((tex_b, blend)) = next_frame {
+                let b = if nearest {
+                    sample_nearest(tex_b, u, v)
+                } else {
+                    sample_bilinear(tex_b, u, v)
+                };
+                for c in 0..4 {
+                    sample[c] = (sample[c] as f32 + (b[c] as f32 - sample[c] as f32) * blend)
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
             let src_a = (sample[3] as f32 / 255.0) * (alpha_byte as f32 / 255.0);
             if src_a <= 0.0 {
                 continue;
@@ -2610,6 +2639,63 @@ mod tests {
         assert!(sys.particles[0].vy.abs() < 1e-3);
         assert!(sys.particles[1].vx.abs() < 1e-3);
         assert!(sys.particles[1].vy.abs() > 79.0);
+    }
+
+    fn two_frame_sprite() -> ParticleSprite {
+        ParticleSprite {
+            frames: vec![
+                RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])),
+                RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 255, 255])),
+            ],
+            duration: 1.0,
+        }
+    }
+
+    fn render_center_with_frame(frame: f32) -> image::Rgba<u8> {
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":0}]}"#)
+                .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        let mut p = make_particle(20.0, 20.0, 8.0, 0.0);
+        p.frame = frame;
+        sys.particles.push(p);
+        let sprite = two_frame_sprite();
+        let mut canvas = RgbaImage::new(40, 40);
+        sys.render_onto(&mut canvas, Some(&sprite), [0.0, 0.0]);
+        *canvas.get_pixel(20, 20)
+    }
+
+    /// A fractional frame position cross-fades between the two adjacent
+    /// frames (genericparticle.frag's SPRITESHEETBLEND): halfway between a
+    /// red and a blue frame must paint ~50/50 purple, not hard-switch.
+    #[test]
+    fn fractional_frame_cross_fades_adjacent_frames() {
+        let px = render_center_with_frame(0.5);
+        assert!(px[0] > 100 && px[0] < 155, "red ~half, got {px:?}");
+        assert!(px[2] > 100 && px[2] < 155, "blue ~half, got {px:?}");
+        assert_eq!(px[1], 0);
+    }
+
+    /// The next frame is clamped at the last frame (ComputeSpriteFrame's
+    /// `min(numFrames - 1, currentFrame + 1)`) — a fraction past the final
+    /// frame must NOT wrap-blend back toward frame 0.
+    #[test]
+    fn cross_fade_clamps_at_last_frame_without_wrapping() {
+        let px = render_center_with_frame(1.5);
+        assert_eq!(px[0], 0, "no red from a wrap to frame 0: {px:?}");
+        assert!(px[2] > 200, "pure last frame, got {px:?}");
+    }
+
+    /// Integer frame positions (RandomFrame assigns whole frames) take the
+    /// single-sample path — exactly one frame's color, no blending.
+    #[test]
+    fn integer_frame_draws_single_frame_unblended() {
+        let px = render_center_with_frame(1.0);
+        assert_eq!(px[0], 0, "{px:?}");
+        assert!(px[2] > 200, "{px:?}");
+        let px0 = render_center_with_frame(0.0);
+        assert!(px0[0] > 200, "{px0:?}");
+        assert_eq!(px0[2], 0, "{px0:?}");
     }
 
     /// `spritetrail` stretches the quad along the particle's velocity:
