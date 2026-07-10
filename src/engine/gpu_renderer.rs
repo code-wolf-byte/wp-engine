@@ -941,6 +941,10 @@ fn vertex_format_for(glsl_type: &str) -> wgpu::VertexFormat {
 /// while Additive/Translucent premultiply color by that alpha, matching the
 /// reference's (ONE,ZERO) / (SRC_ALPHA,ONE) / (SRC_ALPHA,1-SRC_ALPHA) blend
 /// functions for a zero destination.
+/// Material pass blending → wgpu blend state, matching CPass::render's GL
+/// states exactly: `normal` is GL_ONE/GL_ZERO and `disabled` is
+/// glDisable(GL_BLEND) — both plain replace (`None` here); only
+/// `additive`/`translucent` actually blend.
 fn wgpu_blend_state(blending: &WEBlending) -> Option<wgpu::BlendState> {
     match blending {
         WEBlending::Normal | WEBlending::Disabled => None,

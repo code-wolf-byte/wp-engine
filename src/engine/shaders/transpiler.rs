@@ -679,6 +679,15 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
         }
     }
 
+    // Some workshop shaders declare a varying `vec2` in the vertex stage
+    // but `vec4` in the fragment (WE's own compiler links them anyway) —
+    // upgrade the vertex side so our strict pipeline's interface matches
+    // (the reference does the same, ShaderUnit.cpp
+    // applyLinkedVaryingCompatibility).
+    let vert_patched: Option<String> =
+        vert_glsl.map(|v| harmonize_varying_widths(v, &model.frag_glsl));
+    let vert_glsl = vert_patched.as_deref();
+
     // Union scalar-uniform list: fragment's declarations first (their order
     // defines the front of the UBO), then vertex-only ones appended. Both
     // stages emit the SAME block so std140 offsets agree.
@@ -821,6 +830,83 @@ fn json_default_vec4(val: &serde_json::Value) -> [f32; 4] {
 //
 // shaderc wraps glslangValidator as a linkable library — no external binary
 // required, works identically on Linux (Vulkan) and macOS (Metal via wgpu).
+
+/// Port of the reference's `applyLinkedVaryingCompatibility`
+/// (ShaderUnit.cpp:379-415): for every `varying vec4 NAME;` the fragment
+/// declares where the vertex declares `varying vec2 NAME;`, upgrade the
+/// vertex declaration to vec4 and rewrite the vertex's whole-variable
+/// assignments (`NAME = expr;` at statement start — swizzled stores like
+/// `NAME.xy = ...` are already type-correct and left alone) to
+/// `NAME = vec4(expr, 0.0, 1.0);`. WE's own compiler links such mismatched
+/// interfaces silently; strict Vulkan pipelines reject them.
+fn harmonize_varying_widths(vert: &str, frag: &str) -> String {
+    // Fragment-side vec4 varyings.
+    let mut vec4_names: Vec<String> = Vec::new();
+    for line in frag.lines() {
+        let decl = line.trim().split("//").next().unwrap_or("").trim();
+        let tok: Vec<&str> = decl.split_whitespace().collect();
+        if tok.len() >= 3 && tok[0] == "varying" && tok[1] == "vec4" {
+            let name = tok[2].trim_end_matches(';');
+            if !name.contains('[') {
+                vec4_names.push(name.to_string());
+            }
+        }
+    }
+    if vec4_names.is_empty() {
+        return vert.to_string();
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut upgraded: Vec<String> = Vec::new();
+    for line in vert.lines() {
+        let decl = line.trim().split("//").next().unwrap_or("").trim();
+        let tok: Vec<&str> = decl.split_whitespace().collect();
+        if tok.len() >= 3 && tok[0] == "varying" && tok[1] == "vec2" {
+            let name = tok[2].trim_end_matches(';');
+            if vec4_names.iter().any(|n| n == name) {
+                out.push(format!("varying vec4 {name};"));
+                upgraded.push(name.to_string());
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    if upgraded.is_empty() {
+        return vert.to_string();
+    }
+
+    // Rewrite whole-variable assignments of upgraded varyings.
+    for line in &mut out {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        for name in &upgraded {
+            let Some(rest) = trimmed.strip_prefix(name.as_str()) else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            // Plain `=` only (not `.xy =`, `==`, `+=`); expression runs to
+            // the trailing `;`.
+            let Some(expr_and_tail) = rest.strip_prefix('=') else {
+                continue;
+            };
+            if expr_and_tail.starts_with('=') {
+                continue;
+            }
+            let Some(semi) = expr_and_tail.find(';') else {
+                continue;
+            };
+            let expr = expr_and_tail[..semi].trim();
+            let tail = &expr_and_tail[semi + 1..];
+            *line = format!(
+                "{}{name} = vec4({expr}, 0.0, 1.0);{tail}",
+                &line[..indent_len]
+            );
+            break;
+        }
+    }
+    out.join("\n")
+}
+
 
 /// `glsl_to_spirv` with a bounded repair loop for HLSL-style implicit
 /// conversions that strict GLSL rejects but Wallpaper Engine's own (D3D)
@@ -1918,6 +2004,29 @@ mod tests {
         );
         let twice = coerce_vector_widths(&once, &mut vw);
         assert_eq!(once, twice);
+    }
+
+    /// The reference's applyLinkedVaryingCompatibility: a vertex-side
+    /// `varying vec2` matching a fragment-side `varying vec4` gets upgraded,
+    /// with whole-variable assignments wrapped in vec4(expr, 0.0, 1.0);
+    /// swizzled stores and unrelated varyings stay untouched.
+    #[test]
+    fn harmonize_upgrades_mismatched_varying_and_assignments() {
+        let vert = "varying vec2 v_TexCoord;\nvarying vec2 v_Other;\nvoid main() {\n\tv_TexCoord = a_TexCoord * 2.0;\n\tv_TexCoord.xy = a_TexCoord;\n\tv_Other = a_TexCoord;\n}\n";
+        let frag = "varying vec4 v_TexCoord;\nvarying vec2 v_Other;\nvoid main() { gl_FragColor = v_TexCoord; }\n";
+        let out = harmonize_varying_widths(vert, frag);
+        assert!(out.contains("varying vec4 v_TexCoord;"));
+        assert!(out.contains("v_TexCoord = vec4(a_TexCoord * 2.0, 0.0, 1.0);"));
+        assert!(out.contains("v_TexCoord.xy = a_TexCoord;"), "swizzled store untouched");
+        assert!(out.contains("varying vec2 v_Other;"), "matching widths untouched");
+        assert!(out.contains("v_Other = a_TexCoord;"));
+    }
+
+    #[test]
+    fn harmonize_leaves_matched_interfaces_alone() {
+        let vert = "varying vec2 v_TexCoord;\nvoid main() { v_TexCoord = a_TexCoord; }\n";
+        let frag = "varying vec2 v_TexCoord;\nvoid main() { gl_FragColor = vec4(v_TexCoord, 0.0, 1.0); }\n";
+        assert_eq!(harmonize_varying_widths(vert, frag), vert);
     }
 
     #[test]
