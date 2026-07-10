@@ -383,6 +383,9 @@ pub struct ParticleSystem {
     color_min: [f32; 3],
     color_max: [f32; 3],
     gravity: [f32; 2],
+    /// `movement.drag`: velocity decays by `1 - drag*dt` (clamped at 0)
+    /// each step, matching the reference's reversal-preventing clamp.
+    movement_drag: f32,
     /// `alphafade`: (fadeintime, fadeouttime), normalized-lifetime fractions.
     alphafade: Option<(f32, f32)>,
     /// `sizechange`/`alphachange`: (starttime, endtime, startvalue, endvalue).
@@ -615,14 +618,17 @@ impl ParticleSystem {
             vec3_range_from_initializers(&config.initializer, "colorrandom")
                 .unwrap_or(([255.0; 3], [255.0; 3]));
 
-        let gravity = config
-            .operator
-            .iter()
-            .find(|op| op.name == "movement")
+        let movement_op = config.operator.iter().find(|op| op.name == "movement");
+        let gravity = movement_op
             .and_then(|op| op.gravity.as_deref())
             .map(|s| parse_f32_vec3(Some(s)))
             .map(|v| [v[0], v[1]])
             .unwrap_or([0.0, 0.0]);
+        // `movement.drag`: per-second velocity decay (CParticle.cpp
+        // createMovementOperator) — without it, operators that keep adding
+        // velocity every frame (turbulence, vortex) grow unbounded instead
+        // of settling into the drifting equilibrium real presets tune for.
+        let movement_drag = movement_op.and_then(|op| op.drag).unwrap_or(0.0) as f32;
 
         let color_override = overrides
             .and_then(|o| o.color.as_deref())
@@ -922,6 +928,7 @@ impl ParticleSystem {
             color_min,
             color_max,
             gravity,
+            movement_drag,
             alphafade,
             sizechange,
             alphachange,
@@ -975,8 +982,19 @@ impl ParticleSystem {
     pub fn step(&mut self, dt: f32) {
         self.time += dt;
         for p in &mut self.particles {
-            p.vx += self.gravity[0] * dt;
-            p.vy += self.gravity[1] * dt;
+            // `movement` operator (CParticle.cpp createMovementOperator):
+            // position integrates the CURRENT velocity first, and only then
+            // do this frame's forces modify velocity (for the next frame) —
+            // gravity scaled by the instance speed override, then drag decay
+            // clamped so `drag*dt > 1` stops the particle instead of
+            // reversing it.
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            p.vx += self.gravity[0] * dt * self.speed_mult;
+            p.vy += self.gravity[1] * dt * self.speed_mult;
+            let drag_factor = (1.0 - self.movement_drag * dt).max(0.0);
+            p.vx *= drag_factor;
+            p.vy *= drag_factor;
 
             // `turbulence` operator (CParticle.cpp createTurbulenceOperator):
             // normalized curl-noise direction, sampled at a time-scrolled,
@@ -1010,7 +1028,15 @@ impl ParticleSystem {
                     center_base[1] + v.offset[1],
                     center_base[2] + v.offset[2],
                 ];
-                let axis = vec3_normalize_or(v.axis, [0.0, 0.0, 1.0]);
+                // The reference computes tangents in its y-up sim space and
+                // projects y-up; our space is y-down (a reflection, det -1),
+                // under which cross products flip sign: mirror the axis's y
+                // and negate the resulting tangent to reproduce the same
+                // on-screen spin direction.
+                let axis = vec3_normalize_or(
+                    [v.axis[0], -v.axis[1], v.axis[2]],
+                    [0.0, 0.0, 1.0],
+                );
                 let to_particle = [p.x - center[0], p.y - center[1], -center[2]];
 
                 // Infinite axis: cylinder shape (project out the axis
@@ -1030,10 +1056,11 @@ impl ParticleSystem {
                 let tangent = vec3_cross(axis, radial);
                 let tangent_len = vec3_length(tangent);
                 if tangent_len > 0.001 {
+                    // Negated: see the reflection note on `axis` above.
                     let tangent = [
-                        tangent[0] / tangent_len,
-                        tangent[1] / tangent_len,
-                        tangent[2] / tangent_len,
+                        -tangent[0] / tangent_len,
+                        -tangent[1] / tangent_len,
+                        -tangent[2] / tangent_len,
                     ];
 
                     let mut speed = 0.0;
@@ -1108,8 +1135,6 @@ impl ParticleSystem {
                 }
             }
 
-            p.x += p.vx * dt;
-            p.y += p.vy * dt;
             p.life -= dt;
 
             // Reference order (CParticle.cpp createAngularMovementOperator):
@@ -1287,10 +1312,14 @@ impl ParticleSystem {
                     let sy = ms.speed_min[1]
                         + fastrand::f32() * (ms.speed_max[1] - ms.speed_min[1]).max(0.0);
                     let (sin, cos) = angle.sin_cos();
-                    // The reference's glm::mat3 is column-major:
-                    // v' = (cos*x + sin*y, -sin*x + cos*y).
-                    vx = (cos * sx + sin * sy) * self.speed_mult;
-                    vy = (-sin * sx + cos * sy) * self.speed_mult;
+                    // The reference rotates in its y-up sim space
+                    // (v' = (cos*x + sin*y, -sin*x + cos*y), column-major
+                    // glm::mat3) and projects y-up; our space is y-down, so
+                    // the net screen-space rotation is the conjugate —
+                    // otherwise the spawn sequence sweeps the circle in the
+                    // mirrored direction.
+                    vx = (cos * sx - sin * sy) * self.speed_mult;
+                    vy = (sin * sx + cos * sy) * self.speed_mult;
                 }
 
                 // `turbulentvelocityrandom` (CParticle.cpp): curl-noise
@@ -2446,8 +2475,10 @@ mod tests {
     }
 
     /// `vortex` spins particles tangentially around its control point: a
-    /// particle at +X from the center with a +Z axis must gain +Y velocity
-    /// (cross(axis, radial)), scaled by speedinner inside distanceinner.
+    /// particle at +X from the center with a +Z axis must gain -Y velocity
+    /// in our y-down space (the reference's y-up cross(axis, radial),
+    /// mirrored — see the reflection note in `step`), scaled by speedinner
+    /// inside distanceinner.
     #[test]
     fn vortex_operator_adds_tangential_velocity() {
         let json = r#"{
@@ -2464,11 +2495,34 @@ mod tests {
         sys.step(0.1);
         let p = &sys.particles[0];
         assert!(
-            p.vy > 0.5,
-            "expected tangential +Y velocity from vortex, got vy={}",
+            p.vy < -0.5,
+            "expected tangential -Y velocity from vortex, got vy={}",
             p.vy
         );
         assert!(p.vx.abs() < 1e-3, "no radial force expected, got vx={}", p.vx);
+    }
+
+    /// `movement.drag` decays velocity by `1 - drag*dt` per step, clamped
+    /// at zero so an over-large `drag*dt` stops the particle instead of
+    /// reversing it (CParticle.cpp createMovementOperator).
+    #[test]
+    fn movement_drag_decays_velocity_without_reversal() {
+        let json = r#"{
+            "maxcount": 1,
+            "emitter": [{"name":"box","rate":0}],
+            "operator": [{"id":1,"name":"movement","gravity":"0 0 0","drag":4.0}]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        let mut p = make_particle(50.0, 50.0, 5.0, 0.0);
+        p.vx = 100.0;
+        sys.particles.push(p);
+
+        sys.step(0.1); // drag*dt = 0.4 -> vx *= 0.6
+        assert!((sys.particles[0].vx - 60.0).abs() < 1e-3);
+
+        sys.step(0.5); // drag*dt = 2.0 -> clamps to 0, must not reverse
+        assert_eq!(sys.particles[0].vx, 0.0);
     }
 
     /// `mapsequencearoundcontrolpoint` spawns at the control point and
@@ -2553,8 +2607,10 @@ mod tests {
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
         assert_eq!(sys.velocity_min, Some([3.0, 3.0, 0.0]));
         assert_eq!(sys.velocity_max, Some([3.0, 3.0, 0.0]));
-        // WE Y-up gravity -7 maps to our Y-down +7.
-        assert_eq!(sys.gravity[1].abs(), 7.0);
+        // Preset vectors apply unflipped in our y-down space: the reference
+        // flips y into its y-up sim space and flips again at projection, so
+        // the net screen-space direction equals the raw preset value.
+        assert_eq!(sys.gravity[1], -7.0);
     }
 
     /// A config with no `alpharandom` initializer at all must stay a no-op
