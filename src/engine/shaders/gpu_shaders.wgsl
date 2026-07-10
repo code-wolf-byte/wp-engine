@@ -89,6 +89,12 @@ struct CompositeParams {
 }
 @group(0) @binding(2) var<uniform> composite: CompositeParams;
 @group(0) @binding(3) var dest_copy_tex: texture_2d<f32>;
+// Further extra slots (same white-1x1 dummy fallback as slot 0): hardcoded
+// effect kernels read their opacity masks from whichever slot the real WE
+// material assigns (waterripple/tint/opacity/spin: slot 1 -> binding 3;
+// pulse: slot 2 -> binding 4; shake: slot 3 -> binding 5).
+@group(0) @binding(4) var extra_tex1: texture_2d<f32>;
+@group(0) @binding(5) var extra_tex2: texture_2d<f32>;
 
 // Quad vertex shader for object composites: two triangles covering the
 // object's rect, generated from vertex_index (no vertex buffer).
@@ -257,6 +263,16 @@ fn blend_rgb(mode: i32, base: vec3<f32>, blend: vec3<f32>) -> vec3<f32> {
         let b = rgb_to_hsl(base);
         return hsl_to_rgb(vec3(b.x, b.y, rgb_to_hsl(blend).z));
     }
+    // WE extensions past the Photoshop table (common_blending.h):
+    // 30 = BlendTint (max channel of base, colored), 31 = plain add,
+    // 32 = glow (base + base*blend). The caller's mix-by-alpha wrapper
+    // matches ApplyBlending's own mix/add-by-opacity forms.
+    if (mode == 30) {
+        let peak = max(base.r, max(base.g, base.b));
+        return vec3(peak) * blend;
+    }
+    if (mode == 31) { return base + blend; }
+    if (mode == 32) { return base + base * blend; }
     return blend;
 }
 
@@ -276,12 +292,13 @@ fn fs_composite_blend(
     let screen_uv = frag_coord.xy / composite.resolution;
     let dest = textureSample(dest_copy_tex, src_sampler, screen_uv);
     let src_rgb = s.rgb * composite.color;
-    // Mode 30 (ours, above WE's 0-29 Photoshop range): pure premultiplied
-    // add for additive particle layers. The CPU rasterizer already
-    // accumulated `src * src_a` per particle (GL_SRC_ALPHA/GL_ONE), so the
-    // buffer's RGB is ready to add as-is — weighting by its alpha here
-    // would apply each particle's alpha twice.
-    if (composite.mode == 30) {
+    // Mode 100 (ours, above WE's real 0-32 blend range — 30/31/32 are
+    // BlendTint/add/glow in common_blending.h): pure premultiplied add for
+    // additive particle layers. The CPU rasterizer already accumulated
+    // `src * src_a` per particle (GL_SRC_ALPHA/GL_ONE), so the buffer's RGB
+    // is ready to add as-is — weighting by its alpha here would apply each
+    // particle's alpha twice.
+    if (composite.mode == 100) {
         return vec4(min(dest.rgb + src_rgb, vec3(1.0)), dest.a);
     }
     let src_a = s.a * composite.opacity;
@@ -379,8 +396,8 @@ struct PulseParams {
     amount: f32,
     power: f32,
     phase: f32,
-    _p1: f32,
-    _p2: f32,
+    bounds_x: f32,
+    bounds_y: f32,
     _p3: f32,
     tint_low: vec3<f32>,
     _pad0: f32,
@@ -389,13 +406,18 @@ struct PulseParams {
 }
 @group(1) @binding(0) var<uniform> pulse: PulseParams;
 
+// pulse.frag's non-audio path with its default BLENDMODE 9 (linear dodge):
+// rgb = rgb*tintlow + rgb*tinthigh * pulse, where pulse =
+// smoothstep(bounds, sin wave)*amount ^ power; the opacity mask (material
+// slot 2) lerps the whole effect against the untouched sample.
 @fragment
 fn fs_pulse(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv);
+    let mask = textureSample(extra_tex1, src_sampler, uv).r;
     let raw = sin(pulse.time * pulse.speed + pulse.phase - 1.5708) * 0.5 + 0.5;
-    let p = pow(smoothstep(0.0, 1.0, raw) * pulse.amount, pulse.power);
-    let tint = mix(pulse.tint_low, pulse.tint_high, p);
-    return vec4(s.rgb * tint, s.a);
+    let p = pow(smoothstep(pulse.bounds_x, pulse.bounds_y, raw) * pulse.amount, pulse.power);
+    let pulsed = s.rgb * pulse.tint_low + s.rgb * pulse.tint_high * p;
+    return vec4(mix(s.rgb, min(pulsed, vec3(1.0)), mask), s.a);
 }
 
 // ── Scroll ───────────────────────────────────────────────────────────────────
@@ -436,7 +458,8 @@ fn fs_shake(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let base = step(0.0, cos(t));
     offset = mix(1.0 - pow(max(1.0 - offset, 0.001), 2.0), pow(max(offset, 0.001), 2.0), base);
     offset = offset * 2.0 - 1.0;
-    let tc = uv + vec2(offset * shake.strength * shake.strength, 0.0);
+    let mask = textureSample(extra_tex2, src_sampler, uv).r;
+    let tc = uv + vec2(offset * shake.strength * shake.strength * mask, 0.0);
     return textureSample(src_tex, src_sampler, tc);
 }
 
@@ -450,10 +473,14 @@ struct TintParams {
 }
 @group(1) @binding(0) var<uniform> tint: TintParams;
 
+// tint.frag's default BLENDMODE 30 = BlendTint: the max channel of the
+// base broadcast, colored by the tint — not a plain multiply.
 @fragment
 fn fs_tint(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv);
-    let tinted = mix(s.rgb, s.rgb * vec3(tint.r, tint.g, tint.b), tint.alpha);
+    let mask = textureSample(dest_copy_tex, src_sampler, uv).r;
+    let peak = max(s.r, max(s.g, s.b));
+    let tinted = mix(s.rgb, vec3(peak) * vec3(tint.r, tint.g, tint.b), tint.alpha * mask);
     return vec4(tinted, s.a);
 }
 
@@ -470,7 +497,8 @@ struct OpacityParams {
 @fragment
 fn fs_opacity(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv);
-    return vec4(s.rgb, s.a * opacity.alpha);
+    let mask = textureSample(dest_copy_tex, src_sampler, uv).r;
+    return vec4(s.rgb, s.a * opacity.alpha * mask);
 }
 
 // ── Water Ripple ─────────────────────────────────────────────────────────────
@@ -488,7 +516,8 @@ fn fs_waterripple(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s1 = sin((uv.x * ripple.scale + ripple.time * ripple.speed) * 6.28318);
     let s2 = sin((uv.y * ripple.scale * 0.7 + ripple.time * ripple.speed * 0.8) * 6.28318);
     let n = s1 * s2;
-    let tc = uv + vec2(n, n * 0.7) * ripple.strength * 0.01;
+    let mask = textureSample(dest_copy_tex, src_sampler, uv).r;
+    let tc = uv + vec2(n, n * 0.7) * ripple.strength * ripple.strength * mask;
     return textureSample(src_tex, src_sampler, tc);
 }
 
@@ -531,9 +560,16 @@ struct SpinParams {
     speed: f32,
     center_x: f32,
     center_y: f32,
+    size: f32,
+    feather: f32,
+    _p1: f32,
+    _p2: f32,
 }
 @group(1) @binding(0) var<uniform> spin: SpinParams;
 
+// spin.frag rotates only a feathered disc of radius `size` around `center`
+// (smoothstep falloff), mixed over the untouched sample and scaled by the
+// opacity mask — not a whole-layer rotation.
 @fragment
 fn fs_spin(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let center = vec2(spin.center_x, spin.center_y);
@@ -542,5 +578,9 @@ fn fs_spin(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let cs = vec2(cos(angle), sin(angle));
     let rotated = vec2(delta.x * cs.x - delta.y * cs.y, delta.x * cs.y + delta.y * cs.x);
     let tc = fract(rotated + center);
-    return textureSample(src_tex, src_sampler, tc);
+    let original = textureSample(src_tex, src_sampler, uv);
+    let spun = textureSample(src_tex, src_sampler, tc);
+    var mask = smoothstep(spin.size + spin.feather + 0.00001, spin.size - spin.feather, length(delta));
+    mask = mask * textureSample(dest_copy_tex, src_sampler, uv).r;
+    return mix(original, spun, mask);
 }

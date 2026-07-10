@@ -1885,7 +1885,7 @@ impl GpuSceneInstance {
         // alpha-over (mode 0) otherwise makes a sprite's near-black
         // background visibly darken/box the scene instead of contributing
         // nothing, since particle compositing previously always used mode 0.
-        const BLEND_MODE_PARTICLE_ADD: i32 = 30;
+        const BLEND_MODE_PARTICLE_ADD: i32 = 100;
         let mode = if additive { BLEND_MODE_PARTICLE_ADD } else { 0 };
         let composite_buf = self.renderer.make_uniform_buffer(
             &composite_params(
@@ -2803,61 +2803,57 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
         floats.iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
+    // Keys below are the shader annotations' material keys (the names
+    // scene.json constantshadervalues actually use); defaults match each
+    // annotation's declared default.
     match name {
         "pulse" => pack(&[
             time,
-            get(vals, "ui_editor_properties_pulse_speed", 3.0),
-            get(vals, "ui_editor_properties_pulse_amount", 1.0),
-            get(vals, "ui_editor_properties_power", 1.0),
-            get(vals, "ui_editor_properties_pulse_phase", 0.0),
+            get(vals, "speed", 3.0),
+            get(vals, "amount", 1.0),
+            get(vals, "power", 1.0),
+            get(vals, "phase", 0.0),
+            get(vals, "bounds_r", 0.0),
+            get(vals, "bounds_g", 1.0),
             0.0,
-            0.0,
-            0.0,
-            // tint_low: 0.5 so pulse oscillates 50%–100% brightness
-            get(vals, "ui_editor_properties_tint_low_r", 0.5),
-            get(vals, "ui_editor_properties_tint_low_g", 0.5),
-            get(vals, "ui_editor_properties_tint_low_b", 0.5),
+            get(vals, "tintlow_r", 1.0),
+            get(vals, "tintlow_g", 1.0),
+            get(vals, "tintlow_b", 1.0),
             0.0, // pad
-            // tint_high RGB (default white)
-            get(vals, "ui_editor_properties_tint_high_r", 1.0),
-            get(vals, "ui_editor_properties_tint_high_g", 1.0),
-            get(vals, "ui_editor_properties_tint_high_b", 1.0),
+            get(vals, "tinthigh_r", 1.0),
+            get(vals, "tinthigh_g", 1.0),
+            get(vals, "tinthigh_b", 1.0),
             0.0, // pad
         ]),
         "scroll" => pack(&[
             time,
-            get(vals, "ui_editor_properties_speed_x", 0.1),
-            get(vals, "ui_editor_properties_speed_y", 0.0),
-            get(vals, "ui_editor_properties_scale_x", 1.0),
-            get(vals, "ui_editor_properties_scale_y", 1.0),
+            get(vals, "speedx", 0.2),
+            get(vals, "speedy", 0.2),
+            get(vals, "repeat_r", 1.0),
+            get(vals, "repeat_g", 1.0),
             0.0,
             0.0,
             0.0,
         ]),
         "shake" => pack(&[
             time,
-            get(vals, "ui_editor_properties_speed", 1.0),
-            get(vals, "ui_editor_properties_strength", 0.1),
+            get(vals, "speed", 1.0),
+            get(vals, "strength", 0.1),
             0.0,
         ]),
         "tint" => {
-            let r = get(vals, "ui_editor_properties_color_r", 1.0);
-            let g = get(vals, "ui_editor_properties_color_g", 1.0);
-            let b = get(vals, "ui_editor_properties_color_b", 1.0);
-            let a = get(vals, "ui_editor_properties_opacity", 0.5);
+            let r = get(vals, "color_r", 1.0);
+            let g = get(vals, "color_g", 0.0);
+            let b = get(vals, "color_b", 0.0);
+            let a = get(vals, "alpha", 1.0);
             pack(&[r, g, b, a])
         }
-        "opacity" => pack(&[
-            get(vals, "ui_editor_properties_opacity", 1.0),
-            0.0,
-            0.0,
-            0.0,
-        ]),
+        "opacity" => pack(&[get(vals, "alpha", 1.0), 0.0, 0.0, 0.0]),
         "waterripple" => pack(&[
             time,
-            get(vals, "ui_editor_properties_strength", 0.1),
-            get(vals, "ui_editor_properties_speed", 0.15),
-            get(vals, "ui_editor_properties_scale", 1.0),
+            get(vals, "ripplestrength", 0.1),
+            get(vals, "animationspeed", 0.15),
+            get(vals, "scale", 1.0),
         ]),
         "waterwaves" => {
             // Direction is the reference's rotateVec2((0, 1), angle) —
@@ -2876,9 +2872,13 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
         }
         "spin" => pack(&[
             time,
-            get(vals, "ui_editor_properties_speed", 1.0),
-            get(vals, "ui_editor_properties_center_x", 0.5),
-            get(vals, "ui_editor_properties_center_y", 0.5),
+            get(vals, "speed", 1.0),
+            get(vals, "center_r", 0.5),
+            get(vals, "center_g", 0.5),
+            get(vals, "size", 0.1),
+            get(vals, "feather", 0.002),
+            0.0,
+            0.0,
         ]),
         _ => vec![0u8; 32],
     }
