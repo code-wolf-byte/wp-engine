@@ -1837,7 +1837,9 @@ impl GpuSceneInstance {
         delta: f32,
     ) {
         let system = &mut self.particle_systems[idx];
+        let _t_step = std::time::Instant::now();
         system.step(delta);
+        let step_ms = _t_step.elapsed().as_secs_f32() * 1000.0;
         let Some((min_x, min_y, max_x, max_y)) = system.bounds() else {
             return;
         };
@@ -1851,14 +1853,39 @@ impl GpuSceneInstance {
         let bw = (max_x - min_x).ceil().max(1.0) as u32;
         let bh = (max_y - min_y).ceil().max(1.0) as u32;
 
+        // Cap the CPU rasterization cost: huge soft sprites (smoke clouds,
+        // rain sheets with radii in the hundreds of pixels) can cover most
+        // of a 4K scene — rasterize into a budgeted buffer and let the
+        // composite quad stretch it back up. Cost scales with the square of
+        // this factor; the blur from upscaling is invisible on sprites that
+        // are soft gradients to begin with (e.g. 2491009392's rain+smoke
+        // went from ~0.6s/frame of CPU to real-time).
+        const PARTICLE_PIXEL_BUDGET: f32 = 1_500_000.0;
+        let area = bw as f32 * bh as f32;
+        // Budget against total *coverage* (sum of per-particle quad areas),
+        // not the buffer size: overdraw from many huge overlapping sprites
+        // is what actually costs, and it shrinks with scale² the same way.
+        let coverage = system.coverage(area).max(area);
+        let raster_scale = (PARTICLE_PIXEL_BUDGET / coverage).sqrt().min(1.0).max(0.2);
+        let sw = ((bw as f32 * raster_scale).ceil() as u32).max(1);
+        let sh = ((bh as f32 * raster_scale).ceil() as u32).max(1);
+
         let additive = self.particle_additive.get(idx).copied().unwrap_or(false);
-        let mut buf = RgbaImage::new(bw, bh);
-        system.render_onto_blended(
+        let mut buf = RgbaImage::new(sw, sh);
+        let _t_raster = std::time::Instant::now();
+        system.render_onto_scaled(
             &mut buf,
             self.particle_sprites[idx].as_ref(),
             [min_x, min_y],
             additive,
+            raster_scale,
         );
+        if std::env::var("WP_DEBUG_PARTICLE_TIMING").is_ok() {
+            eprintln!(
+                "[timing] particles[{idx}]: step {step_ms:.1}ms, raster {sw}x{sh} (scale {raster_scale:.2}) {:.1}ms",
+                _t_raster.elapsed().as_secs_f32() * 1000.0
+            );
+        }
         let tex = self.renderer.upload_texture(&buf);
         let view = tex.create_view(&Default::default());
         let sampler = self.renderer.sampler_for(false, false);

@@ -1433,6 +1433,21 @@ impl ParticleSystem {
         }
     }
 
+    /// Total pixel coverage the rasterizer would write for one frame: the
+    /// sum of every particle's quad area, each clipped to the bounding-box
+    /// area. Overdraw — many huge overlapping sprites — makes this far
+    /// larger than the bounding box itself, and it is the number a raster
+    /// budget must divide, not the buffer size.
+    pub fn coverage(&self, bbox_area: f32) -> f32 {
+        self.particles
+            .iter()
+            .map(|p| {
+                let side = (p.size * 2.0).max(1.0);
+                (side * side).min(bbox_area)
+            })
+            .sum()
+    }
+
     /// Bounding box (`min_x, min_y, max_x, max_y`) over all alive particles'
     /// `position ± size` (with a small margin for the soft-falloff glow
     /// radius) — `None` when nothing is alive, so callers can skip a wasted
@@ -1481,8 +1496,25 @@ impl ParticleSystem {
         origin: [f32; 2],
         additive: bool,
     ) {
+        self.render_onto_scaled(canvas, sprite, origin, additive, 1.0);
+    }
+
+    /// `render_onto_blended` with all positions/sizes multiplied by `scale`
+    /// — lets a caller rasterize into a smaller-than-scene buffer that the
+    /// GPU compositor then stretches back up. Soft, huge sprites (smoke
+    /// clouds, rain sheets — radii in the hundreds of pixels) are the ones
+    /// that need this, and they lose nothing visible to the upscale, while
+    /// the CPU rasterization cost drops with scale².
+    pub fn render_onto_scaled(
+        &self,
+        canvas: &mut RgbaImage,
+        sprite: Option<&ParticleSprite>,
+        origin: [f32; 2],
+        additive: bool,
+        scale: f32,
+    ) {
         if self.rope_mode {
-            self.render_rope_onto(canvas, origin, additive);
+            self.render_rope_onto(canvas, origin, additive, scale);
             return;
         }
 
@@ -1494,12 +1526,12 @@ impl ParticleSystem {
             if alpha == 0 {
                 continue;
             }
-            let sz = p.size as i32;
+            let sz = (p.size * scale) as i32;
             if sz <= 0 {
                 continue;
             }
-            let px_pos = p.x - origin[0];
-            let py_pos = p.y - origin[1];
+            let px_pos = (p.x - origin[0]) * scale;
+            let py_pos = (p.y - origin[1]) * scale;
 
             if let Some(sprite) = sprite {
                 // `p.frame` is only ever set (in `step`) when the sprite has
@@ -1527,12 +1559,13 @@ impl ParticleSystem {
                         } else {
                             p.rotation
                         };
-                        (p.size, p.size * trail, angle)
+                        (p.size * scale, p.size * trail * scale, angle)
                     }
-                    None => (p.size, p.size, p.rotation),
+                    None => (p.size * scale, p.size * scale, p.rotation),
                 };
                 draw_textured_particle(
-                    canvas, px_pos, py_pos, half_w, half_h, rotation, p.color, alpha, tex, additive,
+                    canvas, px_pos, py_pos, half_w, half_h, rotation, p.color, alpha, tex,
+                    additive, scale < 0.9,
                 );
                 continue;
             }
@@ -1579,7 +1612,7 @@ impl ParticleSystem {
     /// repo) from a tangent/normal it derives per-vertex — this perpendicular-
     /// offset quad approach is our own design for the same visual effect,
     /// informed by, but not a line-for-line port of, that shader.
-    fn render_rope_onto(&self, canvas: &mut RgbaImage, origin: [f32; 2], additive: bool) {
+    fn render_rope_onto(&self, canvas: &mut RgbaImage, origin: [f32; 2], additive: bool, scale: f32) {
         let n = self.particles.len();
         if n < 2 {
             return;
@@ -1612,8 +1645,11 @@ impl ParticleSystem {
                     t,
                 );
                 subpoints.push(SubPoint {
-                    pos: [pos[0] - origin[0], pos[1] - origin[1]],
-                    size: lerp_f32(p1.size, p2.size, t),
+                    pos: [
+                        (pos[0] - origin[0]) * scale,
+                        (pos[1] - origin[1]) * scale,
+                    ],
+                    size: lerp_f32(p1.size, p2.size, t) * scale,
                     alpha: lerp_f32(p1.alpha, p2.alpha, t),
                     color: [
                         lerp_f32(p1.color[0] as f32, p2.color[0] as f32, t) as u8,
@@ -1625,8 +1661,11 @@ impl ParticleSystem {
         }
         let last = &self.particles[n - 1];
         subpoints.push(SubPoint {
-            pos: [last.x - origin[0], last.y - origin[1]],
-            size: last.size,
+            pos: [
+                (last.x - origin[0]) * scale,
+                (last.y - origin[1]) * scale,
+            ],
+            size: last.size * scale,
             color: last.color,
             alpha: last.alpha,
         });
@@ -1844,6 +1883,7 @@ fn draw_textured_particle(
     alpha_byte: u8,
     tex: &RgbaImage,
     additive: bool,
+    nearest: bool,
 ) {
     // `p.size` is already a radius, not a diameter (see `sizerandom`'s
     // comment on the halving done at spawn) — matches the flat-color circle
@@ -1878,7 +1918,11 @@ fn draw_textured_particle(
             }
             let u = (lx + half_w) / (2.0 * half_w);
             let v = (ly + half_h) / (2.0 * half_h);
-            let sample = sample_bilinear(tex, u, v);
+            let sample = if nearest {
+                sample_nearest(tex, u, v)
+            } else {
+                sample_bilinear(tex, u, v)
+            };
             let src_a = (sample[3] as f32 / 255.0) * (alpha_byte as f32 / 255.0);
             if src_a <= 0.0 {
                 continue;
@@ -1929,6 +1973,18 @@ fn blend_pixel(dst: &mut image::Rgba<u8>, src_c: [f32; 3], src_a: f32, additive:
         }
     }
     dst[3] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+}
+
+/// Point sampling — used when the raster target is itself downscaled (the
+/// GPU upscale blurs anyway), saving the 4-tap filter per pixel.
+fn sample_nearest(tex: &RgbaImage, u: f32, v: f32) -> [u8; 4] {
+    let (tw, th) = (tex.width(), tex.height());
+    if tw == 0 || th == 0 {
+        return [0; 4];
+    }
+    let x = ((u.clamp(0.0, 1.0) * (tw as f32 - 1.0)) + 0.5) as u32;
+    let y = ((v.clamp(0.0, 1.0) * (th as f32 - 1.0)) + 0.5) as u32;
+    tex.get_pixel(x.min(tw - 1), y.min(th - 1)).0
 }
 
 fn sample_bilinear(tex: &RgbaImage, u: f32, v: f32) -> [u8; 4] {
