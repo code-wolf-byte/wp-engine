@@ -104,6 +104,10 @@ pub struct TexFrame {
 
 pub struct TexFile {
     format: TexFormat,
+    /// Embedded-video texture (mp4 payload in the first mipmap; WE flag 32
+    /// or a TEXB0004 video container). Pixel decoding doesn't apply —
+    /// callers extract `video_bytes()` and hand them to ffmpeg.
+    is_video: bool,
     free_image: FreeImageFormat,
     flags: u32,
     /// Real (unpadded) image dimensions.
@@ -132,6 +136,7 @@ impl TexFile {
                         // unswizzle path, so the original encoded bytes (not
                         // already-decoded RGBA) must be stored here.
                         format: TexFormat::Rgba8,
+                        is_video: false,
                         free_image: FreeImageFormat::Other,
                         flags: 0,
                         image_width: w,
@@ -204,9 +209,7 @@ impl TexFile {
             free_image = FreeImageFormat::from_u32(fif_id);
         }
 
-        if is_video || (flags & 32) != 0 {
-            bail!("embedded video texture (not a static image)");
-        }
+        let is_video_tex = is_video || (flags & 32) != 0;
 
         let mut images = Vec::with_capacity(image_count as usize);
         for _ in 0..image_count {
@@ -233,6 +236,7 @@ impl TexFile {
 
         Ok(Self {
             format,
+            is_video: is_video_tex,
             free_image,
             flags,
             image_width,
@@ -245,6 +249,9 @@ impl TexFile {
     }
 
     fn decode_mipmap(&self, mip: &Mipmap, channel_alpha: bool) -> Result<RgbaImage> {
+        if self.is_video {
+            bail!("embedded video texture: decode via video_bytes()/ffmpeg, not as pixels");
+        }
         if self.free_image != FreeImageFormat::Unknown {
             let img = image::load_from_memory(&mip.data)
                 .context("decoding FreeImage-format .tex payload")?;
@@ -295,6 +302,18 @@ impl TexFile {
 
     pub fn flags(&self) -> u32 {
         self.flags
+    }
+
+    pub fn is_video(&self) -> bool {
+        self.is_video
+    }
+
+    /// The embedded video container bytes (e.g. mp4) for video textures.
+    pub fn video_bytes(&self) -> Option<&[u8]> {
+        if !self.is_video {
+            return None;
+        }
+        self.images.first()?.first().map(|m| m.data.as_slice())
     }
 
     /// Nearest-neighbor sampling instead of the default linear/bilinear.

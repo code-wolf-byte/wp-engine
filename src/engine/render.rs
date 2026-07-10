@@ -153,7 +153,7 @@ impl LoadedImage {
         Ok(Self {
             no_interpolation,
             clamp_uvs,
-            ..Self::single(tex.to_rgba()?)
+            ..Self::single(tex_to_rgba(tex)?)
         })
     }
 }
@@ -162,10 +162,21 @@ impl ResolvedScene {
     /// Load a scene wallpaper from a directory.
     ///
     /// Automatically detects whether assets are loose files or packed in a
-    /// `.pkg` archive and loads accordingly.
+    /// `.pkg` archive and loads accordingly. The scene file is usually
+    /// `scene.json`/`scene.pkg`, but project.json's `file` field can name a
+    /// different one — GIF-converted wallpapers ship
+    /// `gifscene.json`/`gifscene.pkg` (e.g. workshop item 2036522973).
     pub fn from_directory(dir: &Path) -> Result<Self> {
-        let scene_json_path = dir.join("scene.json");
-        let scene_pkg_path = dir.join("scene.pkg");
+        let scene_name = std::fs::read_to_string(dir.join("project.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|p| p.get("file")?.as_str().map(str::to_string))
+            .filter(|f| f.ends_with(".json"))
+            .unwrap_or_else(|| "scene.json".to_string());
+        let pkg_name = format!("{}.pkg", scene_name.trim_end_matches(".json"));
+
+        let scene_json_path = dir.join(&scene_name);
+        let scene_pkg_path = dir.join(&pkg_name);
 
         if scene_pkg_path.exists() {
             let pkg = Package::from_file(&scene_pkg_path)?;
@@ -173,11 +184,11 @@ impl ResolvedScene {
             let scene_json = if scene_json_path.exists() {
                 std::fs::read_to_string(&scene_json_path)
                     .with_context(|| format!("reading {}", scene_json_path.display()))?
-            } else if let Some(data) = pkg.get("scene.json") {
+            } else if let Some(data) = pkg.get(&scene_name).or_else(|| pkg.get("scene.json")) {
                 String::from_utf8(data.to_vec())
-                    .context("scene.json inside PKG is not valid UTF-8")?
+                    .context("scene json inside PKG is not valid UTF-8")?
             } else {
-                anyhow::bail!("no scene.json found in directory or PKG archive");
+                anyhow::bail!("no {scene_name} found in directory or PKG archive");
             };
 
             return Self::from_package_with_dir(&pkg, &scene_json, dir);
@@ -826,6 +837,29 @@ fn text_layer_from_object(
     ))
 }
 
+/// Decode a parsed .tex to RGBA, routing embedded-video payloads (mp4
+/// inside the container, e.g. 2914504963's Taj Mahal backdrop) through
+/// ffmpeg's first-frame decode instead of the pixel path — a static frame
+/// of the right content beats the gray placeholder the layer otherwise
+/// falls back to. (Streaming playback of embedded videos is future work.)
+fn tex_to_rgba(tex: &TexFile) -> Result<RgbaImage> {
+    if let Some(bytes) = tex.video_bytes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "we_embvid_{}.mp4",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&tmp, bytes)
+            .with_context(|| format!("writing embedded video temp file: {}", tmp.display()))?;
+        let result = crate::render::ffmpeg::decode_first_frame(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    tex.to_rgba()
+}
+
 fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<LoadedImage> {
     // If it's a .json reference, resolve the model/material chain
     if image_path.ends_with(".json") {
@@ -1019,14 +1053,14 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
-    let atlas = find_model_chain_tex_pkg(pkg, json_path)?.0.to_rgba()?;
+    let atlas = tex_to_rgba(&find_model_chain_tex_pkg(pkg, json_path)?.0)?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
     }))
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
-    let atlas = find_model_chain_tex_dir(dir, json_path)?.0.to_rgba()?;
+    let atlas = tex_to_rgba(&find_model_chain_tex_dir(dir, json_path)?.0)?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         std::fs::read(dir.join(rel))
             .ok()
