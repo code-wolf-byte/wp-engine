@@ -13,10 +13,39 @@ pub struct Scene {
     pub objects: Vec<SceneObject>,
 }
 
+impl Scene {
+    /// True for genuine 3D scenes: no usable orthogonal projection anywhere
+    /// (the key may be absent, JSON `null`, or missing width/height — WE
+    /// writes `"orthogonalprojection": null` for perspective scenes) and a
+    /// camera with parseable eye+center. The reference has no perspective
+    /// path (CScene.cpp always calls setOrthogonalProjection), so these
+    /// scenes are broken there too; we project them ourselves.
+    pub fn is_perspective(&self) -> bool {
+        let usable = |o: &Option<OrthogonalProjection>| {
+            o.as_ref()
+                .is_some_and(|p| p.width.is_some() && p.height.is_some())
+        };
+        let has_ortho = self
+            .camera
+            .as_ref()
+            .is_some_and(|c| usable(&c.orthogonal_projection))
+            || self
+                .general
+                .as_ref()
+                .is_some_and(|g| usable(&g.orthogonal_projection));
+        !has_ortho
+            && self
+                .camera
+                .as_ref()
+                .is_some_and(|c| c.parsed_eye().is_some() && c.parsed_center().is_some())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Camera {
     pub center: Option<serde_json::Value>,
     pub eye: Option<serde_json::Value>,
+    pub up: Option<serde_json::Value>,
     #[serde(rename = "parallaxamount")]
     pub parallax_amount: Option<f64>,
     #[serde(rename = "orthogonalprojection")]
@@ -30,6 +59,10 @@ impl Camera {
 
     pub fn parsed_center(&self) -> Option<[f64; 3]> {
         self.center.as_ref().and_then(parse_value_vec3)
+    }
+
+    pub fn parsed_up(&self) -> Option<[f64; 3]> {
+        self.up.as_ref().and_then(parse_value_vec3)
     }
 }
 
@@ -69,6 +102,10 @@ pub struct General {
     pub camera_shake_roughness: Option<serde_json::Value>,
     #[serde(rename = "camerashakespeed")]
     pub camera_shake_speed: Option<serde_json::Value>,
+    // Perspective projection (3D scenes; vertical FOV in degrees)
+    pub fov: Option<serde_json::Value>,
+    pub nearz: Option<serde_json::Value>,
+    pub farz: Option<serde_json::Value>,
     // Scene-level bloom (user-settable)
     pub bloom: Option<serde_json::Value>,
     #[serde(rename = "bloomstrength")]

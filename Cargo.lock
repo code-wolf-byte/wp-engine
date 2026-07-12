@@ -4912,6 +4912,7 @@ dependencies = [
  "serde_json",
  "shaderc",
  "smithay-client-toolkit 0.18.1",
+ "tracing",
  "wayland-backend",
  "wayland-client 0.31.12",
  "wayland-protocols-wlr 0.2.0",
