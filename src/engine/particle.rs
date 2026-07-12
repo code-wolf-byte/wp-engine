@@ -82,7 +82,7 @@ impl AnimationMode {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Default, Debug, Deserialize)]
 pub struct ControlPointConfig {
     #[serde(default)]
     pub id: Option<i64>,
@@ -144,6 +144,10 @@ pub struct Initializer {
     pub controlpoint: Option<i64>,
     #[serde(default)]
     pub count: Option<f64>,
+    /// `mapsequencebetweencontrolpoints`: `"mirror"` ping-pongs the
+    /// sequence along the segment instead of wrapping.
+    #[serde(default)]
+    pub limitbehavior: Option<String>,
     #[serde(default)]
     pub offset: Option<f64>,
     #[serde(default)]
@@ -267,6 +271,11 @@ pub struct InstanceOverride {
     pub rate: Option<f64>,
     pub size: Option<f64>,
     pub speed: Option<f64>,
+    /// Remaining override keys — notably `controlpointN` ("x y z" strings,
+    /// absolute scene coordinates) that reposition a preset's control
+    /// points per instance (e.g. the discharge preset's arc endpoint).
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Per-particle oscillator state for `oscillatealpha`/`oscillatesize`: a
@@ -441,6 +450,9 @@ pub struct ParticleSystem {
     /// counter (shared across spawns, wraps at `count`).
     map_sequence: Option<MapSequenceParams>,
     map_sequence_index: u32,
+    /// `mapsequencebetweencontrolpoints` initializer + its counter.
+    map_seq_between: Option<MapSequenceBetweenParams>,
+    map_seq_between_index: u32,
     /// `turbulentvelocityrandom` initializer parameters.
     turbulent_velocity: Option<TurbulentVelocityParams>,
     /// `turbulence` operator parameters.
@@ -487,6 +499,19 @@ struct SpriteTrailParams {
     length: f32,
     max_length: f32,
     min_length: f32,
+}
+
+/// `mapsequencebetweencontrolpoints` initializer: spawns successive
+/// particles at evenly spaced points along the segment from control point
+/// 0 to control point 1 (`count` slots). `limitbehavior: "mirror"`
+/// ping-pongs the sequence; anything else wraps. Neither the C++ reference
+/// nor its parser implements this one — semantics derived from real
+/// content (the `discharge` preset draws a rope through the chain,
+/// yielding a lightning arc between the two anchors).
+#[derive(Clone, Copy)]
+struct MapSequenceBetweenParams {
+    count: u32,
+    mirror: bool,
 }
 
 /// `mapsequencearoundcontrolpoint` initializer (CParticle.cpp): spawns each
@@ -880,6 +905,15 @@ impl ParticleSystem {
                     .unwrap_or([100.0; 3]),
             });
 
+        let map_seq_between = config
+            .initializer
+            .iter()
+            .find(|init| init.name == "mapsequencebetweencontrolpoints")
+            .map(|init| MapSequenceBetweenParams {
+                count: (init.count.unwrap_or(2.0) as u32).max(2),
+                mirror: init.limitbehavior.as_deref() == Some("mirror"),
+            });
+
         let vortex = config
             .operator
             .iter()
@@ -961,6 +995,8 @@ impl ParticleSystem {
             sprite_trail,
             map_sequence,
             map_sequence_index: 0,
+            map_seq_between,
+            map_seq_between_index: 0,
             turbulent_velocity,
             turbulence,
             vortex,
@@ -1295,6 +1331,30 @@ impl ParticleSystem {
                 let mut spawn_x = ox + (fastrand::f32() - 0.5) * spread_x;
                 let mut spawn_y = oy + (fastrand::f32() - 0.5) * spread_y;
 
+                // `mapsequencebetweencontrolpoints`: the Nth spawn sits at
+                // the Nth slot along the cp0->cp1 segment (mirror =
+                // ping-pong); velocityrandom still jitters it afterwards,
+                // which is what shapes the discharge preset's lightning.
+                if let Some(ms) = self.map_seq_between {
+                    let last = ms.count - 1;
+                    let idx = self.map_seq_between_index;
+                    self.map_seq_between_index = self.map_seq_between_index.wrapping_add(1);
+                    let slot = if ms.mirror {
+                        let period = 2 * last;
+                        let k = idx % period.max(1);
+                        if k <= last { k } else { period - k }
+                    } else {
+                        idx % ms.count
+                    };
+                    let t = slot as f32 / last as f32;
+                    if let (Some(a), Some(b)) =
+                        (self.control_points.first(), self.control_points.get(1))
+                    {
+                        spawn_x = a[0] + (b[0] - a[0]) * t;
+                        spawn_y = a[1] + (b[1] - a[1]) * t;
+                    }
+                }
+
                 // `mapsequencearoundcontrolpoint` (CParticle.cpp): spawn at
                 // the control point, launching successive particles at
                 // evenly-spaced angles around a circle (the initializer
@@ -1537,10 +1597,25 @@ impl ParticleSystem {
                 // `p.frame` is only ever set (in `step`) when the sprite has
                 // more than one frame; a single-frame sprite always draws
                 // frame 0 regardless of its (unused, still -1.0) value.
-                let frame_idx = if sprite.frames.len() > 1 {
-                    (p.frame.max(0.0) as usize).min(sprite.frames.len() - 1)
+                //
+                // Cross-fade: the fractional part of `p.frame` blends toward
+                // the NEXT frame, clamped at the last frame (the real
+                // engine's ComputeSpriteFrame uses
+                // `nextFrame = min(numFrames - 1, currentFrame + 1)` — no
+                // wrap, in any animation mode). RandomFrame assigns integer
+                // frames, so its fraction is 0 and no second sample happens.
+                let (frame_idx, next_frame) = if sprite.frames.len() > 1 {
+                    let f = p.frame.max(0.0);
+                    let a = (f as usize).min(sprite.frames.len() - 1);
+                    let b = (a + 1).min(sprite.frames.len() - 1);
+                    let blend = f.fract();
+                    if b != a && blend > 1.0 / 255.0 {
+                        (a, Some((&sprite.frames[b], blend)))
+                    } else {
+                        (a, None)
+                    }
                 } else {
-                    0
+                    (0, None)
                 };
                 let tex = &sprite.frames[frame_idx];
                 // `spritetrail`: align the quad's V axis with the particle's
@@ -1565,7 +1640,7 @@ impl ParticleSystem {
                 };
                 draw_textured_particle(
                     canvas, px_pos, py_pos, half_w, half_h, rotation, p.color, alpha, tex,
-                    additive, scale < 0.9,
+                    next_frame, additive, scale < 0.9,
                 );
                 continue;
             }
@@ -1882,6 +1957,7 @@ fn draw_textured_particle(
     color: [u8; 3],
     alpha_byte: u8,
     tex: &RgbaImage,
+    next_frame: Option<(&RgbaImage, f32)>,
     additive: bool,
     nearest: bool,
 ) {
@@ -1918,11 +1994,24 @@ fn draw_textured_particle(
             }
             let u = (lx + half_w) / (2.0 * half_w);
             let v = (ly + half_h) / (2.0 * half_h);
-            let sample = if nearest {
+            let mut sample = if nearest {
                 sample_nearest(tex, u, v)
             } else {
                 sample_bilinear(tex, u, v)
             };
+            // Spritesheet cross-fade: mix toward the next frame's sample
+            // (genericparticle.frag's SPRITESHEETBLEND path).
+            if let Some((tex_b, blend)) = next_frame {
+                let b = if nearest {
+                    sample_nearest(tex_b, u, v)
+                } else {
+                    sample_bilinear(tex_b, u, v)
+                };
+                for c in 0..4 {
+                    sample[c] = (sample[c] as f32 + (b[c] as f32 - sample[c] as f32) * blend)
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
             let src_a = (sample[3] as f32 / 255.0) * (alpha_byte as f32 / 255.0);
             if src_a <= 0.0 {
                 continue;
@@ -2071,6 +2160,12 @@ fn value_as_f32(v: &serde_json::Value) -> Option<f32> {
     v.as_f64().map(|f| f as f32)
 }
 
+/// Public alias for callers outside this module (e.g. render.rs's
+/// control-point override plumbing).
+pub fn value_as_vec3_pub(v: &serde_json::Value) -> Option<[f32; 3]> {
+    value_as_vec3(v)
+}
+
 fn value_as_vec3(v: &serde_json::Value) -> Option<[f32; 3]> {
     match v {
         serde_json::Value::String(s) => Some(parse_f32_vec3(Some(s))),
@@ -2153,6 +2248,7 @@ mod tests {
             rate: Some(2.0),
             size: None,
             speed: None,
+            extra: Default::default(),
         };
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
         assert_eq!(sys.color_override, Some([192, 192, 192]));
@@ -2581,6 +2677,31 @@ mod tests {
         assert_eq!(sys.particles[0].vx, 0.0);
     }
 
+    /// `mapsequencebetweencontrolpoints` walks spawn positions along the
+    /// cp0->cp1 segment; `limitbehavior: "mirror"` ping-pongs (0, 1/3, 2/3,
+    /// 1, 2/3, 1/3, 0, ...) instead of wrapping.
+    #[test]
+    fn mapsequence_between_walks_segment_with_mirror() {
+        let json = r#"{
+            "maxcount": 8,
+            "emitter": [{"name":"box","rate":100000}],
+            "controlpoint": [{"id":0,"offset":"0 0 0"},{"id":1,"offset":"90 0 0"}],
+            "initializer": [
+                {"id":1,"name":"velocityrandom","min":"0 0 0","max":"0 0 0"},
+                {"id":2,"name":"mapsequencebetweencontrolpoints","count":4,"limitbehavior":"mirror"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        sys.step(0.001);
+        assert!(sys.particles.len() >= 7, "expected at least 7 spawns");
+        let xs: Vec<f32> = sys.particles.iter().take(7).map(|p| p.x).collect();
+        let expect = [0.0, 30.0, 60.0, 90.0, 60.0, 30.0, 0.0];
+        for (i, (&x, &e)) in xs.iter().zip(expect.iter()).enumerate() {
+            assert!((x - e).abs() < 1e-3, "slot {i}: expected x={e}, got {x}");
+        }
+    }
+
     /// `mapsequencearoundcontrolpoint` spawns at the control point and
     /// launches successive particles at evenly-divided angles: with
     /// `count: 4` and a +X-only speed, consecutive spawn velocities must
@@ -2610,6 +2731,63 @@ mod tests {
         assert!(sys.particles[0].vy.abs() < 1e-3);
         assert!(sys.particles[1].vx.abs() < 1e-3);
         assert!(sys.particles[1].vy.abs() > 79.0);
+    }
+
+    fn two_frame_sprite() -> ParticleSprite {
+        ParticleSprite {
+            frames: vec![
+                RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])),
+                RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 255, 255])),
+            ],
+            duration: 1.0,
+        }
+    }
+
+    fn render_center_with_frame(frame: f32) -> image::Rgba<u8> {
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":0}]}"#)
+                .expect("should parse");
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        let mut p = make_particle(20.0, 20.0, 8.0, 0.0);
+        p.frame = frame;
+        sys.particles.push(p);
+        let sprite = two_frame_sprite();
+        let mut canvas = RgbaImage::new(40, 40);
+        sys.render_onto(&mut canvas, Some(&sprite), [0.0, 0.0]);
+        *canvas.get_pixel(20, 20)
+    }
+
+    /// A fractional frame position cross-fades between the two adjacent
+    /// frames (genericparticle.frag's SPRITESHEETBLEND): halfway between a
+    /// red and a blue frame must paint ~50/50 purple, not hard-switch.
+    #[test]
+    fn fractional_frame_cross_fades_adjacent_frames() {
+        let px = render_center_with_frame(0.5);
+        assert!(px[0] > 100 && px[0] < 155, "red ~half, got {px:?}");
+        assert!(px[2] > 100 && px[2] < 155, "blue ~half, got {px:?}");
+        assert_eq!(px[1], 0);
+    }
+
+    /// The next frame is clamped at the last frame (ComputeSpriteFrame's
+    /// `min(numFrames - 1, currentFrame + 1)`) — a fraction past the final
+    /// frame must NOT wrap-blend back toward frame 0.
+    #[test]
+    fn cross_fade_clamps_at_last_frame_without_wrapping() {
+        let px = render_center_with_frame(1.5);
+        assert_eq!(px[0], 0, "no red from a wrap to frame 0: {px:?}");
+        assert!(px[2] > 200, "pure last frame, got {px:?}");
+    }
+
+    /// Integer frame positions (RandomFrame assigns whole frames) take the
+    /// single-sample path — exactly one frame's color, no blending.
+    #[test]
+    fn integer_frame_draws_single_frame_unblended() {
+        let px = render_center_with_frame(1.0);
+        assert_eq!(px[0], 0, "{px:?}");
+        assert!(px[2] > 200, "{px:?}");
+        let px0 = render_center_with_frame(0.0);
+        assert!(px0[0] > 200, "{px0:?}");
+        assert_eq!(px0[2], 0, "{px0:?}");
     }
 
     /// `spritetrail` stretches the quad along the particle's velocity:
@@ -2722,6 +2900,7 @@ mod tests {
             rate: None,
             size: None,
             speed: None,
+            extra: Default::default(),
         };
         let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
         sys.step(0.01);
