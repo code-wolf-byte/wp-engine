@@ -164,7 +164,7 @@ impl GpuScaler {
         match self.scale_gpu(upload_src, dst_w, dst_h) {
             Ok(pixels) => pixels,
             Err(e) => {
-                eprintln!("GPU scale failed, falling back to CPU: {e}");
+                tracing::warn!(target: "scaler", "GPU scale failed, falling back to CPU: {e}");
                 self.scale_cpu(src, dst_w, dst_h)
             }
         }

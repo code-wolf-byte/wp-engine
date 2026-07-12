@@ -44,12 +44,16 @@ impl WallpaperApplication {
     }
 
     /// Load the configured background and start rendering on all outputs.
+    #[tracing::instrument(target = "app", level = "info", skip(self), fields(background = %self.context.background.display()))]
     pub fn setup(&mut self) -> Result<()> {
+        tracing::info!(target: "app", "loading wallpaper content");
         let content = WallpaperContent::from_any_path(&self.context.background)
             .with_context(|| format!("loading wallpaper {}", self.context.background.display()))?;
+        tracing::debug!(target: "app", "content loaded; spawning platform renderer");
         let handle =
             platform::detect_platform().spawn_wallpaper(content, self.context.settings.clone())?;
         self.handle = Some(handle);
+        tracing::info!(target: "app", "wallpaper renderer started");
         Ok(())
     }
 

@@ -57,9 +57,11 @@ impl WallpaperContent {
 
     /// Resolve content from any filesystem path: a wallpaper directory
     /// (scene.json / scene.pkg / project.json) or a plain image/video file.
+    #[tracing::instrument(target = "content", level = "debug", fields(path = %path.display()))]
     pub fn from_any_path(path: &Path) -> Result<Self> {
         if path.is_dir() {
             if path.join("scene.json").exists() || path.join("scene.pkg").exists() {
+                tracing::debug!(target: "content", "resolved as scene wallpaper");
                 return Ok(WallpaperContent::Scene {
                     dir: path.to_owned(),
                 });
@@ -94,10 +96,14 @@ impl WallpaperContent {
             .to_lowercase();
 
         match ext.as_str() {
-            "mp4" | "webm" | "mkv" | "avi" | "mov" | "flv" | "wmv" => Ok(WallpaperContent::Video {
-                path: path.to_owned(),
-            }),
+            "mp4" | "webm" | "mkv" | "avi" | "mov" | "flv" | "wmv" => {
+                tracing::debug!(target: "content", %ext, "resolved as video wallpaper");
+                Ok(WallpaperContent::Video {
+                    path: path.to_owned(),
+                })
+            }
             _ => {
+                tracing::debug!(target: "content", %ext, "resolved as static image wallpaper");
                 let img = image::open(path)
                     .map_err(|e| anyhow!("failed to load image {}: {}", path.display(), e))?
                     .into_rgba8();

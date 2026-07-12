@@ -1881,8 +1881,9 @@ impl GpuSceneInstance {
             raster_scale,
         );
         if std::env::var("WP_DEBUG_PARTICLE_TIMING").is_ok() {
-            eprintln!(
-                "[timing] particles[{idx}]: step {step_ms:.1}ms, raster {sw}x{sh} (scale {raster_scale:.2}) {:.1}ms",
+            tracing::trace!(
+                target: "timing",
+                "particles[{idx}]: step {step_ms:.1}ms, raster {sw}x{sh} (scale {raster_scale:.2}) {:.1}ms",
                 _t_raster.elapsed().as_secs_f32() * 1000.0
             );
         }
@@ -2232,8 +2233,9 @@ fn load_effect_runtimes(
         .enumerate()
         .map(|(instance_idx, inst)| {
             if skip.contains(&inst.name) {
-                eprintln!(
-                    "[effect] SKIP '{}': disabled via WP_ENGINE_SKIP_EFFECTS",
+                tracing::debug!(
+                    target: "effect",
+                    "SKIP '{}': disabled via WP_ENGINE_SKIP_EFFECTS",
                     inst.name
                 );
                 return None;
@@ -2243,6 +2245,7 @@ fn load_effect_runtimes(
         .collect()
 }
 
+#[tracing::instrument(target = "effect", level = "debug", skip(renderer, resolver, inst), fields(effect = %inst.name, instance = instance_idx))]
 fn load_effect_instance(
     renderer: &mut GpuSceneRenderer,
     resolver: &resolver::AssetResolver,
@@ -2250,6 +2253,7 @@ fn load_effect_instance(
     inst: &EffectInstanceDef,
 ) -> Option<EffectRuntime> {
     let effect_name = &inst.name;
+    tracing::trace!(target: "effect", "loading effect instance");
     if HARDCODED_EFFECTS.contains(&effect_name.as_str()) {
         // Scene instances may override secondary texture slots (typically
         // slot 1 = an opacity mask, e.g. waterwaves/shake masks) — load
@@ -2295,8 +2299,9 @@ fn load_effect_instance(
         });
     }
     let Ok(eff_def) = effect_def::load_effect_by_file(resolver, &inst.file) else {
-        eprintln!(
-            "[effect] SKIP '{effect_name}': no effect.json at '{}'",
+        tracing::warn!(
+            target: "effect",
+            "SKIP '{effect_name}': no effect.json at '{}'",
             inst.file
         );
         return None;
@@ -2328,8 +2333,9 @@ fn load_effect_instance(
         };
         let Ok(mat_def) = effect_def::load_material_from_effect(resolver, effect_dir, mat_path)
         else {
-            eprintln!(
-                "[effect] SKIP '{effect_name}' pass {pass_idx}: material '{mat_path}' not found"
+            tracing::warn!(
+                target: "effect",
+                "SKIP '{effect_name}' pass {pass_idx}: material '{mat_path}' not found"
             );
             continue;
         };
@@ -2342,8 +2348,9 @@ fn load_effect_instance(
         let Ok((frag_glsl, vert_glsl)) =
             resolver.load_glsl_shader_for_effect(shader_name, Some(effect_dir))
         else {
-            eprintln!(
-                "[effect] SKIP '{effect_name}' pass {pass_idx}: shader '{shader_name}' not found"
+            tracing::warn!(
+                target: "effect",
+                "SKIP '{effect_name}' pass {pass_idx}: shader '{shader_name}' not found"
             );
             continue;
         };
@@ -2446,7 +2453,7 @@ fn load_effect_instance(
         let translated = match transpiler::translate_full(&model, Some(&vert_glsl)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[effect] SKIP '{effect_name}' pass {pass_idx}: GLSL→WGSL failed: {e:#}");
+                tracing::warn!(target: "effect", "SKIP '{effect_name}' pass {pass_idx}: GLSL→WGSL failed: {e:#}");
                 continue;
             }
         };
@@ -2472,8 +2479,9 @@ fn load_effect_instance(
         if added.is_err() && !pipeline_attrs.is_empty() {
             // Real-VS pipeline failed (usually an interface mismatch the
             // preprocessor couldn't reconcile) — retry with the synthetic VS.
-            eprintln!(
-                "[effect] '{effect_name}' pass {pass_idx}: real VS failed ({}), synthetic fallback",
+            tracing::warn!(
+                target: "effect",
+                "'{effect_name}' pass {pass_idx}: real VS failed ({}), synthetic fallback",
                 added.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
             );
             if let Ok(fallback) = transpiler::translate(&model) {
@@ -2489,7 +2497,7 @@ fn load_effect_instance(
             }
         }
         if let Err(e) = added {
-            eprintln!("[effect] SKIP '{effect_name}' pass {pass_idx}: pipeline failed: {e}");
+            tracing::warn!(target: "effect", "SKIP '{effect_name}' pass {pass_idx}: pipeline failed: {e}");
             continue;
         }
         let vertex_buffers = renderer.attr_buffers_for(&pipeline_attrs);
@@ -2534,8 +2542,9 @@ fn load_effect_instance(
                 Some(img) => textures.push(renderer.upload_texture(&img)),
                 None => {
                     if !path.is_empty() {
-                        eprintln!(
-                            "[effect] '{effect_name}': texture '{path}' not found — using white"
+                        tracing::warn!(
+                            target: "effect",
+                            "'{effect_name}': texture '{path}' not found — using white"
                         );
                     }
                     textures.push(renderer.upload_texture(&RgbaImage::from_pixel(
@@ -2564,27 +2573,34 @@ fn load_effect_instance(
     }
 
     if passes.is_empty() {
-        eprintln!("[effect] SKIP '{effect_name}': no usable passes");
+        tracing::warn!(target: "effect", "SKIP '{effect_name}': no usable passes");
         return None;
     }
-    eprintln!("[effect] LOADED '{effect_name}' ({} passes)", passes.len());
+    tracing::debug!(target: "effect", "LOADED '{effect_name}' ({} passes)", passes.len());
     Some(EffectRuntime { passes, fbos })
 }
 
 /// Continuously render scene frames into a channel (preview window, headless
 /// tests, and the CPU/SHM fallback path).
+#[tracing::instrument(target = "render", level = "debug", skip(tx), fields(dir = %dir.display(), target_fps))]
 pub fn gpu_scene_render_loop(
     dir: &std::path::Path,
     tx: &SyncSender<Arc<RgbaImage>>,
     target_fps: f64,
 ) -> Result<()> {
+    tracing::info!(target: "render", "opening GPU scene instance");
     let mut instance = GpuSceneInstance::open(dir)?;
     let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
     let start = Instant::now();
+    tracing::info!(target: "render", "entering GPU render loop");
 
+    let mut frame_no: u64 = 0;
     loop {
         let frame = instance.render_rgba()?;
+        tracing::trace!(target: "render", frame = frame_no, "rendered frame");
+        frame_no += 1;
         if tx.send(Arc::new(frame)).is_err() {
+            tracing::debug!(target: "render", frames = frame_no, "receiver dropped; ending render loop");
             return Ok(());
         }
 

@@ -72,15 +72,18 @@ pub struct Package {
 
 impl Package {
     /// Load a PKG archive from disk.
+    #[tracing::instrument(target = "pkg", level = "debug", fields(path = %path.display()))]
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read PKG file: {}", path.display()))?;
+        tracing::debug!(target: "pkg", bytes = data.len(), "read PKG file");
         Self::from_bytes(data)
     }
 
     /// Parse a PKG archive from an already-loaded byte buffer.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let (files, base_offset) = Self::parse_directory(&data)?;
+        tracing::debug!(target: "pkg", files = files.len(), base_offset, "parsed PKG directory");
         Ok(Self {
             data,
             files,

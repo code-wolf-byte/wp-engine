@@ -126,15 +126,18 @@ fn load_project(wallpaper_dir: &Path) -> Result<Project> {
 }
 
 /// Scan all workshop directories and return every parseable wallpaper
+#[tracing::instrument(target = "workshop", level = "debug")]
 pub fn scan_wallpapers() -> Vec<Wallpaper> {
     let workshop_dirs = find_workshop_dirs();
+    tracing::debug!(target: "workshop", dirs = workshop_dirs.len(), "scanning workshop roots");
     let mut wallpapers = Vec::new();
 
     for workshop_dir in workshop_dirs {
+        tracing::trace!(target: "workshop", dir = %workshop_dir.display(), "reading workshop directory");
         let entries = match std::fs::read_dir(&workshop_dir) {
             Ok(e) => e,
             Err(err) => {
-                eprintln!("warn: cannot read {}: {}", workshop_dir.display(), err);
+                tracing::warn!(target: "workshop", "cannot read {}: {}", workshop_dir.display(), err);
                 continue;
             }
         };
@@ -152,13 +155,16 @@ pub fn scan_wallpapers() -> Vec<Wallpaper> {
                 .to_string();
 
             match load_project(&path) {
-                Ok(project) => wallpapers.push(Wallpaper {
-                    workshop_id,
-                    path,
-                    project,
-                }),
+                Ok(project) => {
+                    tracing::trace!(target: "workshop", id = %workshop_id, title = project.title.as_deref().unwrap_or(""), "loaded wallpaper");
+                    wallpapers.push(Wallpaper {
+                        workshop_id,
+                        path,
+                        project,
+                    });
+                }
                 Err(err) => {
-                    eprintln!("warn: skipping {}: {}", workshop_id, err);
+                    tracing::warn!(target: "workshop", "skipping {}: {}", workshop_id, err);
                 }
             }
         }
@@ -166,6 +172,7 @@ pub fn scan_wallpapers() -> Vec<Wallpaper> {
 
     // Sort by title for consistent output
     wallpapers.sort_by(|a, b| a.title().cmp(b.title()));
+    tracing::debug!(target: "workshop", count = wallpapers.len(), "workshop scan complete");
     wallpapers
 }
 

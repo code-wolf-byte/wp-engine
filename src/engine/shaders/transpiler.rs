@@ -652,7 +652,9 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
 /// vertex shader. Both stages share one UBO layout (union of their scalar
 /// uniforms, fragment's first) at group(1) binding(0), and varying locations
 /// are matched by name so the naga-generated interfaces line up.
+#[tracing::instrument(target = "shader", level = "trace", skip_all, fields(shader = %model.name, real_vs = vert_glsl.is_some()))]
 pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<TranslatedShader> {
+    tracing::trace!(target: "shader", "translating GLSL → WGSL");
     // Shaders that use array varyings (e.g. `varying vec2 v[7]`) cannot be translated
     // because naga's SPIR-V reader rejects array-typed entry-point I/O.
     for line in model.frag_glsl.lines() {
@@ -771,14 +773,16 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
                         vert_wgsl = Some(w);
                         attributes = attrs;
                     }
-                    Err(e) => eprintln!(
-                        "[shader] '{}': real VS translation failed ({e}); using synthetic VS",
+                    Err(e) => tracing::warn!(
+                        target: "shader",
+                        "'{}': real VS translation failed ({e}); using synthetic VS",
                         model.name
                     ),
                 }
             }
-            Err(e) => eprintln!(
-                "[shader] '{}': real VS preprocess failed ({e}); using synthetic VS",
+            Err(e) => tracing::warn!(
+                target: "shader",
+                "'{}': real VS preprocess failed ({e}); using synthetic VS",
                 model.name
             ),
         }

@@ -41,11 +41,11 @@ impl FrameSource {
                     match r {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            eprintln!("GPU scene render failed, falling back to CPU: {e}");
+                            tracing::warn!(target: "render", "GPU scene render failed, falling back to CPU: {e}");
                             if let Err(e2) =
                                 crate::engine::animated::scene_render_loop(&dir, &tx, target_fps)
                             {
-                                eprintln!("CPU scene render error: {e2}");
+                                tracing::error!(target: "render", "CPU scene render error: {e2}");
                             }
                         }
                         Err(panic_val) => {
@@ -54,11 +54,11 @@ impl FrameSource {
                                 .cloned()
                                 .or_else(|| panic_val.downcast_ref::<&str>().map(|s| s.to_string()))
                                 .unwrap_or_else(|| "(unknown panic)".into());
-                            eprintln!("GPU render thread panicked: {msg} — falling back to CPU");
+                            tracing::error!(target: "render", "GPU render thread panicked: {msg} — falling back to CPU");
                             if let Err(e2) =
                                 crate::engine::animated::scene_render_loop(&dir, &tx, target_fps)
                             {
-                                eprintln!("CPU scene render error: {e2}");
+                                tracing::error!(target: "render", "CPU scene render error: {e2}");
                             }
                         }
                     }
@@ -75,7 +75,7 @@ impl FrameSource {
 
                 thread::spawn(move || {
                     if let Err(e) = super::ffmpeg::video_decode_loop(&path, &tx) {
-                        eprintln!("video decoder error for '{}': {e}", path.display());
+                        tracing::error!(target: "video", "video decoder error for '{}': {e}", path.display());
                     }
                 });
 
