@@ -96,6 +96,9 @@ pub struct Layer {
     pub angle: f32,
     pub blend_mode: u32,
     pub alpha: f32,
+    /// Inline SceneScript source driving `alpha` per frame, if the property
+    /// was authored as `{"value": …, "script": "…"}`. `None` = static alpha.
+    pub alpha_script: Option<String>,
     pub color: [f32; 3],
     pub brightness: f32,
     /// True for WE "copybackground" layers — source is the rendered canvas so far.
@@ -669,12 +672,14 @@ fn layer_from_object(
         None => [1.0, 1.0, 1.0],
     };
 
-    let alpha = obj
-        .alpha
+    let alpha_animated = obj.alpha.as_ref().map(crate::engine::model::json_to_animated);
+    let alpha = alpha_animated
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
+    // Inline SceneScript source driving `alpha`, if any — evaluated per frame
+    // by the render loop's ScriptContext (see GpuSceneInstance::render).
+    let alpha_script = alpha_animated.as_ref().and_then(|v| v.script.clone());
     let color = obj
         .color
         .as_ref()
@@ -718,6 +723,7 @@ fn layer_from_object(
         angle,
         blend_mode: obj.color_blend_mode,
         alpha,
+        alpha_script,
         color,
         brightness,
         copybackground: obj.copybackground,
@@ -779,6 +785,16 @@ fn particle_layer_from_object(
         .instanceoverride
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    // `instanceoverride.enabled: false` turns the whole system off
+    // (ObjectParser defaults it to true).
+    if overrides.as_ref().is_some_and(|o| {
+        o.enabled
+            .as_ref()
+            .is_some_and(|v| v.as_bool() == Some(false) || v.as_u64() == Some(0))
+    }) {
+        return None;
+    }
 
     // Control-point plumbing the simulation can't do itself (it only knows
     // spawn-relative screen offsets):
@@ -1420,6 +1436,7 @@ mod tests {
             angle: 0.0,
             blend_mode: 0,
             alpha: 1.0,
+            alpha_script: None,
             color: [1.0, 1.0, 1.0],
             brightness: 1.0,
             copybackground: false,

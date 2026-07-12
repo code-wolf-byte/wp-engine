@@ -68,3 +68,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Preview window (animation testing without Wayland)
 minifb = "0.27"
+boa_engine = "0.21.1"

@@ -1087,7 +1087,14 @@ struct SceneLayerGpu {
     /// Last animation time `frames[0]` was posed at, seconds.
     puppet_posed_at: f32,
     blend_mode: u32,
+    /// Live alpha for the current frame. When `alpha_script` is present this is
+    /// recomputed each frame from `alpha_base`; otherwise it stays constant.
     alpha: f32,
+    /// Authored alpha, passed as the `value` argument to `alpha_script` each
+    /// frame (WE feeds the property's base value, not the previous output).
+    alpha_base: f32,
+    /// Inline SceneScript source driving `alpha`, or `None` for static alpha.
+    alpha_script: Option<String>,
     color: [f32; 3],
     brightness: f32,
     frame_duration_ms: u32,
@@ -1157,6 +1164,10 @@ pub struct GpuSceneInstance {
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
+    /// Persistent JS runtime for SceneScript-driven properties, ticked once per
+    /// frame. Lives here (on the render thread) because boa's `Context` is
+    /// `!Send`; created and used entirely within this instance.
+    script_ctx: crate::engine::script::ScriptContext,
 }
 
 impl GpuSceneInstance {
@@ -1277,6 +1288,8 @@ impl GpuSceneInstance {
                     puppet_posed_at: 0.0,
                     blend_mode: l.blend_mode,
                     alpha: l.alpha,
+                    alpha_base: l.alpha,
+                    alpha_script: l.alpha_script.clone(),
                     color: l.color,
                     brightness: l.brightness,
                     frame_duration_ms: l.frame_duration_ms,
@@ -1404,6 +1417,7 @@ impl GpuSceneInstance {
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
+            script_ctx: crate::engine::script::ScriptContext::new(),
         })
     }
 
@@ -1430,6 +1444,24 @@ impl GpuSceneInstance {
         let delta = (time - self.last_time).max(0.0);
         self.last_time = time;
         let dynamics = self.dynamics.update(time, delta, self.mouse_norm);
+
+        // Tick SceneScript-driven properties for this frame. `engine.timeOfDay`
+        // is fractional hours in [0,24); we derive it from the wall clock (UTC
+        // for now — local-time zoning is a follow-up).
+        {
+            let secs_into_day = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() % 86_400)
+                .unwrap_or(0);
+            let time_of_day = secs_into_day as f32 / 3600.0;
+            let ctx = &mut self.script_ctx;
+            ctx.set_time(time, time_of_day);
+            for layer in &mut self.layers {
+                if let Some(script) = &layer.alpha_script {
+                    layer.alpha = ctx.eval_update(script, layer.alpha_base).unwrap_or(layer.alpha_base);
+                }
+            }
+        }
 
         let target_view = self.target.create_view(&Default::default());
         let mut encoder =
@@ -1670,6 +1702,33 @@ impl GpuSceneInstance {
                         // A bind named "previous" is the chain input itself.
                         let (view, res) = if fbo_name == "previous" {
                             (chain_view.clone(), chain_res)
+                        } else if fbo_name == "_rt_FullFrameBuffer"
+                            || fbo_name == "_rt_MipMappedFrameBuffer"
+                        {
+                            // The wallpaper-global scene buffer (CWallpaper.cpp
+                            // creates it at scene size; MipMapped is an alias).
+                            // Effects run before their layer composites, so the
+                            // scene target currently holds exactly "the scene
+                            // behind this layer" — snapshot it, since a pass
+                            // can't sample its own render target.
+                            encoder.copy_texture_to_texture(
+                                self.target.as_image_copy(),
+                                self.scene_copy.as_image_copy(),
+                                wgpu::Extent3d {
+                                    width: self.width,
+                                    height: self.height,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            (
+                                self.scene_copy.create_view(&Default::default()),
+                                [
+                                    self.width as f32,
+                                    self.height as f32,
+                                    self.width as f32,
+                                    self.height as f32,
+                                ],
+                            )
                         } else {
                             let key = named_fbo_key(instance_idx, fbo_name);
                             match self.fbo_pool.get(&key) {
@@ -2271,7 +2330,7 @@ fn load_effect_instance(
         let tex_key = format!("fx{instance_idx}:{effect_name}#0");
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         if let Some(over) = inst.pass_overrides.first() {
-            for name in over.textures.iter().skip(1) {
+            for (slot_i, name) in over.textures.iter().skip(1).enumerate() {
                 let img = name
                     .as_deref()
                     .filter(|n| !n.is_empty() && !n.starts_with("_rt_"))
@@ -2282,10 +2341,28 @@ fn load_effect_instance(
                             crate::engine::tex::TexFile::parse(&bytes).ok()?.to_rgba().ok()
                         })
                     });
-                textures.push(renderer.upload_texture(&img.unwrap_or_else(|| {
-                    RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))
-                })));
+                // Missing-slot fallback is normally white (= unmasked), but
+                // shake's slot 1 is a FLOW map whose authored default is
+                // util/noflow — rg 0.498 gray, "no pixel moves". A white
+                // fallback there would shear the whole layer diagonally.
+                let fallback = if effect_name == "shake" && slot_i == 0 {
+                    image::Rgba([127, 127, 127, 255])
+                } else {
+                    image::Rgba([255, 255, 255, 255])
+                };
+                textures.push(renderer.upload_texture(
+                    &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
+                ));
             }
+        }
+        // A shake with no texture overrides at all authors no flow map either
+        // — bind the gray no-flow dummy so the effect stays static like WE.
+        if effect_name == "shake" && textures.is_empty() {
+            textures.push(renderer.upload_texture(&RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([127, 127, 127, 255]),
+            )));
         }
         if !textures.is_empty() {
             renderer.dynamic_textures.insert(tex_key.clone(), textures);
@@ -2297,11 +2374,21 @@ fn load_effect_instance(
                 hardcoded: true,
                 target: None,
                 binds: Vec::new(),
-                values: inst
-                    .pass_overrides
-                    .first()
-                    .map(|o| o.values.clone())
-                    .unwrap_or_default(),
+                values: {
+                    // Hardcoded kernels read combos (e.g. shake's DIRECTION/
+                    // NOISE) as pseudo-values with a `combo_` prefix.
+                    let mut vals = inst
+                        .pass_overrides
+                        .first()
+                        .map(|o| o.values.clone())
+                        .unwrap_or_default();
+                    if let Some(over) = inst.pass_overrides.first() {
+                        for (k, v) in &over.combos {
+                            vals.insert(format!("combo_{k}"), *v as f32);
+                        }
+                    }
+                    vals
+                },
                 vertex_buffers: Vec::new(),
             }],
             fbos: Vec::new(),
@@ -2522,18 +2609,34 @@ fn load_effect_instance(
             .skip(1)
             .map(|slot| slot.default_path.clone())
             .collect();
+        // Framebuffer refs in the texture list (e.g. refraction's compose
+        // pass: `"textures": [null, "_rt_FullFrameBuffer"]`) aren't files —
+        // they become extra binds, resolved at draw time like `bind` entries.
+        let mut fbo_ref_binds: Vec<(u32, String)> = Vec::new();
         for (i, tex) in merged_textures.iter().enumerate().skip(1) {
             let slot = i - 1;
             if slot >= texture_names.len() {
                 texture_names.resize(slot + 1, None);
             }
             if let Some(name) = tex {
-                // _rt_* names are framebuffer refs resolved via binds, not files.
-                if !name.starts_with("_rt_") && !name.starts_with("_alias_") {
+                if name.starts_with("_rt_") {
+                    fbo_ref_binds.push((i as u32, name.clone()));
+                } else if !name.starts_with("_alias_") {
                     texture_names[slot] = Some(name.clone());
                 }
             }
         }
+        for (slot, name) in texture_names.iter().enumerate() {
+            if let Some(n) = name {
+                if n.starts_with("_rt_") {
+                    fbo_ref_binds.push((slot as u32 + 1, n.clone()));
+                }
+            }
+        }
+        texture_names
+            .iter_mut()
+            .filter(|n| n.as_deref().is_some_and(|n| n.starts_with("_rt_")))
+            .for_each(|n| *n = None);
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         for name in &texture_names {
             let path = name.as_deref().unwrap_or("");
@@ -2575,6 +2678,7 @@ fn load_effect_instance(
                 .bind
                 .iter()
                 .filter_map(|b| b.name.as_ref().map(|n| (b.index.unwrap_or(0), n.clone())))
+                .chain(fbo_ref_binds)
                 .collect(),
             values,
             vertex_buffers,
@@ -2887,12 +2991,25 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             0.0,
             0.0,
         ]),
-        "shake" => pack(&[
-            time,
-            get(vals, "speed", 1.0),
-            get(vals, "strength", 0.1),
-            0.0,
-        ]),
+        "shake" => {
+            // shake.vert precomputes v_Bounds = (x, 1/(y-x)) from `bounds`.
+            let bounds_x = get(vals, "bounds_x", 0.0);
+            let bounds_y = get(vals, "bounds_y", 1.0);
+            pack(&[
+                time,
+                get(vals, "speed", 1.0),
+                get(vals, "strength", 0.1),
+                get(vals, "combo_DIRECTION", 0.0),
+                get(vals, "friction_x", 1.0),
+                get(vals, "friction_y", 1.0),
+                bounds_x,
+                1.0 / (bounds_y - bounds_x).max(0.0001),
+                get(vals, "combo_NOISE", 0.0),
+                0.0,
+                0.0,
+                0.0,
+            ])
+        }
         "tint" => {
             let r = get(vals, "color_r", 1.0);
             let g = get(vals, "color_g", 0.0);

@@ -193,6 +193,15 @@ fn load_particles(
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    // `instanceoverride.enabled: false` turns the whole system off.
+    if overrides.as_ref().is_some_and(|o| {
+        o.enabled
+            .as_ref()
+            .is_some_and(|v| v.as_bool() == Some(false) || v.as_u64() == Some(0))
+    }) {
+        return;
+    }
+
     if let Ok(config) = serde_json::from_str::<ParticleConfig>(&data) {
         let sprite = config
             .material

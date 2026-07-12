@@ -296,6 +296,18 @@ pub struct InstanceOverride {
     pub rate: Option<f64>,
     pub size: Option<f64>,
     pub speed: Option<f64>,
+    /// Multiplier on the preset's `maxcount` pool size
+    /// (CParticle.cpp: `adjustedMaxCount = maxCount * count`).
+    pub count: Option<f64>,
+    /// Multiplier on every spawned particle's lifetime — the reference
+    /// applies it both in `createLifetimeRandomInitializer` and the
+    /// default-spawn path, so a single multiply at spawn covers both.
+    pub lifetime: Option<f64>,
+    /// Per-channel color multiplier ("r g b", 0–1 floats) applied to the
+    /// `colorrandom` result (CParticle.cpp:715-719). Distinct from `color`.
+    pub colorn: Option<serde_json::Value>,
+    /// `false` disables the whole system (ObjectParser default true).
+    pub enabled: Option<serde_json::Value>,
     /// Remaining override keys — notably `controlpointN` ("x y z" strings,
     /// absolute scene coordinates) that reposition a preset's control
     /// points per instance (e.g. the discharge preset's arc endpoint).
@@ -439,6 +451,11 @@ pub struct ParticleSystem {
     size_mult: f32,
     speed_mult: f32,
     rate_mult: f32,
+    /// `instanceoverride.lifetime` multiplier on spawned lifetimes.
+    lifetime_mult: f32,
+    /// `instanceoverride.colorn` per-channel multiplier (0-1) on the
+    /// `colorrandom` result.
+    colorn_mult: [f32; 3],
     color_override: Option<[u8; 3]>,
     /// Resolved once at construction: `spawn_center + offset` per control
     /// point, indexed positionally (falls back to declaration order when a
@@ -686,7 +703,14 @@ impl ParticleSystem {
                     rate: e.rate as f32,
                     origin: [
                         spawn_center[0] + local_origin[0],
-                        spawn_center[1] + local_origin[1],
+                        // The emitter's local origin is authored y-up
+                        // (CParticle.cpp negates it in both createBoxEmitter
+                        // and createSphereEmitter): "0 768 0" means 768
+                        // ABOVE the object — e.g. rainperspective's spawn
+                        // band sits above the frame so drops fall through
+                        // it, not 768 below (which pushed the whole band
+                        // off-screen on 1080p scenes and rain never showed).
+                        spawn_center[1] - local_origin[1],
                         local_origin[2],
                     ],
                     directions,
@@ -699,8 +723,15 @@ impl ParticleSystem {
             })
             .collect();
 
+        // `instanceoverride.count` scales the pool before the default kicks
+        // in (CParticle.cpp: `adjustedMaxCount = maxCount * countMultiplier;
+        // maxParticles = adjusted > 0 ? adjusted : DEFAULT`).
+        let count_mult = overrides.and_then(|o| o.count).unwrap_or(1.0);
         let max_count = match config.maxcount {
-            Some(n) if n > 0 => n as usize,
+            Some(n) if n > 0 => match (n as f64 * count_mult) as usize {
+                0 => 500,
+                adjusted => adjusted,
+            },
             _ => 500,
         };
 
@@ -1065,6 +1096,11 @@ impl ParticleSystem {
             oscillate_size,
             oscillate_position,
             alpha_mult: overrides.and_then(|o| o.alpha).unwrap_or(1.0) as f32,
+            lifetime_mult: overrides.and_then(|o| o.lifetime).unwrap_or(1.0) as f32,
+            colorn_mult: overrides
+                .and_then(|o| o.colorn.as_ref())
+                .and_then(value_as_vec3_pub)
+                .unwrap_or([1.0, 1.0, 1.0]),
             size_mult: overrides.and_then(|o| o.size).unwrap_or(1.0) as f32,
             speed_mult: overrides.and_then(|o| o.speed).unwrap_or(1.0) as f32,
             rate_mult: overrides.and_then(|o| o.rate).unwrap_or(1.0) as f32,
@@ -1396,8 +1432,11 @@ impl ParticleSystem {
             emitter.accumulator += emitter.rate * self.rate_mult * dt;
             while emitter.accumulator >= 1.0 && self.particles.len() < self.max_count {
                 emitter.accumulator -= 1.0;
-                let life =
-                    self.life_min + fastrand::f32() * (self.life_max - self.life_min).max(0.0);
+                // `createLifetimeRandomInitializer`: `p.lifetime =
+                // random(min, max) * lifetimeOverride`.
+                let life = (self.life_min
+                    + fastrand::f32() * (self.life_max - self.life_min).max(0.0))
+                    * self.lifetime_mult;
                 // Reference halves the sizerandom range (CParticle.cpp: `size = (min +
                 // t*(max-min)) * override / 2.0`) — the initializer's value is a
                 // diameter, not a radius.
@@ -1553,11 +1592,19 @@ impl ParticleSystem {
                     })
                     .unwrap_or(0.0);
 
+                // `createColorRandomInitializer`: `p.color = randomVec3(min,
+                // max) * colorOverride` — colorn is a 0-1 per-channel tint.
                 let color = self.color_override.unwrap_or_else(|| {
                     [
-                        lerp_u8(self.color_min[0], self.color_max[0]),
-                        lerp_u8(self.color_min[1], self.color_max[1]),
-                        lerp_u8(self.color_min[2], self.color_max[2]),
+                        (lerp_u8(self.color_min[0], self.color_max[0]) as f32
+                            * self.colorn_mult[0])
+                            .clamp(0.0, 255.0) as u8,
+                        (lerp_u8(self.color_min[1], self.color_max[1]) as f32
+                            * self.colorn_mult[1])
+                            .clamp(0.0, 255.0) as u8,
+                        (lerp_u8(self.color_min[2], self.color_max[2]) as f32
+                            * self.colorn_mult[2])
+                            .clamp(0.0, 255.0) as u8,
                     ]
                 });
 
@@ -2655,9 +2702,7 @@ mod tests {
             alpha: Some(0.5),
             color: Some("192 192 192".to_string()),
             rate: Some(2.0),
-            size: None,
-            speed: None,
-            extra: Default::default(),
+            ..Default::default()
         };
         let sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
         assert_eq!(sys.color_override, Some([192, 192, 192]));
@@ -2665,6 +2710,47 @@ mod tests {
         assert_eq!(sys.rate_mult, 2.0);
     }
 
+    /// `count` scales the pool, `lifetime` scales spawned lifetimes, and
+    /// `colorn` tints the colorrandom result — the multiplier semantics of
+    /// CParticle.cpp (lines 59, 755-765, 712-720).
+    #[test]
+    fn instance_override_count_lifetime_colorn() {
+        let json = r#"{
+            "maxcount": 100,
+            "emitter": [{"name":"box","rate":1000}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":2,"max":2},
+                {"id":2,"name":"colorrandom","min":"200 100 50","max":"200 100 50"}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
+        let overrides = InstanceOverride {
+            count: Some(0.5),
+            lifetime: Some(2.0),
+            colorn: Some(serde_json::json!("0.5 1 1")),
+            ..Default::default()
+        };
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
+        assert_eq!(sys.max_count, 50, "count 0.5 should halve maxcount 100");
+        sys.step(0.01);
+        let p = &sys.particles[0];
+        assert_eq!(p.life, 4.0, "lifetime 2.0 should double the 2s lifetime");
+        assert_eq!(p.color, [100, 100, 50], "colorn should tint the red channel only");
+    }
+
+    /// `enabled: false` in an instanceoverride must drop the whole system at
+    /// the layer level (checked in render.rs/animated.rs, config-level here).
+    #[test]
+    fn instance_override_enabled_parses() {
+        let o: InstanceOverride =
+            serde_json::from_str(r#"{"enabled": false, "id": 3}"#).expect("should parse");
+        assert_eq!(o.enabled.as_ref().and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// Emitter local origins are authored y-up (CParticle.cpp negates the y
+    /// in both emitter constructors): "10 20 0" sits 20 ABOVE the object in
+    /// screen space — rainperspective's "0 768 0" spawn band must end up
+    /// above the frame, not below it.
     #[test]
     fn emitter_origin_is_local_offset_from_spawn_center() {
         let json = r#"{
@@ -2674,7 +2760,7 @@ mod tests {
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
         let sys = ParticleSystem::from_config(&config, [100.0, 200.0], None);
         assert_eq!(sys.emitters[0].origin[0], 110.0);
-        assert_eq!(sys.emitters[0].origin[1], 220.0);
+        assert_eq!(sys.emitters[0].origin[1], 180.0);
     }
 
     #[test]
@@ -3461,14 +3547,7 @@ mod tests {
             "initializer": [{"id":1,"name":"alpharandom","min":1.0,"max":1.0}]
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
-        let overrides = InstanceOverride {
-            alpha: Some(0.5),
-            color: None,
-            rate: None,
-            size: None,
-            speed: None,
-            extra: Default::default(),
-        };
+        let overrides = InstanceOverride { alpha: Some(0.5), ..Default::default() };
         let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
         sys.step(0.01);
         assert_eq!(sys.particles[0].initial_alpha, 0.5);
