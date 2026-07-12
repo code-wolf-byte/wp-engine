@@ -1356,6 +1356,15 @@ impl GpuSceneInstance {
                 if let Some(sprite) = &pl.sprite_texture {
                     system.set_sprite_frames(sprite.frames.len(), sprite.duration);
                 }
+                for child in &pl.children {
+                    system.add_child(
+                        child.config.clone(),
+                        child.sprite.clone(),
+                        child.additive,
+                        &child.child_ref,
+                        spawn_center,
+                    );
+                }
                 system
             })
             .collect();

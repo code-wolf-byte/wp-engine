@@ -1278,6 +1278,7 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
     let mut sampler_names: Vec<String> = Vec::new(); // g_Texture0, g_Texture1, ...
     let mut scalars: Vec<(String, String)> = Vec::new(); // (type, name) → UBO
     let mut inputs: Vec<(String, String)> = Vec::new(); // varyings
+    let mut zero_arrays: Vec<(String, usize)> = Vec::new(); // float name[N] → const zeros
 
     for line in src.lines() {
         let t = line.trim();
@@ -1290,6 +1291,22 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
                 sampler_names.push(name.to_string());
             } else if !ty.is_empty() && !name.contains('[') {
                 scalars.push((ty.to_string(), name.to_string()));
+            } else if ty == "float" {
+                // Float-array uniforms (`uniform float g_AudioSpectrum64Left[64];`)
+                // don't fit the 16-byte-per-scalar UBO model, so they're
+                // re-emitted below as zero-filled const arrays instead of
+                // silently vanishing (which left the identifiers undeclared
+                // and failed the whole compile). The only such uniforms in
+                // practice are WE's audio-spectrum bands, and zero is exactly
+                // what they hold when no audio is playing — the right output
+                // for an engine with no audio-capture pipeline (yet).
+                if let Some((base, rest)) = name.split_once('[') {
+                    if let Ok(n) = rest.trim_end_matches(']').parse::<usize>() {
+                        if n > 0 && !zero_arrays.iter().any(|(b, _)| b == base) {
+                            zero_arrays.push((base.to_string(), n));
+                        }
+                    }
+                }
             }
         } else if t.starts_with("varying ") || t.starts_with("attribute ") {
             if tok.len() >= 3 {
@@ -1412,6 +1429,11 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
             out.push_str(&format!("    {ty} {name};\n"));
         }
         out.push_str("};\n");
+    }
+    // Float-array uniforms as zero-filled constants (see the scan above).
+    for (name, n) in &zero_arrays {
+        let zeros = vec!["0.0"; *n].join(", ");
+        out.push_str(&format!("const float {name}[{n}] = float[{n}]({zeros});\n"));
     }
     // Input varyings with explicit locations
     for (i, (ty, name)) in inputs.iter().enumerate() {

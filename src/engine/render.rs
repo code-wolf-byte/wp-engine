@@ -66,6 +66,19 @@ pub struct ParticleLayer {
     /// owning layer regardless of how many particles/skipped/invisible
     /// objects precede it.
     pub order_index: usize,
+    /// Child presets from `config.children`, resolved (JSON + material
+    /// sprite) here where asset access lives; attached to the built system
+    /// via `ParticleSystem::add_child` at construction time.
+    pub children: Vec<ResolvedChildParticle>,
+}
+
+/// One resolved `children` entry of a particle preset (see
+/// [`particle::ChildRef`]).
+pub struct ResolvedChildParticle {
+    pub config: particle::ParticleConfig,
+    pub sprite: Option<particle::ParticleSprite>,
+    pub additive: bool,
+    pub child_ref: particle::ChildRef,
 }
 
 pub struct Layer {
@@ -458,6 +471,15 @@ impl ResolvedScene {
                     if let Some(sprite) = &pl.sprite_texture {
                         system.set_sprite_frames(sprite.frames.len(), sprite.duration);
                     }
+                    for child in &pl.children {
+                        system.add_child(
+                            child.config.clone(),
+                            child.sprite.clone(),
+                            child.additive,
+                            &child.child_ref,
+                            spawn_center,
+                        );
+                    }
                     for _ in 0..150 {
                         system.step(1.0 / 30.0);
                     }
@@ -805,16 +827,63 @@ fn particle_layer_from_object(
         .unwrap_or([0.0, 0.0]);
 
     let resolved_sprite = config.material.as_deref().and_then(|mat_path| {
+        // A failure here silently degrades to the flat-color circle draw —
+        // visually plausible for dust/snow but wrong for shaped sprites, so
+        // it must at least be visible in the log.
         if let Some(pkg) = pkg {
-            resolve_particle_sprite_pkg(pkg, mat_path).ok()
+            resolve_particle_sprite_pkg(pkg, mat_path)
+                .inspect_err(|e| {
+                    eprintln!("[particle] sprite '{mat_path}' failed (untextured fallback): {e:#}")
+                })
+                .ok()
         } else {
-            dir.and_then(|dir| resolve_particle_sprite_dir(dir, mat_path).ok())
+            dir.and_then(|dir| {
+                resolve_particle_sprite_dir(dir, mat_path)
+                    .inspect_err(|e| {
+                        eprintln!(
+                            "[particle] sprite '{mat_path}' failed (untextured fallback): {e:#}"
+                        )
+                    })
+                    .ok()
+            })
         }
     });
     let additive_blend = resolved_sprite
         .as_ref()
         .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
     let sprite_texture = resolved_sprite.map(|(sprite, _)| sprite);
+
+    // Child presets: same preset-JSON + material resolution as the parent.
+    // Failures degrade to "child skipped" (logged), never sink the layer.
+    let children: Vec<ResolvedChildParticle> = config
+        .children
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|child_ref| {
+            let json = read_particle_json(dir, pkg, &child_ref.name).or_else(|| {
+                eprintln!("[particle] child preset '{}' not found", child_ref.name);
+                None
+            })?;
+            let child_cfg: particle::ParticleConfig = serde_json::from_str(&json)
+                .inspect_err(|e| {
+                    eprintln!("[particle] child '{}' parse failed: {e}", child_ref.name)
+                })
+                .ok()?;
+            let resolved = child_cfg.material.as_deref().and_then(|mat_path| {
+                if let Some(pkg) = pkg {
+                    resolve_particle_sprite_pkg(pkg, mat_path).ok()
+                } else {
+                    dir.and_then(|dir| resolve_particle_sprite_dir(dir, mat_path).ok())
+                }
+            });
+            let additive = resolved
+                .as_ref()
+                .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
+            let sprite = resolved.map(|(sprite, _)| sprite);
+            Some(ResolvedChildParticle { config: child_cfg, sprite, additive, child_ref })
+        })
+        .collect();
 
     Some(ParticleLayer {
         name: obj.name.clone().unwrap_or_default(),
@@ -825,6 +894,7 @@ fn particle_layer_from_object(
         sprite_texture,
         additive_blend,
         order_index: 0,
+        children,
     })
 }
 
@@ -1004,10 +1074,14 @@ fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
 }
 
 /// Returns the resolved texture plus the material pass's own `"blending"`
-/// string (e.g. `"additive"`), if any — particles need this to composite
+/// string (e.g. `"additive"`) and `ui_editor_properties_overbright`
+/// brightness constant (default 1.0) — particles need both to composite
 /// correctly (see `resolve_particle_sprite_{pkg,dir}`); plain image layers
-/// just discard it.
-fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, Option<String>)> {
+/// just discard them.
+fn find_model_chain_tex_pkg(
+    pkg: &Package,
+    json_path: &str,
+) -> Result<(TexFile, Option<String>, f32)> {
     let data = pkg
         .get(json_path)
         .map(|d| d.to_vec())
@@ -1026,6 +1100,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
                 .get("blending")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let overbright = pass_overbright(pass);
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
@@ -1037,7 +1112,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
                         {
                             let tex = TexFile::parse(&tex_data)
                                 .with_context(|| format!("parsing {tex_path}"))?;
-                            return Ok((tex, blending));
+                            return Ok((tex, blending, overbright));
                         }
 
                         let alt_path = format!("{tex_name}.tex");
@@ -1046,7 +1121,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
                             .map(|d| d.to_vec())
                             .or_else(|| read_from_global_assets(&alt_path))
                         {
-                            return Ok((TexFile::parse(&tex_data)?, blending));
+                            return Ok((TexFile::parse(&tex_data)?, blending, overbright));
                         }
                     }
                 }
@@ -1057,8 +1132,22 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
     anyhow::bail!("could not resolve texture from {json_path}")
 }
 
+/// `ui_editor_properties_overbright` from a material pass's
+/// `constantshadervalues` (CParticle reads it off the first pass; 1.0 when
+/// absent).
+fn pass_overbright(pass: &serde_json::Value) -> f32 {
+    pass.get("constantshadervalues")
+        .and_then(|c| c.get("ui_editor_properties_overbright"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(1.0)
+}
+
 /// Follow the model -> material -> texture chain for loose files on disk.
-fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>)> {
+fn find_model_chain_tex_dir(
+    dir: &Path,
+    json_path: &str,
+) -> Result<(TexFile, Option<String>, f32)> {
     let data = std::fs::read(dir.join(json_path))
         .ok()
         .or_else(|| read_from_global_assets(json_path))
@@ -1076,6 +1165,7 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
                 .get("blending")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let overbright = pass_overbright(pass);
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
@@ -1084,7 +1174,7 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
                             .ok()
                             .or_else(|| read_from_global_assets(&tex_path))
                         {
-                            return Ok((TexFile::parse(&tex_data)?, blending));
+                            return Ok((TexFile::parse(&tex_data)?, blending, overbright));
                         }
                     }
                 }
@@ -1184,12 +1274,13 @@ fn resolve_particle_sprite_pkg(
     pkg: &Package,
     json_path: &str,
 ) -> Result<(particle::ParticleSprite, Option<String>)> {
-    let (tex, blending) = find_model_chain_tex_pkg(pkg, json_path)?;
+    let (tex, blending, overbright) = find_model_chain_tex_pkg(pkg, json_path)?;
     let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
     Ok((
         particle::ParticleSprite {
             frames: tex.to_particle_rgba_frames()?,
             duration,
+            overbright,
         },
         blending,
     ))
@@ -1199,12 +1290,13 @@ fn resolve_particle_sprite_dir(
     dir: &Path,
     json_path: &str,
 ) -> Result<(particle::ParticleSprite, Option<String>)> {
-    let (tex, blending) = find_model_chain_tex_dir(dir, json_path)?;
+    let (tex, blending, overbright) = find_model_chain_tex_dir(dir, json_path)?;
     let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
     Ok((
         particle::ParticleSprite {
             frames: tex.to_particle_rgba_frames()?,
             duration,
+            overbright,
         },
         blending,
     ))
@@ -1347,6 +1439,7 @@ mod tests {
                 sprite_texture: None,
                 additive_blend: false,
                 order_index: 0,
+                children: Vec::new(),
             },
             ParticleLayer {
                 name: "green_particles".to_string(),
@@ -1357,6 +1450,7 @@ mod tests {
                 sprite_texture: None,
                 additive_blend: false,
                 order_index: 2,
+                children: Vec::new(),
             },
         ];
 
