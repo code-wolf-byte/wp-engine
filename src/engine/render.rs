@@ -166,7 +166,9 @@ impl ResolvedScene {
     /// `scene.json`/`scene.pkg`, but project.json's `file` field can name a
     /// different one — GIF-converted wallpapers ship
     /// `gifscene.json`/`gifscene.pkg` (e.g. workshop item 2036522973).
+    #[tracing::instrument(target = "scene", level = "debug", fields(dir = %dir.display()))]
     pub fn from_directory(dir: &Path) -> Result<Self> {
+        tracing::debug!(target: "scene", "resolving scene from directory");
         let scene_name = std::fs::read_to_string(dir.join("project.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -242,7 +244,7 @@ impl ResolvedScene {
                     match load_texture_from_dir(dir, path) {
                         Ok(loaded) => loaded,
                         Err(e) => {
-                            eprintln!("[scene] texture load failed for '{path}': {e:#}");
+                            tracing::warn!(target: "scene", "texture load failed for '{path}': {e:#}");
                             if obj.effects.is_empty() {
                                 continue;
                             }
@@ -316,7 +318,7 @@ impl ResolvedScene {
                     }) {
                         Ok(loaded) => loaded,
                         Err(e) => {
-                            eprintln!("[scene] texture load failed for '{path}': {e:#}");
+                            tracing::warn!(target: "scene", "texture load failed for '{path}': {e:#}");
                             if obj.effects.is_empty() {
                                 continue;
                             }
@@ -748,13 +750,54 @@ fn particle_layer_from_object(
         _ => return None,
     };
     let json = read_particle_json(dir, pkg, particle_ref)?;
-    let config: particle::ParticleConfig = serde_json::from_str(&json)
-        .inspect_err(|e| eprintln!("[particle] failed to parse '{particle_ref}': {e}"))
+    let mut config: particle::ParticleConfig = serde_json::from_str(&json)
+        .inspect_err(|e| tracing::warn!(target: "particle", "failed to parse '{particle_ref}': {e}"))
         .ok()?;
-    let overrides = obj
+    let overrides: Option<particle::InstanceOverride> = obj
         .instanceoverride
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    // Control-point plumbing the simulation can't do itself (it only knows
+    // spawn-relative screen offsets):
+    // 1. `instanceoverride.controlpointN` repositions preset control points
+    //    with absolute scene coordinates (e.g. the discharge preset's arc
+    //    endpoint, "1586.7 993.2") — absolute values are world-space, so
+    //    force flag 2 on.
+    // 2. Any world-space control point (flags & 2) is then converted to a
+    //    spawn-relative offset here, where the object's origin is known:
+    //    offset = (x_we - origin_x, origin_y - y_we) in the simulation's
+    //    y-down screen space.
+    if let Some(over) = overrides.as_ref() {
+        for (key, value) in &over.extra {
+            let Some(n) = key
+                .strip_prefix("controlpoint")
+                .and_then(|s| s.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            while config.controlpoint.len() <= n {
+                config.controlpoint.push(particle::ControlPointConfig::default());
+            }
+            config.controlpoint[n].offset = Some(value.clone());
+            config.controlpoint[n].flags = Some(config.controlpoint[n].flags.unwrap_or(0) | 2);
+        }
+    }
+    let origin = obj.parsed_origin();
+    for cp in &mut config.controlpoint {
+        if cp.flags.unwrap_or(0) & 2 == 0 {
+            continue;
+        }
+        if let Some(world) = cp.offset.as_ref().and_then(particle::value_as_vec3_pub) {
+            let rel = [
+                world[0] - origin[0] as f32,
+                origin[1] as f32 - world[1],
+                world[2],
+            ];
+            cp.offset = Some(serde_json::json!(format!("{} {} {}", rel[0], rel[1], rel[2])));
+            cp.flags = Some(cp.flags.unwrap_or(0) & !2);
+        }
+    }
     let parallax_depth = obj
         .parallax_depth
         .as_ref()
@@ -1091,15 +1134,16 @@ fn apply_puppet_mesh(
         return plain(atlas);
     };
     let Some(mdl_bytes) = read(puppet_path) else {
-        eprintln!("[scene] puppet mesh '{puppet_path}' not found — drawing raw atlas");
+        tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' not found — drawing raw atlas");
         return plain(atlas);
     };
     let Some(model) = crate::engine::puppet::parse_model(&mdl_bytes) else {
-        eprintln!("[scene] puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
+        tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
         return plain(atlas);
     };
-    eprintln!(
-        "[scene] puppet '{puppet_path}': {} vertices, {} triangles, {} bones, {} animations",
+    tracing::debug!(
+        target: "scene",
+        "puppet '{puppet_path}': {} vertices, {} triangles, {} bones, {} animations",
         model.mesh.positions.len(),
         model.mesh.indices.len() / 3,
         model.bones.len(),
