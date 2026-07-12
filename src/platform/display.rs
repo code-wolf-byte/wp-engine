@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 
-use crate::render::{FrameSource, RenderSettings};
+use crate::render::{RenderSettings, WallpaperContent};
 
 // ── Private inner trait ───────────────────────────────────────────────────────
 
@@ -17,16 +17,14 @@ pub(crate) trait WallpaperHandleInner: Send {
 /// Drop or call `stop()` to remove the wallpaper.
 pub struct WallpaperHandle {
     inner: Box<dyn WallpaperHandleInner>,
-    /// Live render settings shared with the wallpaper thread.
-    pub settings: Arc<Mutex<RenderSettings>>,
 }
 
 impl WallpaperHandle {
     pub(crate) fn new(
         inner: Box<dyn WallpaperHandleInner>,
-        settings: Arc<Mutex<RenderSettings>>,
+        _settings: Arc<Mutex<RenderSettings>>,
     ) -> Self {
-        Self { inner, settings }
+        Self { inner }
     }
 
     /// Stop the renderer and wait for its thread to exit.
@@ -43,9 +41,14 @@ impl WallpaperHandle {
 // ── Platform trait ────────────────────────────────────────────────────────────
 
 pub trait DisplayPlatform {
+    /// Spawn a wallpaper renderer for `content` on every output.
+    ///
+    /// The platform decides how to render: scene wallpapers draw directly
+    /// into GPU surfaces when the compositor allows it; other content (and
+    /// fallback paths) go through CPU frames + SHM buffers.
     fn spawn_wallpaper(
         &self,
-        frame_source: FrameSource,
+        content: WallpaperContent,
         settings: Arc<Mutex<RenderSettings>>,
     ) -> Result<WallpaperHandle>;
 }
@@ -55,13 +58,18 @@ pub trait DisplayPlatform {
 /// Detect the current display platform at runtime and return a boxed implementation.
 ///
 /// On Linux, checks `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` and returns a
-/// `WaylandPlatform`. Panics with a clear message if no supported platform is found.
+/// `WaylandPlatform`. Returns an error if no supported platform is found.
 pub fn detect_platform() -> Box<dyn DisplayPlatform> {
     if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("WAYLAND_SOCKET").is_ok() {
         return Box::new(super::wayland::WaylandPlatform);
     }
-    panic!(
-        "no supported display platform detected \
-         (WAYLAND_DISPLAY and WAYLAND_SOCKET are both unset)"
+    eprintln!(
+        "error: no supported display platform detected.\n\
+         wp-engine requires a Wayland compositor with wlr-layer-shell support.\n\
+         (WAYLAND_DISPLAY and WAYLAND_SOCKET are both unset)\n\
+         \n\
+         Supported compositors: Sway, Hyprland, river, labwc, wayfire, etc.\n\
+         X11 is not yet supported."
     );
+    std::process::exit(1);
 }

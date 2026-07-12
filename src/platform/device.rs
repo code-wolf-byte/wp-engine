@@ -21,6 +21,10 @@ pub struct GpuDevice {
     pub device: Device,
     /// wgpu queue handle — use this to submit command encoders.
     pub queue: Queue,
+    /// The instance the adapter came from — needed to create presentation surfaces.
+    pub instance: wgpu::Instance,
+    /// The chosen adapter — needed for surface capability queries.
+    pub adapter: wgpu::Adapter,
 }
 
 impl GpuDevice {
@@ -66,6 +70,12 @@ impl GpuDevice {
             .await
             .map_err(|e| anyhow!("failed to open GPU device '{}': {e}", info.name))?;
 
-        Ok(Self { info, device, queue })
+        Ok(Self {
+            info,
+            device,
+            queue,
+            instance,
+            adapter,
+        })
     }
 }

@@ -9,18 +9,18 @@ use super::{BackendType, GpuAdapter, GpuDeviceType};
 pub(super) fn from_wgpu_info(info: wgpu::AdapterInfo) -> GpuAdapter {
     let backend = match info.backend {
         wgpu::Backend::Vulkan => BackendType::Vulkan,
-        wgpu::Backend::Metal  => BackendType::Metal,
-        wgpu::Backend::Dx12   => BackendType::Dx12,
-        wgpu::Backend::Gl     => BackendType::OpenGl,
-        _                     => BackendType::Unknown,
+        wgpu::Backend::Metal => BackendType::Metal,
+        wgpu::Backend::Dx12 => BackendType::Dx12,
+        wgpu::Backend::Gl => BackendType::OpenGl,
+        _ => BackendType::Unknown,
     };
 
     let device_type = match info.device_type {
-        wgpu::DeviceType::DiscreteGpu   => GpuDeviceType::Discrete,
+        wgpu::DeviceType::DiscreteGpu => GpuDeviceType::Discrete,
         wgpu::DeviceType::IntegratedGpu => GpuDeviceType::Integrated,
-        wgpu::DeviceType::VirtualGpu    => GpuDeviceType::Virtual,
-        wgpu::DeviceType::Cpu           => GpuDeviceType::Software,
-        _                               => GpuDeviceType::Unknown,
+        wgpu::DeviceType::VirtualGpu => GpuDeviceType::Virtual,
+        wgpu::DeviceType::Cpu => GpuDeviceType::Software,
+        _ => GpuDeviceType::Unknown,
     };
 
     GpuAdapter {

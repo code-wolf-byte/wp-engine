@@ -1,36 +1,8 @@
 use anyhow::{anyhow, Result};
 use image::RgbaImage;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
-
-/// Open the container and read the video stream's average frame rate.
-/// Does not decode any frames.
-pub fn probe_fps(path: &Path) -> Result<f64> {
-    ffmpeg_next::init().map_err(|e| anyhow!("FFmpeg init: {e}"))?;
-
-    let ctx = ffmpeg_next::format::input(&path)
-        .map_err(|e| anyhow!("cannot open '{}': {e}", path.display()))?;
-
-    let stream = ctx
-        .streams()
-        .best(ffmpeg_next::media::Type::Video)
-        .ok_or_else(|| anyhow!("no video stream found in '{}'", path.display()))?;
-
-    let rate = stream.avg_frame_rate();
-    let fps = rate.numerator() as f64 / rate.denominator() as f64;
-
-    if !fps.is_finite() || fps <= 0.0 {
-        return Err(anyhow!(
-            "could not determine FPS for '{}' (reported {}/{})",
-            path.display(),
-            rate.numerator(),
-            rate.denominator(),
-        ));
-    }
-
-    Ok(fps)
-}
+use std::sync::Arc;
 
 /// Decode every frame of the video file and send each as an `Arc<RgbaImage>`
 /// through `tx`. When the file ends the decoder loops back to the beginning
@@ -51,8 +23,8 @@ pub fn video_decode_loop(path: &Path, tx: &SyncSender<Arc<RgbaImage>>) -> Result
 
     // Outer loop: re-open the file on each iteration to loop the video.
     loop {
-        let mut ictx = format::input(&path)
-            .map_err(|e| anyhow!("cannot open '{}': {e}", path.display()))?;
+        let mut ictx =
+            format::input(&path).map_err(|e| anyhow!("cannot open '{}': {e}", path.display()))?;
 
         let stream_idx = ictx
             .streams()
@@ -156,6 +128,74 @@ pub fn video_decode_loop(path: &Path, tx: &SyncSender<Arc<RgbaImage>>) -> Result
 
         // File ended — the outer `loop` re-opens it for seamless repeat.
     }
+}
+
+/// Decode the first video frame from `path` and return it as an `RgbaImage`.
+/// Useful for extracting a static thumbnail from a video texture layer.
+pub fn decode_first_frame(path: &Path) -> Result<RgbaImage> {
+    use ffmpeg_next::{
+        codec::context::Context as CodecCtx,
+        format,
+        format::Pixel,
+        media::Type,
+        software::scaling::{context::Context as ScaleCtx, flag::Flags},
+        util::frame::video::Video as VideoFrame,
+    };
+
+    ffmpeg_next::init().map_err(|e| anyhow!("FFmpeg init: {e}"))?;
+
+    let mut ictx =
+        format::input(&path).map_err(|e| anyhow!("cannot open '{}': {e}", path.display()))?;
+
+    let stream_idx = ictx
+        .streams()
+        .best(Type::Video)
+        .ok_or_else(|| anyhow!("no video stream in '{}'", path.display()))?
+        .index();
+
+    let mut decoder = {
+        let stream = ictx.stream(stream_idx).unwrap();
+        CodecCtx::from_parameters(stream.parameters())
+            .map_err(|e| anyhow!("codec context: {e}"))?
+            .decoder()
+            .video()
+            .map_err(|e| anyhow!("video decoder: {e}"))?
+    };
+
+    let mut scaler = ScaleCtx::get(
+        decoder.format(),
+        decoder.width(),
+        decoder.height(),
+        Pixel::RGBA,
+        decoder.width(),
+        decoder.height(),
+        Flags::BILINEAR,
+    )
+    .map_err(|e| anyhow!("scaler context: {e}"))?;
+
+    let mut raw = VideoFrame::empty();
+    let mut scaled = VideoFrame::empty();
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != stream_idx {
+            continue;
+        }
+        if decoder.send_packet(&packet).is_err() {
+            continue;
+        }
+        while decoder.receive_frame(&mut raw).is_ok() {
+            if scaler.run(&raw, &mut scaled).is_ok() {
+                if let Some(img) = frame_to_rgba(&scaled) {
+                    return Ok(img);
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "no decodable video frame found in '{}'",
+        path.display()
+    ))
 }
 
 /// Copy one RGBA `VideoFrame` into an `RgbaImage`, trimming stride padding.

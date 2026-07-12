@@ -1,6 +1,7 @@
 use crate::platform::RenderQuality;
 
 /// Render settings shared between the UI and the wallpaper thread.
+#[derive(Debug)]
 pub struct RenderSettings {
     /// GPU render quality / source down-sample factor.
     pub quality: RenderQuality,
@@ -10,6 +11,9 @@ pub struct RenderSettings {
 
 impl Default for RenderSettings {
     fn default() -> Self {
-        Self { quality: RenderQuality::Ultra, volume: 1.0 }
+        Self {
+            quality: RenderQuality::Ultra,
+            volume: 1.0,
+        }
     }
 }

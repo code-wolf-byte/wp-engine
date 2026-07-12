@@ -122,8 +122,7 @@ fn load_project(wallpaper_dir: &Path) -> Result<Project> {
     let project_path = wallpaper_dir.join("project.json");
     let data = std::fs::read_to_string(&project_path)
         .with_context(|| format!("reading {}", project_path.display()))?;
-    serde_json::from_str(&data)
-        .with_context(|| format!("parsing {}", project_path.display()))
+    serde_json::from_str(&data).with_context(|| format!("parsing {}", project_path.display()))
 }
 
 /// Scan all workshop directories and return every parseable wallpaper
@@ -135,11 +134,7 @@ pub fn scan_wallpapers() -> Vec<Wallpaper> {
         let entries = match std::fs::read_dir(&workshop_dir) {
             Ok(e) => e,
             Err(err) => {
-                eprintln!(
-                    "warn: cannot read {}: {}",
-                    workshop_dir.display(),
-                    err
-                );
+                eprintln!("warn: cannot read {}: {}", workshop_dir.display(), err);
                 continue;
             }
         };

@@ -19,3 +19,11 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+.octogent
+
+# Claude Code local settings/worktrees (personal, not shared)
+.claude/
+
+# Read-only C++ reference clone (Almamu/linux-wallpaperengine) used for
+# porting comparison — not part of this project, not vendored.
+cpp-implementation/

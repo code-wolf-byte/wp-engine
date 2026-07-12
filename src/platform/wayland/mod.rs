@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Result};
 use calloop::LoopSignal;
 use calloop_wayland_source::WaylandSource;
+use raw_window_handle::{
+    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    shell::WaylandSurface,
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -11,19 +13,25 @@ use smithay_client_toolkit::{
     shell::wlr_layer::{
         Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
     },
+    shell::WaylandSurface,
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
-use std::sync::{Arc, Mutex, mpsc::SyncSender};
+use std::ffi::c_void;
+use std::ptr::NonNull;
+use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Proxy, QueueHandle,
 };
 
-use crate::{platform, render::{FrameSource, RenderSettings}};
 use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
+use crate::{
+    engine::gpu_renderer::GpuSceneInstance,
+    platform,
+    render::{FrameSource, RenderSettings, WallpaperContent},
+};
 
 // ── Platform implementation ───────────────────────────────────────────────────
 
@@ -32,10 +40,10 @@ pub(super) struct WaylandPlatform;
 impl DisplayPlatform for WaylandPlatform {
     fn spawn_wallpaper(
         &self,
-        frame_source: FrameSource,
+        content: WallpaperContent,
         settings: Arc<Mutex<RenderSettings>>,
     ) -> Result<WallpaperHandle> {
-        let wayland_handle = spawn_wayland_wallpaper(frame_source, Arc::clone(&settings))?;
+        let wayland_handle = spawn_wayland_wallpaper(content, Arc::clone(&settings))?;
         Ok(WallpaperHandle::new(Box::new(wayland_handle), settings))
     }
 }
@@ -44,7 +52,7 @@ impl DisplayPlatform for WaylandPlatform {
 
 struct WaylandHandle {
     stop_signal: LoopSignal,
-    thread:      thread::JoinHandle<()>,
+    thread: thread::JoinHandle<()>,
 }
 
 impl WallpaperHandleInner for WaylandHandle {
@@ -59,14 +67,14 @@ impl WallpaperHandleInner for WaylandHandle {
 }
 
 fn spawn_wayland_wallpaper(
-    frame_source: FrameSource,
+    content: WallpaperContent,
     settings: Arc<Mutex<RenderSettings>>,
 ) -> Result<WaylandHandle> {
     let (signal_tx, signal_rx) = std::sync::mpsc::sync_channel::<LoopSignal>(0);
 
     let settings_thread = Arc::clone(&settings);
     let thread = thread::spawn(move || {
-        if let Err(e) = wallpaper_loop(frame_source, settings_thread, signal_tx) {
+        if let Err(e) = wallpaper_loop(content, settings_thread, signal_tx) {
             eprintln!("wallpaper thread error: {e}");
         }
     });
@@ -75,51 +83,261 @@ fn spawn_wayland_wallpaper(
         .recv()
         .map_err(|_| anyhow!("wallpaper thread exited before sending the loop signal"))?;
 
-    Ok(WaylandHandle { stop_signal, thread })
+    Ok(WaylandHandle {
+        stop_signal,
+        thread,
+    })
 }
 
-// ── Internal renderer ─────────────────────────────────────────────────────────
+// ── Content renderer ──────────────────────────────────────────────────────────
+
+/// How the wallpaper content produces pixels.
+enum ContentRenderer {
+    /// CPU frames (static images, videos, and the scene fallback loop);
+    /// presented through SHM buffers.
+    Frames(FrameSource),
+    /// GPU-rendered scene sharing our device — presented directly into the
+    /// wgpu surface (no readback) when the compositor allows, with an RGBA
+    /// readback + SHM fallback otherwise.
+    Scene(Box<GpuSceneInstance>),
+}
+
+impl ContentRenderer {
+    fn is_animated(&self) -> bool {
+        match self {
+            ContentRenderer::Frames(fs) => fs.is_animated(),
+            ContentRenderer::Scene(_) => true,
+        }
+    }
+}
+
+// ── Internal renderer state ───────────────────────────────────────────────────
+
+/// GPU presentation state for one output surface.
+struct SurfaceGpu {
+    surface: wgpu::Surface<'static>,
+    format: wgpu::TextureFormat,
+    configured: (u32, u32),
+}
 
 struct WallpaperSurface {
+    /// wgpu surface — declared before `layer` so it drops before the
+    /// wl_surface it was created from.
+    gpu: Option<SurfaceGpu>,
+    /// `None` once GPU surface creation failed for this output (don't retry).
+    gpu_failed: bool,
     layer: LayerSurface,
     width: u32,
     height: u32,
+    /// Previous frame's SHM pool — kept alive until compositor releases the buffer.
+    pool: Option<SlotPool>,
 }
 
 struct WallpaperState {
-    registry_state:    RegistryState,
-    output_state:      OutputState,
-    compositor_state:  CompositorState,
-    shm:               Shm,
-    layer_shell:       LayerShell,
-    surfaces:          Vec<WallpaperSurface>,
-    /// Live frame source — replaces the old static `image: RgbaImage`.
-    frame_source:      FrameSource,
-    /// GPU-accelerated scaler (falls back to CPU on error).
-    gpu_scaler:        platform::GpuScaler,
-    /// Render settings shared with the UI thread.
-    settings:          Arc<Mutex<RenderSettings>>,
+    registry_state: RegistryState,
+    output_state: OutputState,
+    compositor_state: CompositorState,
+    shm: Shm,
+    layer_shell: LayerShell,
+    surfaces: Vec<WallpaperSurface>,
+    renderer: ContentRenderer,
+    gpu_scaler: platform::GpuScaler,
+    settings: Arc<Mutex<RenderSettings>>,
+    /// Queue handle stored so draw_at can request wl_surface_frame callbacks.
+    qh: Option<QueueHandle<WallpaperState>>,
+    // GPU presentation
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    display_ptr: *mut c_void,
+    allow_gpu_surface: bool,
 }
 
 impl WallpaperState {
-    /// Draw the current frame onto the surface at `surfaces[idx]`.
-    ///
-    /// Takes `&self` (not `&mut self`) so the calloop timer callback can call
-    /// this after releasing the `&mut` borrow from `frame_source.try_advance()`.
-    /// The frame is obtained via `Arc::clone` — a cheap atomic refcount bump,
-    /// no pixel data is copied at this point.
-    fn draw_at(&self, idx: usize) {
-        let width = self.surfaces[idx].width;
-        let height = self.surfaces[idx].height;
+    /// Try to create + configure a wgpu surface for output `idx`.
+    /// On any failure the output falls back to the SHM path permanently.
+    fn ensure_gpu_surface(&mut self, idx: usize) {
+        if !self.allow_gpu_surface
+            || self.surfaces[idx].gpu_failed
+            || !matches!(self.renderer, ContentRenderer::Scene(_))
+        {
+            return;
+        }
+        let (width, height) = (self.surfaces[idx].width, self.surfaces[idx].height);
         if width == 0 || height == 0 {
             return;
         }
 
-        // Cheap Arc clone — no image data is duplicated.
-        let frame = std::sync::Arc::clone(self.frame_source.current_frame());
+        if self.surfaces[idx].gpu.is_none() {
+            match self.create_gpu_surface(idx) {
+                Ok(gpu) => self.surfaces[idx].gpu = Some(gpu),
+                Err(e) => {
+                    eprintln!(
+                        "wallpaper: GPU surface unavailable for output {idx}: {e} — using SHM path"
+                    );
+                    self.surfaces[idx].gpu_failed = true;
+                    return;
+                }
+            }
+        }
 
-        let stride = width * 4;
-        let mut pool = match SlotPool::new((width * height * 4) as usize, &self.shm) {
+        let gpu = self.surfaces[idx].gpu.as_mut().unwrap();
+        if gpu.configured != (width, height) {
+            gpu.surface.configure(
+                &self.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: gpu.format,
+                    width,
+                    height,
+                    present_mode: wgpu::PresentMode::Fifo,
+                    desired_maximum_frame_latency: 2,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    view_formats: vec![],
+                },
+            );
+            gpu.configured = (width, height);
+        }
+    }
+
+    fn create_gpu_surface(&self, idx: usize) -> Result<SurfaceGpu> {
+        let display =
+            NonNull::new(self.display_ptr).ok_or_else(|| anyhow!("null wl_display pointer"))?;
+        let surface_ptr = self.surfaces[idx].layer.wl_surface().id().as_ptr() as *mut c_void;
+        let surface_ptr =
+            NonNull::new(surface_ptr).ok_or_else(|| anyhow!("null wl_surface pointer"))?;
+
+        let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display));
+        let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(surface_ptr));
+
+        // Safety: the wl_display lives for the whole wallpaper thread and the
+        // wl_surface is owned by our LayerSurface, which outlives the wgpu
+        // surface (field order in WallpaperSurface drops `gpu` first).
+        let surface = unsafe {
+            self.instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: raw_display,
+                    raw_window_handle: raw_window,
+                })
+        }
+        .map_err(|e| anyhow!("create_surface failed: {e}"))?;
+
+        if !self.adapter.is_surface_supported(&surface) {
+            return Err(anyhow!(
+                "adapter does not support presenting to this surface"
+            ));
+        }
+
+        let caps = surface.get_capabilities(&self.adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| {
+                matches!(
+                    f,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
+            .or_else(|| caps.formats.first().copied())
+            .ok_or_else(|| anyhow!("surface reports no supported formats"))?;
+
+        Ok(SurfaceGpu {
+            surface,
+            format,
+            configured: (0, 0),
+        })
+    }
+
+    fn draw_at(&mut self, idx: usize) {
+        if self.surfaces[idx].width == 0 || self.surfaces[idx].height == 0 {
+            return;
+        }
+        self.ensure_gpu_surface(idx);
+        if self.surfaces[idx].gpu.is_some() {
+            self.draw_gpu(idx);
+        } else {
+            self.draw_shm(idx);
+        }
+    }
+
+    /// Direct GPU presentation: render the scene straight into the acquired
+    /// surface texture — no CPU readback, no SHM copy.
+    fn draw_gpu(&mut self, idx: usize) {
+        let (width, height) = (self.surfaces[idx].width, self.surfaces[idx].height);
+
+        // Request the next frame callback before present() commits the surface.
+        if self.renderer.is_animated() {
+            if let Some(qh) = &self.qh {
+                let wl_surf = self.surfaces[idx].layer.wl_surface();
+                wl_surf.frame(qh, wl_surf.clone());
+            }
+        }
+
+        let acquired = self.surfaces[idx]
+            .gpu
+            .as_ref()
+            .unwrap()
+            .surface
+            .get_current_texture();
+        let frame = match acquired {
+            Ok(f) => f,
+            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                self.surfaces[idx].gpu.as_mut().unwrap().configured = (0, 0);
+                self.ensure_gpu_surface(idx);
+                match self.surfaces[idx]
+                    .gpu
+                    .as_ref()
+                    .unwrap()
+                    .surface
+                    .get_current_texture()
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("wallpaper: surface acquire failed after reconfigure: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("wallpaper: surface acquire failed: {e}");
+                return;
+            }
+        };
+
+        let view = frame.texture.create_view(&Default::default());
+        let format = self.surfaces[idx].gpu.as_ref().unwrap().format;
+        match &mut self.renderer {
+            ContentRenderer::Scene(instance) => {
+                instance.render_to_view(&view, width, height, format);
+            }
+            // GPU surfaces are only created for scene renderers.
+            ContentRenderer::Frames(_) => return,
+        }
+        frame.present();
+    }
+
+    /// SHM path: CPU frame → GPU scaler → SHM buffer (static/video content
+    /// and scene fallback when direct presentation is unavailable).
+    fn draw_shm(&mut self, idx: usize) {
+        let width = self.surfaces[idx].width;
+        let height = self.surfaces[idx].height;
+
+        let frame: Arc<image::RgbaImage> = match &mut self.renderer {
+            ContentRenderer::Frames(fs) => Arc::clone(fs.current_frame()),
+            ContentRenderer::Scene(instance) => match instance.render_rgba() {
+                Ok(img) => Arc::new(img),
+                Err(e) => {
+                    eprintln!("wallpaper: scene readback failed: {e}");
+                    return;
+                }
+            },
+        };
+
+        let row_bytes = width as usize * 4;
+        let stride = row_bytes;
+        let active_len = stride * height as usize;
+        let mut pool = match SlotPool::new(active_len, &self.shm) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("wallpaper: failed to create shm pool: {e}");
@@ -140,20 +358,71 @@ impl WallpaperState {
             }
         };
 
-        // Scale frame to output resolution via GPU (falls back to CPU on error).
         let quality = self.settings.lock().unwrap().quality;
-        let pixels = self.gpu_scaler.scale(frame.as_ref(), width, height, quality);
-        canvas.copy_from_slice(&pixels);
+        let pixels = self
+            .gpu_scaler
+            .scale(frame.as_ref(), width, height, quality);
+        if pixels.len() != active_len {
+            eprintln!(
+                "wallpaper: scaler returned {} bytes for {}x{} frame, expected {}",
+                pixels.len(),
+                width,
+                height,
+                active_len
+            );
+            return;
+        }
+
+        copy_frame_into_shm_canvas(canvas, &pixels, width as usize, height as usize, stride);
 
         let wl_surf = self.surfaces[idx].layer.wl_surface();
+
+        // Request a wl_surface_frame callback before committing — only for
+        // animated sources. The callback fires after the compositor presents
+        // this frame, at which point we advance to the next frame and draw again.
+        // Static sources draw once on configure and never request more callbacks.
+        if self.renderer.is_animated() {
+            if let Some(qh) = &self.qh {
+                wl_surf.frame(qh, wl_surf.clone());
+            }
+        }
+
         wl_surf.attach(Some(buffer.wl_buffer()), 0, 0);
         wl_surf.damage_buffer(0, 0, width as i32, height as i32);
         wl_surf.commit();
+
+        // Keep the SHM pool alive until the compositor reads the buffer.
+        self.surfaces[idx].pool = Some(pool);
+    }
+}
+
+fn copy_frame_into_shm_canvas(
+    canvas: &mut [u8],
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) {
+    let row_bytes = width * 4;
+    let active_len = stride * height;
+    let copy_len = active_len.min(canvas.len());
+
+    canvas.fill(0);
+    if copy_len < active_len || pixels.len() < row_bytes * height {
+        return;
+    }
+
+    for row in 0..height {
+        let src_start = row * row_bytes;
+        let src_end = src_start + row_bytes;
+        let dst_start = row * stride;
+        let dst_end = dst_start + row_bytes;
+        canvas[dst_start..dst_end].copy_from_slice(&pixels[src_start..src_end]);
     }
 }
 
 fn wallpaper_loop(
-    frame_source: FrameSource,
+    content: WallpaperContent,
     settings: Arc<Mutex<RenderSettings>>,
     signal_tx: SyncSender<LoopSignal>,
 ) -> Result<()> {
@@ -161,11 +430,35 @@ fn wallpaper_loop(
     let gpu = platform::GpuDevice::open_low_power()
         .or_else(|_| platform::GpuDevice::open_best())
         .map_err(|e| anyhow!("no GPU device available: {e}"))?;
+    let instance = gpu.instance.clone();
+    let adapter = gpu.adapter.clone();
+    let device = gpu.device.clone();
+    let queue = gpu.queue.clone();
     let gpu_scaler = platform::GpuScaler::from_device(gpu)
         .map_err(|e| anyhow!("GPU scaler init failed: {e}"))?;
 
+    let allow_gpu_surface = std::env::var("WP_ENGINE_FORCE_SHM").is_err();
+
+    // Build the content renderer. Scenes render on our own device so frames
+    // can be presented directly; everything else produces CPU frames.
+    let renderer = match content {
+        WallpaperContent::Scene { dir } if allow_gpu_surface => {
+            match GpuSceneInstance::with_device(device.clone(), queue.clone(), &dir) {
+                Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
+                Err(e) => {
+                    eprintln!("wallpaper: GPU scene init failed ({e}); using frame-loop fallback");
+                    ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
+                        dir,
+                    })?)
+                }
+            }
+        }
+        other => ContentRenderer::Frames(FrameSource::from_content(other)?),
+    };
+
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("cannot connect to Wayland display: {e}"))?;
+    let display_ptr = conn.backend().display_ptr() as *mut c_void;
 
     let (globals, mut event_queue) = registry_queue_init::<WallpaperState>(&conn)
         .map_err(|e| anyhow!("Wayland registry init failed: {e}"))?;
@@ -174,8 +467,8 @@ fn wallpaper_loop(
 
     let compositor_state = CompositorState::bind(&globals, &qh)
         .map_err(|_| anyhow!("compositor does not advertise wl_compositor"))?;
-    let shm = Shm::bind(&globals, &qh)
-        .map_err(|_| anyhow!("compositor does not advertise wl_shm"))?;
+    let shm =
+        Shm::bind(&globals, &qh).map_err(|_| anyhow!("compositor does not advertise wl_shm"))?;
     let output_state = OutputState::new(&globals, &qh);
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| {
         anyhow!("compositor does not support zwlr_layer_shell_v1 (wlr-layer-shell)")
@@ -189,9 +482,15 @@ fn wallpaper_loop(
         shm,
         layer_shell,
         surfaces: Vec::new(),
-        frame_source,
+        renderer,
         gpu_scaler,
         settings,
+        qh: Some(qh.clone()),
+        instance,
+        adapter,
+        device,
+        display_ptr,
+        allow_gpu_surface,
     };
 
     // First roundtrip: discovers all current outputs → triggers new_output → creates surfaces.
@@ -212,51 +511,20 @@ fn wallpaper_loop(
         .insert(event_loop.handle())
         .map_err(|e| anyhow!("WaylandSource insert failed: {e}"))?;
 
-    // ── Animated wallpapers: high-frequency poll, render only on new frames ────
-    //
-    // The decoder thread paces itself using the frame's PTS timestamps, so
-    // frames arrive at the video's native rate. We poll at 120 Hz (every 8 ms)
-    // to keep display latency low without tying render calls to a fixed-fps
-    // timer that might not match the video's actual frame rate.
-    //
-    // On each tick:
-    //   1. `try_advance()` takes at most ONE frame from the channel (&mut,
-    //      released before step 2).
-    //   2. Only if a new frame arrived, `draw_at` redraws every output
-    //      (&self borrow, no conflict with step 1).
-    //   3. Return `ToDuration` to reschedule.
-    if state.frame_source.is_animated() {
-        const POLL_INTERVAL: Duration = Duration::from_millis(8); // ~120 Hz
-
-        event_loop
-            .handle()
-            .insert_source(
-                calloop::timer::Timer::from_duration(POLL_INTERVAL),
-                |_deadline, _metadata, state: &mut WallpaperState| {
-                    // Step 1: try to pull the next frame (&mut, released here).
-                    if state.frame_source.try_advance() {
-                        // Step 2: new frame available — redraw all outputs.
-                        let n = state.surfaces.len();
-                        for idx in 0..n {
-                            state.draw_at(idx);
-                        }
-                    }
-
-                    // Step 3: reschedule.
-                    calloop::timer::TimeoutAction::ToDuration(POLL_INTERVAL)
-                },
-            )
-            .map_err(|e| anyhow!("timer source insert failed: {e}"))?;
-    }
-
     // Give the loop signal to the spawning thread before blocking.
     let _ = signal_tx.send(event_loop.get_signal());
 
     // Run until stop_signal.stop() is called from the UI thread.
-    event_loop
-        .run(None, &mut state, |_| {})
-        .map_err(|e| anyhow!("event loop error: {e}"))?;
+    let run_result = event_loop.run(None, &mut state, |_| {});
 
+    // Destroy wgpu surfaces BEFORE the event loop (and with it the Wayland
+    // connection) is dropped — vkDestroySurfaceKHR against a closed
+    // wl_display segfaults.
+    for surface in &mut state.surfaces {
+        surface.gpu = None;
+    }
+
+    run_result.map_err(|e| anyhow!("event loop error: {e}"))?;
     Ok(())
 }
 
@@ -264,17 +532,42 @@ fn wallpaper_loop(
 
 impl CompositorHandler for WallpaperState {
     fn scale_factor_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: i32,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
     fn transform_changed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _: wl_output::Transform,
-    ) {}
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
     fn frame(
-        &mut self, _: &Connection, _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface, _time: u32,
-    ) {}
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        // Compositor has presented the previous frame and is ready for the next.
+        // This mirrors linux-wallpaperengine's surfaceFrameCallback pattern.
+        let idx = self
+            .surfaces
+            .iter()
+            .position(|s| s.layer.wl_surface() == surface);
+        if let Some(idx) = idx {
+            self.qh = Some(qh.clone());
+            if let ContentRenderer::Frames(fs) = &mut self.renderer {
+                fs.try_advance();
+            }
+            self.draw_at(idx);
+        }
+    }
 }
 
 impl OutputHandler for WallpaperState {
@@ -302,16 +595,19 @@ impl OutputHandler for WallpaperState {
         layer.set_size(0, 0);
         layer.commit();
 
-        self.surfaces.push(WallpaperSurface { layer, width: 0, height: 0 });
+        self.surfaces.push(WallpaperSurface {
+            gpu: None,
+            gpu_failed: false,
+            layer,
+            width: 0,
+            height: 0,
+            pool: None,
+        });
     }
 
-    fn update_output(
-        &mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput,
-    ) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-    fn output_destroyed(
-        &mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput,
-    ) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
 impl LayerShellHandler for WallpaperState {

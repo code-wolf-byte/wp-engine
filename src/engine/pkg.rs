@@ -1,3 +1,51 @@
+//! # Wallpaper Engine PKG Archive Format
+//!
+//! A `.pkg` file is a **flat, uncompressed archive** used by Wallpaper Engine to
+//! bundle scene assets (JSON descriptors, GLSL shaders, `.tex` textures, particle
+//! definitions, etc.) into a single file for Steam Workshop distribution.
+//!
+//! ## Binary Layout
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │  HEADER                                                      │
+//! │  u32 LE  : byte length of the version string                 │
+//! │  bytes   : ASCII version string, e.g. "PKGV0012"            │
+//! ├──────────────────────────────────────────────────────────────┤
+//! │  DIRECTORY                                                   │
+//! │  u32 LE  : number of file entries                            │
+//! │                                                              │
+//! │  repeated for each file:                                     │
+//! │    u32 LE  : byte length of the filename                     │
+//! │    bytes   : UTF-8 filename, e.g. "shaders/effects/foo.frag" │
+//! │    u32 LE  : offset of file data from start of DATA SECTION  │
+//! │    u32 LE  : byte length of file data                        │
+//! ├──────────────────────────────────────────────────────────────┤
+//! │  DATA SECTION  (immediately follows the last directory entry) │
+//! │  [raw bytes of file 0]                                       │
+//! │  [raw bytes of file 1]                                       │
+//! │  ...  (files are contiguous, no padding between them)        │
+//! └──────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Key Details
+//!
+//! - **All integers are little-endian `u32`.**  No other widths are used.
+//! - **Offsets are relative to the data section start**, not the beginning of the
+//!   file.  Absolute position = `base_offset + entry.offset`, where `base_offset`
+//!   is the byte position immediately after the last directory entry.
+//! - **Files are stored contiguously with no alignment or padding** between them.
+//!   `entry[n+1].offset == entry[n].offset + entry[n].length`.
+//! - **No compression or encryption.**  All content (JSON, GLSL, `.tex`) is stored
+//!   verbatim.
+//! - **Filenames are case-insensitive and path-separator-agnostic.**  Backslashes
+//!   and forward slashes are both valid; this parser normalises to `/` and
+//!   lowercases all paths before indexing them.
+//! - **Empty files** (`length = 0`) are valid entries and return an empty slice,
+//!   not `None`.
+//! - **Version tag** (`PKGV0012`) is embedded in the header string itself.  All
+//!   WE scene packages observed in the wild use version `0012`.
+
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -14,7 +62,8 @@ struct FileEntry {
 
 /// A loaded Wallpaper Engine PKG archive.
 ///
-/// All file data is kept in memory; [`get`](Self::get) returns zero-copy slices.
+/// The entire file is read into memory once; [`get`](Self::get) returns
+/// zero-copy slices into that buffer.
 pub struct Package {
     data: Vec<u8>,
     files: HashMap<String, FileEntry>,
@@ -32,7 +81,11 @@ impl Package {
     /// Parse a PKG archive from an already-loaded byte buffer.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let (files, base_offset) = Self::parse_directory(&data)?;
-        Ok(Self { data, files, base_offset })
+        Ok(Self {
+            data,
+            files,
+            base_offset,
+        })
     }
 
     /// Return the raw bytes for `path`, or `None` if the path is not in the archive.
@@ -96,14 +149,16 @@ impl Package {
 
 fn read_u32(cur: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
-    cur.read_exact(&mut buf).context("unexpected EOF reading u32")?;
+    cur.read_exact(&mut buf)
+        .context("unexpected EOF reading u32")?;
     Ok(u32::from_le_bytes(buf))
 }
 
 fn read_sized_string(cur: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u32(cur)? as usize;
     let mut buf = vec![0u8; len];
-    cur.read_exact(&mut buf).context("unexpected EOF reading string bytes")?;
+    cur.read_exact(&mut buf)
+        .context("unexpected EOF reading string bytes")?;
     String::from_utf8(buf).context("PKG string is not valid UTF-8")
 }
 
