@@ -1113,6 +1113,10 @@ struct SceneLayerGpu {
     /// This layer's position in `scene.visible_objects()` — lets `render()`
     /// interleave with particle systems in true scene z-order.
     order_index: usize,
+    /// Perspective scenes only: view-space distance of the quad center from
+    /// the camera, for painter's-algorithm back-to-front sorting. Negative =
+    /// behind the camera (culled). Always 0.0 in orthographic scenes.
+    depth: f32,
 }
 
 // ── GpuSceneInstance ──────────────────────────────────────────────────────────
@@ -1168,6 +1172,10 @@ pub struct GpuSceneInstance {
     /// frame. Lives here (on the render thread) because boa's `Context` is
     /// `!Send`; created and used entirely within this instance.
     script_ctx: crate::engine::script::ScriptContext,
+    /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
+    /// projected through a perspective camera and `render()` sorts image
+    /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
+    perspective: bool,
 }
 
 impl GpuSceneInstance {
@@ -1238,6 +1246,13 @@ impl GpuSceneInstance {
 
         let dynamics = CameraDynamics::from_scene(&resolved.scene);
 
+        // Perspective (3D) scenes project layer quads through the scene
+        // camera instead of mapping pixel origins to NDC directly.
+        let camera3d = crate::engine::camera3d::PerspectiveCamera::from_scene(
+            &resolved.scene,
+            w as f32 / h as f32,
+        );
+
         let layers: Vec<SceneLayerGpu> = resolved
             .layers
             .iter()
@@ -1275,12 +1290,54 @@ impl GpuSceneInstance {
                     effective_size[0] * l.scale[0],
                     effective_size[1] * l.scale[1],
                 ];
-                let rect = [
-                    (2.0 * l.origin[0] / w as f64 - 1.0) as f32,
-                    (2.0 * l.origin[1] / h as f64 - 1.0) as f32,
-                    (size_px[0] / w as f64) as f32,
-                    (size_px[1] / h as f64) as f32,
-                ];
+                let (rect, angle, depth) = if let Some(cam) = &camera3d {
+                    // 3D scene: the quad lives at a world-space origin with
+                    // world-space extents (size × scale). Rotate its corner
+                    // offsets, project all four through the camera, and
+                    // composite the NDC bounding box. Approximation: no
+                    // in-quad perspective warp (corners collapse to an
+                    // axis-aligned rect) — fine for the mostly camera-facing
+                    // layers these scenes use.
+                    let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
+                    let ang = l.angles;
+                    let hx = (size_px[0] / 2.0) as f32;
+                    let hy = (size_px[1] / 2.0) as f32;
+                    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
+                        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], ang);
+                        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
+                    });
+                    let ndc: Vec<[f32; 2]> =
+                        corners.iter().filter_map(|c| cam.project(*c)).collect();
+                    if ndc.len() < 4 {
+                        // Any corner at/behind the eye plane: cull the whole
+                        // quad rather than composite a blown-up projection.
+                        ([-10.0, -10.0, 0.0, 0.0], 0.0, -1.0)
+                    } else {
+                        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+                        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+                        for p in &ndc {
+                            min_x = min_x.min(p[0]);
+                            min_y = min_y.min(p[1]);
+                            max_x = max_x.max(p[0]);
+                            max_y = max_y.max(p[1]);
+                        }
+                        let rect = [
+                            (min_x + max_x) / 2.0,
+                            (min_y + max_y) / 2.0,
+                            (max_x - min_x) / 2.0,
+                            (max_y - min_y) / 2.0,
+                        ];
+                        (rect, 0.0, cam.view_depth(center))
+                    }
+                } else {
+                    let rect = [
+                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32,
+                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32,
+                        (size_px[0] / w as f64) as f32,
+                        (size_px[1] / h as f64) as f32,
+                    ];
+                    (rect, l.angle, 0.0)
+                };
 
                 SceneLayerGpu {
                     frames,
@@ -1294,8 +1351,9 @@ impl GpuSceneInstance {
                     brightness: l.brightness,
                     frame_duration_ms: l.frame_duration_ms,
                     parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
-                    angle: l.angle,
+                    angle,
                     rect,
+                    depth,
                     object_size,
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
@@ -1418,6 +1476,7 @@ impl GpuSceneInstance {
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
             script_ctx: crate::engine::script::ScriptContext::new(),
+            perspective: camera3d.is_some(),
         })
     }
 
@@ -1535,6 +1594,26 @@ impl GpuSceneInstance {
             )
             .collect();
         items.sort_by_key(|(order, _)| *order);
+
+        if self.perspective {
+            // Painter's algorithm for 3D scenes: draw image layers strictly
+            // back-to-front by view-space depth (no depth buffer yet), with
+            // culled quads (depth < 0) dropped. Particles keep drawing after
+            // images, as in the ortho path's known simplification.
+            items.retain(|(_, item)| match item {
+                DrawItem::Image(i) => self.layers[*i].depth >= 0.0,
+                DrawItem::Particle(_) => true,
+            });
+            items.sort_by(|(oa, a), (ob, b)| {
+                let key = |it: &DrawItem, order: usize| match it {
+                    DrawItem::Image(i) => (0, -self.layers[*i].depth, order),
+                    DrawItem::Particle(_) => (1, 0.0, order),
+                };
+                key(a, *oa)
+                    .partial_cmp(&key(b, *ob))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         for (_, item) in items {
             match item {

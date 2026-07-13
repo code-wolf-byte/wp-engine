@@ -94,6 +94,9 @@ pub struct Layer {
     pub parallax_depth: [f64; 2],
     /// z-rotation in radians (WE `angles.z`; the JSON value is already in radians).
     pub angle: f32,
+    /// Full 3D rotation in radians, un-negated as stored in scene.json.
+    /// Only used by the perspective (3D scene) path; 2D uses `angle`.
+    pub angles: [f32; 3],
     pub blend_mode: u32,
     pub alpha: f32,
     /// Inline SceneScript source driving `alpha` per frame, if the property
@@ -656,13 +659,13 @@ fn layer_from_object(
     // WE stores angles already in radians; only the z component (2D roll)
     // applies to a flat layer quad. The reference negates it (rotate(-angle,
     // ...)) when building the object's screen transform.
-    let angle = obj
+    let angles3 = obj
         .angles
         .as_ref()
         .map(crate::engine::model::json_to_animated)
         .and_then(|v| v.as_vec3())
-        .map(|v| -v[2])
-        .unwrap_or(0.0);
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let angle = -angles3[2];
 
     let scale = match &obj.scale {
         Some(v) => {
@@ -721,6 +724,7 @@ fn layer_from_object(
         scale,
         parallax_depth: parallax,
         angle,
+        angles: angles3,
         blend_mode: obj.color_blend_mode,
         alpha,
         alpha_script,
@@ -1319,6 +1323,14 @@ fn resolve_particle_sprite_dir(
 }
 
 fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
+    // Perspective 3D scenes have no orthogonal projection and their layer
+    // sizes are world-space, not pixels — inferring pixel dimensions from
+    // them yields garbage (e.g. 1619x29). Render at a fixed 16:9 target; the
+    // perspective camera maps world → NDC independently of this resolution.
+    if scene.is_perspective() {
+        return (1920, 1080);
+    }
+
     // 1. Try orthogonal projection dimensions from camera or general settings
     if let Some(cam) = &scene.camera {
         if let Some(proj) = &cam.orthogonal_projection {
@@ -1434,6 +1446,7 @@ mod tests {
             scale: [1.0, 1.0, 1.0],
             parallax_depth: [0.0, 0.0],
             angle: 0.0,
+            angles: [0.0, 0.0, 0.0],
             blend_mode: 0,
             alpha: 1.0,
             alpha_script: None,

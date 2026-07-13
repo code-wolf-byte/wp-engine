@@ -12,6 +12,7 @@ name = "scan-wallpapers"
 path = "src/tests/scan_wallpapers.rs"
 
 [dependencies]
+# Structured logging (spans/targets); the subscriber is initialized in main.
 # Wayland renderer
 smithay-client-toolkit  = "0.18"
 wayland-client          = "0.31"
