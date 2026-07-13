@@ -1099,6 +1099,10 @@ struct SceneLayerGpu {
     alpha_base: f32,
     /// Inline SceneScript source driving `alpha`, or `None` for static alpha.
     alpha_script: Option<String>,
+    /// Script-driven text: re-evaluated each tick; when the output string
+    /// changes, `frames[0]` is re-rasterized and `rect` re-derived (clocks
+    /// tick, dates roll over — 42 of the corpus's 58 script wallpapers).
+    text_dynamic: Option<crate::engine::render::TextDynamic>,
     color: [f32; 3],
     brightness: f32,
     frame_duration_ms: u32,
@@ -1352,6 +1356,7 @@ impl GpuSceneInstance {
                     alpha: l.alpha,
                     alpha_base: l.alpha,
                     alpha_script: l.alpha_script.clone(),
+                    text_dynamic: l.text_dynamic.clone(),
                     color: l.color,
                     brightness: l.brightness,
                     frame_duration_ms: l.frame_duration_ms,
@@ -1523,6 +1528,48 @@ impl GpuSceneInstance {
             for layer in &mut self.layers {
                 if let Some(script) = &layer.alpha_script {
                     layer.alpha = ctx.eval_update(script, layer.alpha_base).unwrap_or(layer.alpha_base);
+                }
+                // Script-driven text: re-evaluate; only a CHANGED string pays
+                // for rasterization + upload (a clock re-rasterizes once per
+                // displayed unit — second or minute — not per frame).
+                if let Some(td) = &mut layer.text_dynamic {
+                    if let Some(new_text) = ctx.eval_update_string(
+                        &td.script,
+                        &td.last_text,
+                        td.script_properties.as_ref(),
+                    ) {
+                        if new_text != td.last_text && !new_text.is_empty() {
+                            if let Some(img) = crate::engine::text::rasterize(
+                                &td.font_data,
+                                &new_text,
+                                td.point_size,
+                            ) {
+                                // Re-derive the aligned rect for the new
+                                // dimensions — same math layer_from_object +
+                                // build use (origin is y-up scene coords).
+                                let scaled = [
+                                    img.width() as f64 * td.scale[0],
+                                    img.height() as f64 * td.scale[1],
+                                ];
+                                let off = crate::engine::render::alignment_offset(
+                                    Some(&td.alignment),
+                                    scaled,
+                                );
+                                let origin = [
+                                    td.raw_origin[0] + off[0],
+                                    td.raw_origin[1] + off[1],
+                                ];
+                                layer.rect = [
+                                    (2.0 * origin[0] / self.width as f64 - 1.0) as f32,
+                                    (2.0 * origin[1] / self.height as f64 - 1.0) as f32,
+                                    (scaled[0] / self.width as f64) as f32,
+                                    (scaled[1] / self.height as f64) as f32,
+                                ];
+                                layer.frames[0] = self.renderer.upload_texture(&img);
+                                td.last_text = new_text;
+                            }
+                        }
+                    }
                 }
             }
         }

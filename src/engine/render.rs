@@ -81,6 +81,27 @@ pub struct ResolvedChildParticle {
     pub child_ref: particle::ChildRef,
 }
 
+/// Everything needed to re-rasterize a script-driven text layer at runtime:
+/// the script, the font, and the layout inputs (`layer_from_object` folds
+/// alignment into origin once at load; content changes re-derive it).
+#[derive(Clone)]
+pub struct TextDynamic {
+    pub script: String,
+    /// The scene's authored `text.scriptproperties` object (per-instance
+    /// editor values, merged over the script's builder defaults).
+    pub script_properties: Option<serde_json::Value>,
+    pub font_data: Vec<u8>,
+    pub point_size: f32,
+    /// Text currently rasterized into the layer image (the `value` WE feeds
+    /// back into `update` each tick).
+    pub last_text: String,
+    /// Un-aligned authored origin (WE scene coords, y-up).
+    pub raw_origin: [f64; 3],
+    /// Combined "halign valign" string, as passed to `alignment_offset`.
+    pub alignment: String,
+    pub scale: [f64; 3],
+}
+
 pub struct Layer {
     pub name: String,
     pub image: RgbaImage,
@@ -116,6 +137,9 @@ pub struct Layer {
     /// Embedded-video stream (mp4 inside the .tex) — the live GPU path
     /// re-uploads decoded frames from this; `image` is the first frame.
     pub video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
+    /// Script-driven text: the GPU path re-evaluates and re-rasterizes
+    /// `image` when the script's output changes (clocks, dates, countdowns).
+    pub text_dynamic: Option<TextDynamic>,
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
@@ -637,7 +661,7 @@ fn parse_parallax_depth(v: &serde_json::Value) -> [f64; 2] {
 /// same horizontally. Matches CImage.cpp lines 242-256 exactly (each pair is
 /// mutually exclusive — "top bottom" together, like the reference, only
 /// honors "top").
-fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -> [f64; 2] {
+pub(crate) fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -> [f64; 2] {
     let a = alignment.unwrap_or("").to_lowercase();
     let mut offset = [0.0, 0.0];
     if a.contains("top") {
@@ -746,6 +770,7 @@ fn layer_from_object(
         clamp_uvs: loaded.clamp_uvs,
         puppet: loaded.puppet,
         video: loaded.video,
+        text_dynamic: None,
         order_index: 0,
     }
 }
@@ -952,7 +977,29 @@ fn text_layer_from_object(
     dir: Option<&Path>,
     pkg: Option<&Package>,
 ) -> Option<Layer> {
-    let text_str = obj.text.as_ref().and_then(extract_text_string)?;
+    // A text object's `text` is either a plain string, a {"value": …}
+    // wrapper, or a scripted {"script": "…", "value"?: …} — clocks/dates
+    // (the dominant case in real content) often ship the script with NO
+    // static value at all, so the script's first evaluation IS the content.
+    let text_value = obj.text.as_ref()?;
+    let script = text_value
+        .get("script")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let script_properties = text_value.get("scriptproperties").cloned();
+    let static_str = extract_text_string(text_value).unwrap_or_default();
+    let text_str = match (&script, static_str.is_empty()) {
+        (Some(script), _) => {
+            // One-shot load-time evaluation so the layer rasterizes real
+            // content (and sizes itself correctly) from frame 0.
+            let mut ctx = crate::engine::script::ScriptContext::new();
+            ctx.eval_update_string(script, &static_str, script_properties.as_ref())
+                .filter(|t| !t.is_empty())
+                .unwrap_or(static_str)
+        }
+        (None, false) => static_str,
+        (None, true) => return None,
+    };
     if text_str.is_empty() {
         return None;
     }
@@ -975,11 +1022,20 @@ fn text_layer_from_object(
     let valign = obj.verticalalign.as_deref().unwrap_or("center");
     let combined = format!("{halign} {valign}");
 
-    Some(layer_from_object(
-        obj,
-        LoadedImage::single(image),
-        Some(&combined),
-    ))
+    let mut layer = layer_from_object(obj, LoadedImage::single(image), Some(&combined));
+    if let Some(script) = script {
+        layer.text_dynamic = Some(TextDynamic {
+            script,
+            script_properties,
+            font_data,
+            point_size,
+            last_text: text_str,
+            raw_origin: obj.parsed_origin(),
+            alignment: combined,
+            scale: layer.scale,
+        });
+    }
+    Some(layer)
 }
 
 /// A live decode stream for an embedded-video texture layer: a detached
@@ -1532,6 +1588,7 @@ mod tests {
             clamp_uvs: false,
             puppet: None,
             video: None,
+            text_dynamic: None,
             order_index: 1,
         }];
 

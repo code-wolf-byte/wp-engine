@@ -81,19 +81,102 @@ impl Default for ScriptContext {
     }
 }
 
+/// Real workshop scripts are authored as ES modules: `import * as WEMath
+/// from 'WEMath'`, `export function update(value)`, `export let
+/// __workshopId`, `export var scriptProperties = createScriptProperties()…`.
+/// boa evaluates our snippets in script (non-module) mode where `import`/
+/// `export` are syntax errors — and the WE globals they import already exist
+/// in our realm anyway. Strip module syntax line-by-line: drop `import`
+/// lines, peel `export ` off declarations.
+fn strip_module_syntax(script: &str) -> String {
+    script
+        .lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if t.starts_with("import ") {
+                ""
+            } else if let Some(rest) = t.strip_prefix("export ") {
+                rest
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Wrap a user script in an IIFE so it can be re-evaluated every frame in
+/// the persistent realm: top-level `let`/`const` become function-scoped
+/// (re-declaring a global `let` would throw on the second frame), `update`
+/// and `scriptProperties` stay local to the closure, and WE's startup call
+/// to `applyUserProperties(props)` (which initializes script config like
+/// delimiters from the property defaults) runs before `update`. Trade-off:
+/// module-level state does not persist across frames — fine for the
+/// clock/date scripts that dominate real content.
+fn iife_body(script: &str, authored_props: Option<&serde_json::Value>) -> String {
+    // The scene JSON's `scriptproperties` object holds the values the author
+    // chose in the editor (e.g. this clock instance shows hours only) —
+    // merged over the script's own builder defaults before `init()` runs.
+    let merge_props = authored_props
+        .filter(|v| v.is_object())
+        .map(|v| {
+            format!(
+                ";if (typeof scriptProperties !== 'undefined') {{ var __wp_p = {v}; for (var __wp_k in __wp_p) {{ scriptProperties[__wp_k] = __wp_p[__wp_k]; }} }}"
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "(function() {{\n{script}\n{merge_props}\n;if (typeof init === 'function') {{ try {{ init(); }} catch (e) {{}} }}\nif (typeof applyUserProperties === 'function' && typeof scriptProperties !== 'undefined') {{ try {{ applyUserProperties(scriptProperties); }} catch (e) {{}} }}\nreturn (typeof update === 'function') ? update(value) : value;\n}})();",
+        script = strip_module_syntax(script),
+    )
+}
+
 impl ScriptContext {
     pub fn new() -> Self {
         let mut context = Context::default();
         // Declare the globals once. `value`/`update` are reset per evaluation;
         // `engine`/`WEMath` persist and are mutated by `set_time`.
+        //
+        // `createScriptProperties()` mirrors WE's chainable builder: every
+        // `add*` records the property's default under its name on the same
+        // object the script keeps (`scriptProperties.showHours` etc.), since
+        // we have no editor UI feeding user-chosen values yet.
         let _ = context.eval(Source::from_bytes(
             "var value;\n\
              var update;\n\
-             var engine = { runtime: 0, timeOfDay: 0 };\n\
-             var WEMath = { smoothStep: function(a, b, x) { \
-                 var t = Math.min(Math.max((x - a) / (b - a), 0), 1); \
-                 return t * t * (3 - 2 * t); \
-             } };",
+             var engine = { runtime: 0, timeOfDay: 0, registerTimeEvent: function(){}, userProperties: {} };\n\
+             var shared = {};\n\
+             var console = { log: function(){}, warn: function(){}, error: function(){} };\n\
+             function createScriptProperties() {\n\
+                 var api = {};\n\
+                 function add(def) { if (def && def.name !== undefined) { api[def.name] = def.value; } return api; }\n\
+                 ['addCheckbox','addSlider','addText','addTextInput','addCombo','addColorPicker','addFile','addDirectory','addBool'].forEach(function(m) { api[m] = add; });\n\
+                 api.finish = function() { return api; };\n\
+                 return api;\n\
+             }\n\
+             var WEMath = { \
+                 smoothStep: function(a, b, x) { \
+                     var t = Math.min(Math.max((x - a) / (b - a), 0), 1); \
+                     return t * t * (3 - 2 * t); \
+                 }, \
+                 mix: function(a, b, t) { return a + (b - a) * t; }, \
+                 clamp: function(x, a, b) { return Math.min(Math.max(x, a), b); }, \
+                 frac: function(x) { return x - Math.floor(x); } \
+             };\n\
+             function Vec3(x, y, z) { this.x = x || 0; this.y = y || 0; this.z = z || 0; }\n\
+             Vec3.prototype.copy = function() { return new Vec3(this.x, this.y, this.z); };\n\
+             Vec3.prototype.add = function(o) { return new Vec3(this.x + o.x, this.y + o.y, this.z + o.z); };\n\
+             Vec3.prototype.subtract = function(o) { return new Vec3(this.x - o.x, this.y - o.y, this.z - o.z); };\n\
+             Vec3.prototype.multiply = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x * (s ? o : o.x), this.y * (s ? o : o.y), this.z * (s ? o : o.z)); };\n\
+             Vec3.prototype.divide = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x / (s ? o : o.x), this.y / (s ? o : o.y), this.z / (s ? o : o.z)); };\n\
+             var thisLayer = { origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), visible: true, pointsize: 32, font: '', text: '' };\n\
+             var thisScene = { \
+                 createLayer: function() { return { visible: false, origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), text: '' }; }, \
+                 sortLayer: function() {}, \
+                 getLayerIndex: function() { return 0; }, \
+                 getLayer: function() { return null; } \
+             };\n\
+             var input = { cursorWorldPosition: new Vec3(0,0,0), cursorPosition: new Vec3(0,0,0) };",
         ));
         Self { context }
     }
@@ -120,12 +203,36 @@ impl ScriptContext {
         // script must win, which it can't if the reset shared the same program.
         let _ = self.context.eval(Source::from_bytes(b"update = undefined;"));
         let src = format!(
-            "value = {v};\n{script}\n; (typeof update === 'function') ? update(value) : value;",
+            "value = {v};\n{body}",
             v = js_num(current_value),
+            body = iife_body(script, None),
         );
         let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
         let n = result.to_number(&mut self.context).ok()?;
         n.is_finite().then_some(n as f32)
+    }
+
+    /// Evaluate a text object's `update(value)`, returning its string result —
+    /// the dominant script kind in real content (clocks, dates, countdowns:
+    /// 42 of the 58 script-using wallpapers in the local corpus). `None` when
+    /// the script throws or has no usable `update`, so callers keep the
+    /// previous text.
+    pub fn eval_update_string(
+        &mut self,
+        script: &str,
+        current_value: &str,
+        authored_props: Option<&serde_json::Value>,
+    ) -> Option<String> {
+        let _ = self.context.eval(Source::from_bytes(b"update = undefined;"));
+        // serde_json string-escapes into a valid JS string literal.
+        let quoted = serde_json::to_string(current_value).ok()?;
+        let src = format!(
+            "value = {quoted};\n{body}",
+            body = iife_body(script, authored_props)
+        );
+        let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
+        let js_str = result.to_string(&mut self.context).ok()?;
+        Some(js_str.to_std_string_escaped())
     }
 }
 
@@ -260,5 +367,42 @@ mod tests {
         assert_eq!(ctx.eval_update("function update(v){ return boom.x; }", 2.0), None);
         // The context is still usable afterwards.
         assert_eq!(ctx.eval_update("function update(v){ return v * 10; }", 2.0), Some(20.0));
+    }
+
+    /// Real workshop text scripts are ES modules with `import`/`export` and a
+    /// `createScriptProperties()` builder — the whole shape must evaluate and
+    /// return a string.
+    #[test]
+    fn module_style_text_script_evaluates_to_string() {
+        let mut ctx = ScriptContext::new();
+        let script = r#"'use strict';
+export let __workshopId = '2741588178';
+import * as WEMath from 'WEMath';
+export var scriptProperties = createScriptProperties()
+    .addCheckbox({ name: 'showLabel', value: true })
+    .addText({ name: 'format', value: 'H:M' });
+export function update(value) {
+    var d = new Date();
+    var label = scriptProperties.showLabel ? 'T-' : '';
+    return label + scriptProperties.format + '!';
+}"#;
+        assert_eq!(
+            ctx.eval_update_string(script, "old", None).as_deref(),
+            Some("T-H:M!")
+        );
+    }
+
+    /// A clock-style script using `Date` must produce plausible digits.
+    #[test]
+    fn date_script_returns_time_digits() {
+        let mut ctx = ScriptContext::new();
+        let script = r#"export function update(value) {
+            var d = new Date();
+            var h = d.getHours();
+            return (h < 10 ? '0' : '') + h;
+        }"#;
+        let out = ctx.eval_update_string(script, "", None).expect("should evaluate");
+        let n: u32 = out.parse().expect("two digits");
+        assert!(n < 24, "hours out of range: {out}");
     }
 }
