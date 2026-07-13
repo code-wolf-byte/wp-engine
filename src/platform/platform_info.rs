@@ -49,5 +49,5 @@ impl fmt::Display for PlatformInfo {
 }
 
 pub fn log_platform() {
-    eprintln!("{}", PlatformInfo::detect());
+    tracing::info!(target: "platform", "{}", PlatformInfo::detect());
 }

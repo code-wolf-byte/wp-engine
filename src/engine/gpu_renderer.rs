@@ -1086,8 +1086,23 @@ struct SceneLayerGpu {
     puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
     /// Last animation time `frames[0]` was posed at, seconds.
     puppet_posed_at: f32,
+    /// Embedded-video stream — `frames[0]` is replaced with the newest
+    /// decoded frame each tick (the decoder thread paces itself by PTS;
+    /// draining to the latest frame drops rather than lags).
+    video: Option<std::sync::Arc<std::sync::Mutex<crate::engine::render::VideoLayerStream>>>,
     blend_mode: u32,
+    /// Live alpha for the current frame. When `alpha_script` is present this is
+    /// recomputed each frame from `alpha_base`; otherwise it stays constant.
     alpha: f32,
+    /// Authored alpha, passed as the `value` argument to `alpha_script` each
+    /// frame (WE feeds the property's base value, not the previous output).
+    alpha_base: f32,
+    /// Inline SceneScript source driving `alpha`, or `None` for static alpha.
+    alpha_script: Option<String>,
+    /// Script-driven text: re-evaluated each tick; when the output string
+    /// changes, `frames[0]` is re-rasterized and `rect` re-derived (clocks
+    /// tick, dates roll over — 42 of the corpus's 58 script wallpapers).
+    text_dynamic: Option<crate::engine::render::TextDynamic>,
     color: [f32; 3],
     brightness: f32,
     frame_duration_ms: u32,
@@ -1106,6 +1121,10 @@ struct SceneLayerGpu {
     /// This layer's position in `scene.visible_objects()` — lets `render()`
     /// interleave with particle systems in true scene z-order.
     order_index: usize,
+    /// Perspective scenes only: view-space distance of the quad center from
+    /// the camera, for painter's-algorithm back-to-front sorting. Negative =
+    /// behind the camera (culled). Always 0.0 in orthographic scenes.
+    depth: f32,
 }
 
 // ── GpuSceneInstance ──────────────────────────────────────────────────────────
@@ -1157,6 +1176,14 @@ pub struct GpuSceneInstance {
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
+    /// Persistent JS runtime for SceneScript-driven properties, ticked once per
+    /// frame. Lives here (on the render thread) because boa's `Context` is
+    /// `!Send`; created and used entirely within this instance.
+    script_ctx: crate::engine::script::ScriptContext,
+    /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
+    /// projected through a perspective camera and `render()` sorts image
+    /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
+    perspective: bool,
 }
 
 impl GpuSceneInstance {
@@ -1227,6 +1254,13 @@ impl GpuSceneInstance {
 
         let dynamics = CameraDynamics::from_scene(&resolved.scene);
 
+        // Perspective (3D) scenes project layer quads through the scene
+        // camera instead of mapping pixel origins to NDC directly.
+        let camera3d = crate::engine::camera3d::PerspectiveCamera::from_scene(
+            &resolved.scene,
+            w as f32 / h as f32,
+        );
+
         let layers: Vec<SceneLayerGpu> = resolved
             .layers
             .iter()
@@ -1264,25 +1298,72 @@ impl GpuSceneInstance {
                     effective_size[0] * l.scale[0],
                     effective_size[1] * l.scale[1],
                 ];
-                let rect = [
-                    (2.0 * l.origin[0] / w as f64 - 1.0) as f32,
-                    (2.0 * l.origin[1] / h as f64 - 1.0) as f32,
-                    (size_px[0] / w as f64) as f32,
-                    (size_px[1] / h as f64) as f32,
-                ];
+                let (rect, angle, depth) = if let Some(cam) = &camera3d {
+                    // 3D scene: the quad lives at a world-space origin with
+                    // world-space extents (size × scale). Rotate its corner
+                    // offsets, project all four through the camera, and
+                    // composite the NDC bounding box. Approximation: no
+                    // in-quad perspective warp (corners collapse to an
+                    // axis-aligned rect) — fine for the mostly camera-facing
+                    // layers these scenes use.
+                    let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
+                    let ang = l.angles;
+                    let hx = (size_px[0] / 2.0) as f32;
+                    let hy = (size_px[1] / 2.0) as f32;
+                    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
+                        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], ang);
+                        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
+                    });
+                    let ndc: Vec<[f32; 2]> =
+                        corners.iter().filter_map(|c| cam.project(*c)).collect();
+                    if ndc.len() < 4 {
+                        // Any corner at/behind the eye plane: cull the whole
+                        // quad rather than composite a blown-up projection.
+                        ([-10.0, -10.0, 0.0, 0.0], 0.0, -1.0)
+                    } else {
+                        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+                        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+                        for p in &ndc {
+                            min_x = min_x.min(p[0]);
+                            min_y = min_y.min(p[1]);
+                            max_x = max_x.max(p[0]);
+                            max_y = max_y.max(p[1]);
+                        }
+                        let rect = [
+                            (min_x + max_x) / 2.0,
+                            (min_y + max_y) / 2.0,
+                            (max_x - min_x) / 2.0,
+                            (max_y - min_y) / 2.0,
+                        ];
+                        (rect, 0.0, cam.view_depth(center))
+                    }
+                } else {
+                    let rect = [
+                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32,
+                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32,
+                        (size_px[0] / w as f64) as f32,
+                        (size_px[1] / h as f64) as f32,
+                    ];
+                    (rect, l.angle, 0.0)
+                };
 
                 SceneLayerGpu {
                     frames,
                     puppet: l.puppet.clone(),
                     puppet_posed_at: 0.0,
+                    video: l.video.clone(),
                     blend_mode: l.blend_mode,
                     alpha: l.alpha,
+                    alpha_base: l.alpha,
+                    alpha_script: l.alpha_script.clone(),
+                    text_dynamic: l.text_dynamic.clone(),
                     color: l.color,
                     brightness: l.brightness,
                     frame_duration_ms: l.frame_duration_ms,
                     parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
-                    angle: l.angle,
+                    angle,
                     rect,
+                    depth,
                     object_size,
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
@@ -1356,6 +1437,15 @@ impl GpuSceneInstance {
                 if let Some(sprite) = &pl.sprite_texture {
                     system.set_sprite_frames(sprite.frames.len(), sprite.duration);
                 }
+                for child in &pl.children {
+                    system.add_child(
+                        child.config.clone(),
+                        child.sprite.clone(),
+                        child.additive,
+                        &child.child_ref,
+                        spawn_center,
+                    );
+                }
                 system
             })
             .collect();
@@ -1395,6 +1485,8 @@ impl GpuSceneInstance {
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
+            script_ctx: crate::engine::script::ScriptContext::new(),
+            perspective: camera3d.is_some(),
         })
     }
 
@@ -1421,6 +1513,66 @@ impl GpuSceneInstance {
         let delta = (time - self.last_time).max(0.0);
         self.last_time = time;
         let dynamics = self.dynamics.update(time, delta, self.mouse_norm);
+
+        // Tick SceneScript-driven properties for this frame. `engine.timeOfDay`
+        // is fractional hours in [0,24); we derive it from the wall clock (UTC
+        // for now — local-time zoning is a follow-up).
+        {
+            let secs_into_day = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() % 86_400)
+                .unwrap_or(0);
+            let time_of_day = secs_into_day as f32 / 3600.0;
+            let ctx = &mut self.script_ctx;
+            ctx.set_time(time, time_of_day);
+            for layer in &mut self.layers {
+                if let Some(script) = &layer.alpha_script {
+                    layer.alpha = ctx.eval_update(script, layer.alpha_base).unwrap_or(layer.alpha_base);
+                }
+                // Script-driven text: re-evaluate; only a CHANGED string pays
+                // for rasterization + upload (a clock re-rasterizes once per
+                // displayed unit — second or minute — not per frame).
+                if let Some(td) = &mut layer.text_dynamic {
+                    if let Some(new_text) = ctx.eval_update_string(
+                        &td.script,
+                        &td.last_text,
+                        td.script_properties.as_ref(),
+                    ) {
+                        if new_text != td.last_text && !new_text.is_empty() {
+                            if let Some(img) = crate::engine::text::rasterize(
+                                &td.font_data,
+                                &new_text,
+                                td.point_size,
+                            ) {
+                                // Re-derive the aligned rect for the new
+                                // dimensions — same math layer_from_object +
+                                // build use (origin is y-up scene coords).
+                                let scaled = [
+                                    img.width() as f64 * td.scale[0],
+                                    img.height() as f64 * td.scale[1],
+                                ];
+                                let off = crate::engine::render::alignment_offset(
+                                    Some(&td.alignment),
+                                    scaled,
+                                );
+                                let origin = [
+                                    td.raw_origin[0] + off[0],
+                                    td.raw_origin[1] + off[1],
+                                ];
+                                layer.rect = [
+                                    (2.0 * origin[0] / self.width as f64 - 1.0) as f32,
+                                    (2.0 * origin[1] / self.height as f64 - 1.0) as f32,
+                                    (scaled[0] / self.width as f64) as f32,
+                                    (scaled[1] / self.height as f64) as f32,
+                                ];
+                                layer.frames[0] = self.renderer.upload_texture(&img);
+                                td.last_text = new_text;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let target_view = self.target.create_view(&Default::default());
         let mut encoder =
@@ -1458,6 +1610,20 @@ impl GpuSceneInstance {
         // PUPPET_UPDATE_INTERVAL rather than every frame — the idle-style
         // animations these carry (breathing, hair sway) are far slower than
         // even that.
+        // Pull the newest decoded frame for embedded-video layers (the
+        // ffmpeg thread paces itself; an empty channel means no new frame
+        // this tick and the current texture stays).
+        for i in 0..self.layers.len() {
+            let Some(stream) = self.layers[i].video.clone() else {
+                continue;
+            };
+            let Some(frame) = stream.lock().ok().and_then(|s| s.latest_frame()) else {
+                continue;
+            };
+            let tex = self.renderer.upload_texture(&frame);
+            self.layers[i].frames[0] = tex;
+        }
+
         const PUPPET_UPDATE_INTERVAL: f32 = 1.0 / 15.0;
         for i in 0..self.layers.len() {
             let Some(runtime) = self.layers[i].puppet.clone() else {
@@ -1494,6 +1660,26 @@ impl GpuSceneInstance {
             )
             .collect();
         items.sort_by_key(|(order, _)| *order);
+
+        if self.perspective {
+            // Painter's algorithm for 3D scenes: draw image layers strictly
+            // back-to-front by view-space depth (no depth buffer yet), with
+            // culled quads (depth < 0) dropped. Particles keep drawing after
+            // images, as in the ortho path's known simplification.
+            items.retain(|(_, item)| match item {
+                DrawItem::Image(i) => self.layers[*i].depth >= 0.0,
+                DrawItem::Particle(_) => true,
+            });
+            items.sort_by(|(oa, a), (ob, b)| {
+                let key = |it: &DrawItem, order: usize| match it {
+                    DrawItem::Image(i) => (0, -self.layers[*i].depth, order),
+                    DrawItem::Particle(_) => (1, 0.0, order),
+                };
+                key(a, *oa)
+                    .partial_cmp(&key(b, *ob))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         for (_, item) in items {
             match item {
@@ -1661,6 +1847,33 @@ impl GpuSceneInstance {
                         // A bind named "previous" is the chain input itself.
                         let (view, res) = if fbo_name == "previous" {
                             (chain_view.clone(), chain_res)
+                        } else if fbo_name == "_rt_FullFrameBuffer"
+                            || fbo_name == "_rt_MipMappedFrameBuffer"
+                        {
+                            // The wallpaper-global scene buffer (CWallpaper.cpp
+                            // creates it at scene size; MipMapped is an alias).
+                            // Effects run before their layer composites, so the
+                            // scene target currently holds exactly "the scene
+                            // behind this layer" — snapshot it, since a pass
+                            // can't sample its own render target.
+                            encoder.copy_texture_to_texture(
+                                self.target.as_image_copy(),
+                                self.scene_copy.as_image_copy(),
+                                wgpu::Extent3d {
+                                    width: self.width,
+                                    height: self.height,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            (
+                                self.scene_copy.create_view(&Default::default()),
+                                [
+                                    self.width as f32,
+                                    self.height as f32,
+                                    self.width as f32,
+                                    self.height as f32,
+                                ],
+                            )
                         } else {
                             let key = named_fbo_key(instance_idx, fbo_name);
                             match self.fbo_pool.get(&key) {
@@ -1881,8 +2094,9 @@ impl GpuSceneInstance {
             raster_scale,
         );
         if std::env::var("WP_DEBUG_PARTICLE_TIMING").is_ok() {
-            eprintln!(
-                "[timing] particles[{idx}]: step {step_ms:.1}ms, raster {sw}x{sh} (scale {raster_scale:.2}) {:.1}ms",
+            tracing::trace!(
+                target: "timing",
+                "particles[{idx}]: step {step_ms:.1}ms, raster {sw}x{sh} (scale {raster_scale:.2}) {:.1}ms",
                 _t_raster.elapsed().as_secs_f32() * 1000.0
             );
         }
@@ -2232,8 +2446,9 @@ fn load_effect_runtimes(
         .enumerate()
         .map(|(instance_idx, inst)| {
             if skip.contains(&inst.name) {
-                eprintln!(
-                    "[effect] SKIP '{}': disabled via WP_ENGINE_SKIP_EFFECTS",
+                tracing::debug!(
+                    target: "effect",
+                    "SKIP '{}': disabled via WP_ENGINE_SKIP_EFFECTS",
                     inst.name
                 );
                 return None;
@@ -2243,6 +2458,7 @@ fn load_effect_runtimes(
         .collect()
 }
 
+#[tracing::instrument(target = "effect", level = "debug", skip(renderer, resolver, inst), fields(effect = %inst.name, instance = instance_idx))]
 fn load_effect_instance(
     renderer: &mut GpuSceneRenderer,
     resolver: &resolver::AssetResolver,
@@ -2250,6 +2466,7 @@ fn load_effect_instance(
     inst: &EffectInstanceDef,
 ) -> Option<EffectRuntime> {
     let effect_name = &inst.name;
+    tracing::trace!(target: "effect", "loading effect instance");
     if HARDCODED_EFFECTS.contains(&effect_name.as_str()) {
         // Scene instances may override secondary texture slots (typically
         // slot 1 = an opacity mask, e.g. waterwaves/shake masks) — load
@@ -2258,7 +2475,7 @@ fn load_effect_instance(
         let tex_key = format!("fx{instance_idx}:{effect_name}#0");
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         if let Some(over) = inst.pass_overrides.first() {
-            for name in over.textures.iter().skip(1) {
+            for (slot_i, name) in over.textures.iter().skip(1).enumerate() {
                 let img = name
                     .as_deref()
                     .filter(|n| !n.is_empty() && !n.starts_with("_rt_"))
@@ -2269,10 +2486,28 @@ fn load_effect_instance(
                             crate::engine::tex::TexFile::parse(&bytes).ok()?.to_rgba().ok()
                         })
                     });
-                textures.push(renderer.upload_texture(&img.unwrap_or_else(|| {
-                    RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]))
-                })));
+                // Missing-slot fallback is normally white (= unmasked), but
+                // shake's slot 1 is a FLOW map whose authored default is
+                // util/noflow — rg 0.498 gray, "no pixel moves". A white
+                // fallback there would shear the whole layer diagonally.
+                let fallback = if effect_name == "shake" && slot_i == 0 {
+                    image::Rgba([127, 127, 127, 255])
+                } else {
+                    image::Rgba([255, 255, 255, 255])
+                };
+                textures.push(renderer.upload_texture(
+                    &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
+                ));
             }
+        }
+        // A shake with no texture overrides at all authors no flow map either
+        // — bind the gray no-flow dummy so the effect stays static like WE.
+        if effect_name == "shake" && textures.is_empty() {
+            textures.push(renderer.upload_texture(&RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([127, 127, 127, 255]),
+            )));
         }
         if !textures.is_empty() {
             renderer.dynamic_textures.insert(tex_key.clone(), textures);
@@ -2284,19 +2519,30 @@ fn load_effect_instance(
                 hardcoded: true,
                 target: None,
                 binds: Vec::new(),
-                values: inst
-                    .pass_overrides
-                    .first()
-                    .map(|o| o.values.clone())
-                    .unwrap_or_default(),
+                values: {
+                    // Hardcoded kernels read combos (e.g. shake's DIRECTION/
+                    // NOISE) as pseudo-values with a `combo_` prefix.
+                    let mut vals = inst
+                        .pass_overrides
+                        .first()
+                        .map(|o| o.values.clone())
+                        .unwrap_or_default();
+                    if let Some(over) = inst.pass_overrides.first() {
+                        for (k, v) in &over.combos {
+                            vals.insert(format!("combo_{k}"), *v as f32);
+                        }
+                    }
+                    vals
+                },
                 vertex_buffers: Vec::new(),
             }],
             fbos: Vec::new(),
         });
     }
     let Ok(eff_def) = effect_def::load_effect_by_file(resolver, &inst.file) else {
-        eprintln!(
-            "[effect] SKIP '{effect_name}': no effect.json at '{}'",
+        tracing::warn!(
+            target: "effect",
+            "SKIP '{effect_name}': no effect.json at '{}'",
             inst.file
         );
         return None;
@@ -2328,8 +2574,9 @@ fn load_effect_instance(
         };
         let Ok(mat_def) = effect_def::load_material_from_effect(resolver, effect_dir, mat_path)
         else {
-            eprintln!(
-                "[effect] SKIP '{effect_name}' pass {pass_idx}: material '{mat_path}' not found"
+            tracing::warn!(
+                target: "effect",
+                "SKIP '{effect_name}' pass {pass_idx}: material '{mat_path}' not found"
             );
             continue;
         };
@@ -2342,8 +2589,9 @@ fn load_effect_instance(
         let Ok((frag_glsl, vert_glsl)) =
             resolver.load_glsl_shader_for_effect(shader_name, Some(effect_dir))
         else {
-            eprintln!(
-                "[effect] SKIP '{effect_name}' pass {pass_idx}: shader '{shader_name}' not found"
+            tracing::warn!(
+                target: "effect",
+                "SKIP '{effect_name}' pass {pass_idx}: shader '{shader_name}' not found"
             );
             continue;
         };
@@ -2446,7 +2694,7 @@ fn load_effect_instance(
         let translated = match transpiler::translate_full(&model, Some(&vert_glsl)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[effect] SKIP '{effect_name}' pass {pass_idx}: GLSL→WGSL failed: {e:#}");
+                tracing::warn!(target: "effect", "SKIP '{effect_name}' pass {pass_idx}: GLSL→WGSL failed: {e:#}");
                 continue;
             }
         };
@@ -2472,8 +2720,9 @@ fn load_effect_instance(
         if added.is_err() && !pipeline_attrs.is_empty() {
             // Real-VS pipeline failed (usually an interface mismatch the
             // preprocessor couldn't reconcile) — retry with the synthetic VS.
-            eprintln!(
-                "[effect] '{effect_name}' pass {pass_idx}: real VS failed ({}), synthetic fallback",
+            tracing::warn!(
+                target: "effect",
+                "'{effect_name}' pass {pass_idx}: real VS failed ({}), synthetic fallback",
                 added.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
             );
             if let Ok(fallback) = transpiler::translate(&model) {
@@ -2489,7 +2738,7 @@ fn load_effect_instance(
             }
         }
         if let Err(e) = added {
-            eprintln!("[effect] SKIP '{effect_name}' pass {pass_idx}: pipeline failed: {e}");
+            tracing::warn!(target: "effect", "SKIP '{effect_name}' pass {pass_idx}: pipeline failed: {e}");
             continue;
         }
         let vertex_buffers = renderer.attr_buffers_for(&pipeline_attrs);
@@ -2505,18 +2754,34 @@ fn load_effect_instance(
             .skip(1)
             .map(|slot| slot.default_path.clone())
             .collect();
+        // Framebuffer refs in the texture list (e.g. refraction's compose
+        // pass: `"textures": [null, "_rt_FullFrameBuffer"]`) aren't files —
+        // they become extra binds, resolved at draw time like `bind` entries.
+        let mut fbo_ref_binds: Vec<(u32, String)> = Vec::new();
         for (i, tex) in merged_textures.iter().enumerate().skip(1) {
             let slot = i - 1;
             if slot >= texture_names.len() {
                 texture_names.resize(slot + 1, None);
             }
             if let Some(name) = tex {
-                // _rt_* names are framebuffer refs resolved via binds, not files.
-                if !name.starts_with("_rt_") && !name.starts_with("_alias_") {
+                if name.starts_with("_rt_") {
+                    fbo_ref_binds.push((i as u32, name.clone()));
+                } else if !name.starts_with("_alias_") {
                     texture_names[slot] = Some(name.clone());
                 }
             }
         }
+        for (slot, name) in texture_names.iter().enumerate() {
+            if let Some(n) = name {
+                if n.starts_with("_rt_") {
+                    fbo_ref_binds.push((slot as u32 + 1, n.clone()));
+                }
+            }
+        }
+        texture_names
+            .iter_mut()
+            .filter(|n| n.as_deref().is_some_and(|n| n.starts_with("_rt_")))
+            .for_each(|n| *n = None);
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         for name in &texture_names {
             let path = name.as_deref().unwrap_or("");
@@ -2534,8 +2799,9 @@ fn load_effect_instance(
                 Some(img) => textures.push(renderer.upload_texture(&img)),
                 None => {
                     if !path.is_empty() {
-                        eprintln!(
-                            "[effect] '{effect_name}': texture '{path}' not found — using white"
+                        tracing::warn!(
+                            target: "effect",
+                            "'{effect_name}': texture '{path}' not found — using white"
                         );
                     }
                     textures.push(renderer.upload_texture(&RgbaImage::from_pixel(
@@ -2557,6 +2823,7 @@ fn load_effect_instance(
                 .bind
                 .iter()
                 .filter_map(|b| b.name.as_ref().map(|n| (b.index.unwrap_or(0), n.clone())))
+                .chain(fbo_ref_binds)
                 .collect(),
             values,
             vertex_buffers,
@@ -2564,27 +2831,34 @@ fn load_effect_instance(
     }
 
     if passes.is_empty() {
-        eprintln!("[effect] SKIP '{effect_name}': no usable passes");
+        tracing::warn!(target: "effect", "SKIP '{effect_name}': no usable passes");
         return None;
     }
-    eprintln!("[effect] LOADED '{effect_name}' ({} passes)", passes.len());
+    tracing::debug!(target: "effect", "LOADED '{effect_name}' ({} passes)", passes.len());
     Some(EffectRuntime { passes, fbos })
 }
 
 /// Continuously render scene frames into a channel (preview window, headless
 /// tests, and the CPU/SHM fallback path).
+#[tracing::instrument(target = "render", level = "debug", skip(tx), fields(dir = %dir.display(), target_fps))]
 pub fn gpu_scene_render_loop(
     dir: &std::path::Path,
     tx: &SyncSender<Arc<RgbaImage>>,
     target_fps: f64,
 ) -> Result<()> {
+    tracing::info!(target: "render", "opening GPU scene instance");
     let mut instance = GpuSceneInstance::open(dir)?;
     let frame_duration = Duration::from_secs_f64(1.0 / target_fps);
     let start = Instant::now();
+    tracing::info!(target: "render", "entering GPU render loop");
 
+    let mut frame_no: u64 = 0;
     loop {
         let frame = instance.render_rgba()?;
+        tracing::trace!(target: "render", frame = frame_no, "rendered frame");
+        frame_no += 1;
         if tx.send(Arc::new(frame)).is_err() {
+            tracing::debug!(target: "render", frames = frame_no, "receiver dropped; ending render loop");
             return Ok(());
         }
 
@@ -2862,12 +3136,25 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             0.0,
             0.0,
         ]),
-        "shake" => pack(&[
-            time,
-            get(vals, "speed", 1.0),
-            get(vals, "strength", 0.1),
-            0.0,
-        ]),
+        "shake" => {
+            // shake.vert precomputes v_Bounds = (x, 1/(y-x)) from `bounds`.
+            let bounds_x = get(vals, "bounds_x", 0.0);
+            let bounds_y = get(vals, "bounds_y", 1.0);
+            pack(&[
+                time,
+                get(vals, "speed", 1.0),
+                get(vals, "strength", 0.1),
+                get(vals, "combo_DIRECTION", 0.0),
+                get(vals, "friction_x", 1.0),
+                get(vals, "friction_y", 1.0),
+                bounds_x,
+                1.0 / (bounds_y - bounds_x).max(0.0001),
+                get(vals, "combo_NOISE", 0.0),
+                0.0,
+                0.0,
+                0.0,
+            ])
+        }
         "tint" => {
             let r = get(vals, "color_r", 1.0);
             let g = get(vals, "color_g", 0.0);

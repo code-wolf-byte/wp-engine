@@ -66,6 +66,40 @@ pub struct ParticleLayer {
     /// owning layer regardless of how many particles/skipped/invisible
     /// objects precede it.
     pub order_index: usize,
+    /// Child presets from `config.children`, resolved (JSON + material
+    /// sprite) here where asset access lives; attached to the built system
+    /// via `ParticleSystem::add_child` at construction time.
+    pub children: Vec<ResolvedChildParticle>,
+}
+
+/// One resolved `children` entry of a particle preset (see
+/// [`particle::ChildRef`]).
+pub struct ResolvedChildParticle {
+    pub config: particle::ParticleConfig,
+    pub sprite: Option<particle::ParticleSprite>,
+    pub additive: bool,
+    pub child_ref: particle::ChildRef,
+}
+
+/// Everything needed to re-rasterize a script-driven text layer at runtime:
+/// the script, the font, and the layout inputs (`layer_from_object` folds
+/// alignment into origin once at load; content changes re-derive it).
+#[derive(Clone)]
+pub struct TextDynamic {
+    pub script: String,
+    /// The scene's authored `text.scriptproperties` object (per-instance
+    /// editor values, merged over the script's builder defaults).
+    pub script_properties: Option<serde_json::Value>,
+    pub font_data: Vec<u8>,
+    pub point_size: f32,
+    /// Text currently rasterized into the layer image (the `value` WE feeds
+    /// back into `update` each tick).
+    pub last_text: String,
+    /// Un-aligned authored origin (WE scene coords, y-up).
+    pub raw_origin: [f64; 3],
+    /// Combined "halign valign" string, as passed to `alignment_offset`.
+    pub alignment: String,
+    pub scale: [f64; 3],
 }
 
 pub struct Layer {
@@ -81,8 +115,14 @@ pub struct Layer {
     pub parallax_depth: [f64; 2],
     /// z-rotation in radians (WE `angles.z`; the JSON value is already in radians).
     pub angle: f32,
+    /// Full 3D rotation in radians, un-negated as stored in scene.json.
+    /// Only used by the perspective (3D scene) path; 2D uses `angle`.
+    pub angles: [f32; 3],
     pub blend_mode: u32,
     pub alpha: f32,
+    /// Inline SceneScript source driving `alpha` per frame, if the property
+    /// was authored as `{"value": …, "script": "…"}`. `None` = static alpha.
+    pub alpha_script: Option<String>,
     pub color: [f32; 3],
     pub brightness: f32,
     /// True for WE "copybackground" layers — source is the rendered canvas so far.
@@ -94,6 +134,12 @@ pub struct Layer {
     /// Animated puppet runtime (mesh + skeleton + MDLA animations) — the
     /// live GPU path re-poses and re-rasterizes `image` from this.
     pub puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    /// Embedded-video stream (mp4 inside the .tex) — the live GPU path
+    /// re-uploads decoded frames from this; `image` is the first frame.
+    pub video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
+    /// Script-driven text: the GPU path re-evaluates and re-rasterizes
+    /// `image` when the script's output changes (clocks, dates, countdowns).
+    pub text_dynamic: Option<TextDynamic>,
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
@@ -111,6 +157,9 @@ struct LoadedImage {
     /// MDLA animations): `image` holds the rest pose, and the live GPU
     /// path re-poses/re-rasterizes from this over time.
     puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    /// Present for embedded-video textures: `image` holds the first frame,
+    /// and the live GPU path re-uploads frames from this stream over time.
+    video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
 }
 
 impl LoadedImage {
@@ -122,6 +171,7 @@ impl LoadedImage {
             no_interpolation: false,
             clamp_uvs: false,
             puppet: None,
+            video: None,
         }
     }
 
@@ -146,14 +196,18 @@ impl LoadedImage {
                         no_interpolation,
                         clamp_uvs,
                         puppet: None,
+                        video: None,
                     });
                 }
             }
         }
+        if let Some(bytes) = tex.video_bytes() {
+            return video_tex_to_loaded(tex, bytes);
+        }
         Ok(Self {
             no_interpolation,
             clamp_uvs,
-            ..Self::single(tex_to_rgba(tex)?)
+            ..Self::single(tex.to_rgba()?)
         })
     }
 }
@@ -166,7 +220,9 @@ impl ResolvedScene {
     /// `scene.json`/`scene.pkg`, but project.json's `file` field can name a
     /// different one — GIF-converted wallpapers ship
     /// `gifscene.json`/`gifscene.pkg` (e.g. workshop item 2036522973).
+    #[tracing::instrument(target = "scene", level = "debug", fields(dir = %dir.display()))]
     pub fn from_directory(dir: &Path) -> Result<Self> {
+        tracing::debug!(target: "scene", "resolving scene from directory");
         let scene_name = std::fs::read_to_string(dir.join("project.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -242,7 +298,7 @@ impl ResolvedScene {
                     match load_texture_from_dir(dir, path) {
                         Ok(loaded) => loaded,
                         Err(e) => {
-                            eprintln!("[scene] texture load failed for '{path}': {e:#}");
+                            tracing::warn!(target: "scene", "texture load failed for '{path}': {e:#}");
                             if obj.effects.is_empty() {
                                 continue;
                             }
@@ -316,7 +372,7 @@ impl ResolvedScene {
                     }) {
                         Ok(loaded) => loaded,
                         Err(e) => {
-                            eprintln!("[scene] texture load failed for '{path}': {e:#}");
+                            tracing::warn!(target: "scene", "texture load failed for '{path}': {e:#}");
                             if obj.effects.is_empty() {
                                 continue;
                             }
@@ -455,6 +511,15 @@ impl ResolvedScene {
                     );
                     if let Some(sprite) = &pl.sprite_texture {
                         system.set_sprite_frames(sprite.frames.len(), sprite.duration);
+                    }
+                    for child in &pl.children {
+                        system.add_child(
+                            child.config.clone(),
+                            child.sprite.clone(),
+                            child.additive,
+                            &child.child_ref,
+                            spawn_center,
+                        );
                     }
                     for _ in 0..150 {
                         system.step(1.0 / 30.0);
@@ -596,7 +661,7 @@ fn parse_parallax_depth(v: &serde_json::Value) -> [f64; 2] {
 /// same horizontally. Matches CImage.cpp lines 242-256 exactly (each pair is
 /// mutually exclusive — "top bottom" together, like the reference, only
 /// honors "top").
-fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -> [f64; 2] {
+pub(crate) fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -> [f64; 2] {
     let a = alignment.unwrap_or("").to_lowercase();
     let mut offset = [0.0, 0.0];
     if a.contains("top") {
@@ -629,13 +694,13 @@ fn layer_from_object(
     // WE stores angles already in radians; only the z component (2D roll)
     // applies to a flat layer quad. The reference negates it (rotate(-angle,
     // ...)) when building the object's screen transform.
-    let angle = obj
+    let angles3 = obj
         .angles
         .as_ref()
         .map(crate::engine::model::json_to_animated)
         .and_then(|v| v.as_vec3())
-        .map(|v| -v[2])
-        .unwrap_or(0.0);
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let angle = -angles3[2];
 
     let scale = match &obj.scale {
         Some(v) => {
@@ -645,12 +710,14 @@ fn layer_from_object(
         None => [1.0, 1.0, 1.0],
     };
 
-    let alpha = obj
-        .alpha
+    let alpha_animated = obj.alpha.as_ref().map(crate::engine::model::json_to_animated);
+    let alpha = alpha_animated
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
+    // Inline SceneScript source driving `alpha`, if any — evaluated per frame
+    // by the render loop's ScriptContext (see GpuSceneInstance::render).
+    let alpha_script = alpha_animated.as_ref().and_then(|v| v.script.clone());
     let color = obj
         .color
         .as_ref()
@@ -692,14 +759,18 @@ fn layer_from_object(
         scale,
         parallax_depth: parallax,
         angle,
+        angles: angles3,
         blend_mode: obj.color_blend_mode,
         alpha,
+        alpha_script,
         color,
         brightness,
         copybackground: obj.copybackground,
         no_interpolation: loaded.no_interpolation,
         clamp_uvs: loaded.clamp_uvs,
         puppet: loaded.puppet,
+        video: loaded.video,
+        text_dynamic: None,
         order_index: 0,
     }
 }
@@ -748,13 +819,64 @@ fn particle_layer_from_object(
         _ => return None,
     };
     let json = read_particle_json(dir, pkg, particle_ref)?;
-    let config: particle::ParticleConfig = serde_json::from_str(&json)
-        .inspect_err(|e| eprintln!("[particle] failed to parse '{particle_ref}': {e}"))
+    let mut config: particle::ParticleConfig = serde_json::from_str(&json)
+        .inspect_err(|e| tracing::warn!(target: "particle", "failed to parse '{particle_ref}': {e}"))
         .ok()?;
-    let overrides = obj
+    let overrides: Option<particle::InstanceOverride> = obj
         .instanceoverride
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    // `instanceoverride.enabled: false` turns the whole system off
+    // (ObjectParser defaults it to true).
+    if overrides.as_ref().is_some_and(|o| {
+        o.enabled
+            .as_ref()
+            .is_some_and(|v| v.as_bool() == Some(false) || v.as_u64() == Some(0))
+    }) {
+        return None;
+    }
+
+    // Control-point plumbing the simulation can't do itself (it only knows
+    // spawn-relative screen offsets):
+    // 1. `instanceoverride.controlpointN` repositions preset control points
+    //    with absolute scene coordinates (e.g. the discharge preset's arc
+    //    endpoint, "1586.7 993.2") — absolute values are world-space, so
+    //    force flag 2 on.
+    // 2. Any world-space control point (flags & 2) is then converted to a
+    //    spawn-relative offset here, where the object's origin is known:
+    //    offset = (x_we - origin_x, origin_y - y_we) in the simulation's
+    //    y-down screen space.
+    if let Some(over) = overrides.as_ref() {
+        for (key, value) in &over.extra {
+            let Some(n) = key
+                .strip_prefix("controlpoint")
+                .and_then(|s| s.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            while config.controlpoint.len() <= n {
+                config.controlpoint.push(particle::ControlPointConfig::default());
+            }
+            config.controlpoint[n].offset = Some(value.clone());
+            config.controlpoint[n].flags = Some(config.controlpoint[n].flags.unwrap_or(0) | 2);
+        }
+    }
+    let origin = obj.parsed_origin();
+    for cp in &mut config.controlpoint {
+        if cp.flags.unwrap_or(0) & 2 == 0 {
+            continue;
+        }
+        if let Some(world) = cp.offset.as_ref().and_then(particle::value_as_vec3_pub) {
+            let rel = [
+                world[0] - origin[0] as f32,
+                origin[1] as f32 - world[1],
+                world[2],
+            ];
+            cp.offset = Some(serde_json::json!(format!("{} {} {}", rel[0], rel[1], rel[2])));
+            cp.flags = Some(cp.flags.unwrap_or(0) & !2);
+        }
+    }
     let parallax_depth = obj
         .parallax_depth
         .as_ref()
@@ -762,16 +884,63 @@ fn particle_layer_from_object(
         .unwrap_or([0.0, 0.0]);
 
     let resolved_sprite = config.material.as_deref().and_then(|mat_path| {
+        // A failure here silently degrades to the flat-color circle draw —
+        // visually plausible for dust/snow but wrong for shaped sprites, so
+        // it must at least be visible in the log.
         if let Some(pkg) = pkg {
-            resolve_particle_sprite_pkg(pkg, mat_path).ok()
+            resolve_particle_sprite_pkg(pkg, mat_path)
+                .inspect_err(|e| {
+                    eprintln!("[particle] sprite '{mat_path}' failed (untextured fallback): {e:#}")
+                })
+                .ok()
         } else {
-            dir.and_then(|dir| resolve_particle_sprite_dir(dir, mat_path).ok())
+            dir.and_then(|dir| {
+                resolve_particle_sprite_dir(dir, mat_path)
+                    .inspect_err(|e| {
+                        eprintln!(
+                            "[particle] sprite '{mat_path}' failed (untextured fallback): {e:#}"
+                        )
+                    })
+                    .ok()
+            })
         }
     });
     let additive_blend = resolved_sprite
         .as_ref()
         .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
     let sprite_texture = resolved_sprite.map(|(sprite, _)| sprite);
+
+    // Child presets: same preset-JSON + material resolution as the parent.
+    // Failures degrade to "child skipped" (logged), never sink the layer.
+    let children: Vec<ResolvedChildParticle> = config
+        .children
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|child_ref| {
+            let json = read_particle_json(dir, pkg, &child_ref.name).or_else(|| {
+                eprintln!("[particle] child preset '{}' not found", child_ref.name);
+                None
+            })?;
+            let child_cfg: particle::ParticleConfig = serde_json::from_str(&json)
+                .inspect_err(|e| {
+                    eprintln!("[particle] child '{}' parse failed: {e}", child_ref.name)
+                })
+                .ok()?;
+            let resolved = child_cfg.material.as_deref().and_then(|mat_path| {
+                if let Some(pkg) = pkg {
+                    resolve_particle_sprite_pkg(pkg, mat_path).ok()
+                } else {
+                    dir.and_then(|dir| resolve_particle_sprite_dir(dir, mat_path).ok())
+                }
+            });
+            let additive = resolved
+                .as_ref()
+                .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
+            let sprite = resolved.map(|(sprite, _)| sprite);
+            Some(ResolvedChildParticle { config: child_cfg, sprite, additive, child_ref })
+        })
+        .collect();
 
     Some(ParticleLayer {
         name: obj.name.clone().unwrap_or_default(),
@@ -782,6 +951,7 @@ fn particle_layer_from_object(
         sprite_texture,
         additive_blend,
         order_index: 0,
+        children,
     })
 }
 
@@ -807,7 +977,29 @@ fn text_layer_from_object(
     dir: Option<&Path>,
     pkg: Option<&Package>,
 ) -> Option<Layer> {
-    let text_str = obj.text.as_ref().and_then(extract_text_string)?;
+    // A text object's `text` is either a plain string, a {"value": …}
+    // wrapper, or a scripted {"script": "…", "value"?: …} — clocks/dates
+    // (the dominant case in real content) often ship the script with NO
+    // static value at all, so the script's first evaluation IS the content.
+    let text_value = obj.text.as_ref()?;
+    let script = text_value
+        .get("script")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let script_properties = text_value.get("scriptproperties").cloned();
+    let static_str = extract_text_string(text_value).unwrap_or_default();
+    let text_str = match (&script, static_str.is_empty()) {
+        (Some(script), _) => {
+            // One-shot load-time evaluation so the layer rasterizes real
+            // content (and sizes itself correctly) from frame 0.
+            let mut ctx = crate::engine::script::ScriptContext::new();
+            ctx.eval_update_string(script, &static_str, script_properties.as_ref())
+                .filter(|t| !t.is_empty())
+                .unwrap_or(static_str)
+        }
+        (None, false) => static_str,
+        (None, true) => return None,
+    };
     if text_str.is_empty() {
         return None;
     }
@@ -830,34 +1022,96 @@ fn text_layer_from_object(
     let valign = obj.verticalalign.as_deref().unwrap_or("center");
     let combined = format!("{halign} {valign}");
 
-    Some(layer_from_object(
-        obj,
-        LoadedImage::single(image),
-        Some(&combined),
-    ))
+    let mut layer = layer_from_object(obj, LoadedImage::single(image), Some(&combined));
+    if let Some(script) = script {
+        layer.text_dynamic = Some(TextDynamic {
+            script,
+            script_properties,
+            font_data,
+            point_size,
+            last_text: text_str,
+            raw_origin: obj.parsed_origin(),
+            alignment: combined,
+            scale: layer.scale,
+        });
+    }
+    Some(layer)
 }
 
-/// Decode a parsed .tex to RGBA, routing embedded-video payloads (mp4
-/// inside the container, e.g. 2914504963's Taj Mahal backdrop) through
-/// ffmpeg's first-frame decode instead of the pixel path — a static frame
-/// of the right content beats the gray placeholder the layer otherwise
-/// falls back to. (Streaming playback of embedded videos is future work.)
-fn tex_to_rgba(tex: &TexFile) -> Result<RgbaImage> {
-    if let Some(bytes) = tex.video_bytes() {
-        let tmp = std::env::temp_dir().join(format!(
-            "we_embvid_{}.mp4",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::write(&tmp, bytes)
-            .with_context(|| format!("writing embedded video temp file: {}", tmp.display()))?;
-        let result = crate::render::ffmpeg::decode_first_frame(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        return result;
+/// A live decode stream for an embedded-video texture layer: a detached
+/// ffmpeg thread loops the video (PTS-paced, same `video_decode_loop` the
+/// full-video wallpaper path uses) and feeds frames through a small bounded
+/// channel. The consumer drains to the newest frame each render tick, so
+/// slow consumers drop frames instead of lagging. The thread exits on its
+/// own once this struct (the receiver) is dropped, and the temp file
+/// backing the looping decoder is removed then too.
+pub struct VideoLayerStream {
+    rx: std::sync::mpsc::Receiver<std::sync::Arc<RgbaImage>>,
+    /// Temp file the decoder re-opens on every loop — must outlive playback.
+    path: std::path::PathBuf,
+}
+
+impl VideoLayerStream {
+    /// Newest decoded frame since the last call, if any arrived.
+    pub fn latest_frame(&self) -> Option<std::sync::Arc<RgbaImage>> {
+        let mut latest = None;
+        while let Ok(frame) = self.rx.try_recv() {
+            latest = Some(frame);
+        }
+        latest
     }
-    tex.to_rgba()
+}
+
+impl Drop for VideoLayerStream {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Start looping playback for an embedded video payload: writes the bytes
+/// to a temp file, decodes the first frame synchronously (so the layer has
+/// correct content immediately), and spawns the paced decode loop for the
+/// rest.
+fn start_video_stream(bytes: &[u8]) -> Result<(RgbaImage, VideoLayerStream)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "we_embvid_{}_{}.mp4",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes)
+        .with_context(|| format!("writing embedded video temp file: {}", tmp.display()))?;
+    let first = match crate::render::ffmpeg::decode_first_frame(&tmp) {
+        Ok(img) => img,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<RgbaImage>>(2);
+    let decode_path = tmp.clone();
+    std::thread::spawn(move || {
+        // Exits when the receiver (VideoLayerStream) is dropped.
+        if let Err(e) = crate::render::ffmpeg::video_decode_loop(&decode_path, &tx) {
+            eprintln!(
+                "embedded video decoder error for '{}': {e}",
+                decode_path.display()
+            );
+        }
+    });
+    Ok((first, VideoLayerStream { rx, path: tmp }))
+}
+
+/// Build a `LoadedImage` for an embedded-video texture: first frame as the
+/// image, plus the live stream for the GPU path to animate.
+fn video_tex_to_loaded(tex: &TexFile, bytes: &[u8]) -> Result<LoadedImage> {
+    let (first, stream) = start_video_stream(bytes)?;
+    let mut loaded = LoadedImage::single(first);
+    loaded.no_interpolation = tex.no_interpolation();
+    loaded.clamp_uvs = tex.clamp_uvs();
+    loaded.video = Some(std::sync::Arc::new(std::sync::Mutex::new(stream)));
+    Ok(loaded)
 }
 
 fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<LoadedImage> {
@@ -961,10 +1215,14 @@ fn read_from_global_assets(rel_path: &str) -> Option<Vec<u8>> {
 }
 
 /// Returns the resolved texture plus the material pass's own `"blending"`
-/// string (e.g. `"additive"`), if any — particles need this to composite
+/// string (e.g. `"additive"`) and `ui_editor_properties_overbright`
+/// brightness constant (default 1.0) — particles need both to composite
 /// correctly (see `resolve_particle_sprite_{pkg,dir}`); plain image layers
-/// just discard it.
-fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, Option<String>)> {
+/// just discard them.
+fn find_model_chain_tex_pkg(
+    pkg: &Package,
+    json_path: &str,
+) -> Result<(TexFile, Option<String>, f32)> {
     let data = pkg
         .get(json_path)
         .map(|d| d.to_vec())
@@ -983,6 +1241,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
                 .get("blending")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let overbright = pass_overbright(pass);
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
@@ -994,7 +1253,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
                         {
                             let tex = TexFile::parse(&tex_data)
                                 .with_context(|| format!("parsing {tex_path}"))?;
-                            return Ok((tex, blending));
+                            return Ok((tex, blending, overbright));
                         }
 
                         let alt_path = format!("{tex_name}.tex");
@@ -1003,7 +1262,7 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
                             .map(|d| d.to_vec())
                             .or_else(|| read_from_global_assets(&alt_path))
                         {
-                            return Ok((TexFile::parse(&tex_data)?, blending));
+                            return Ok((TexFile::parse(&tex_data)?, blending, overbright));
                         }
                     }
                 }
@@ -1014,8 +1273,22 @@ fn find_model_chain_tex_pkg(pkg: &Package, json_path: &str) -> Result<(TexFile, 
     anyhow::bail!("could not resolve texture from {json_path}")
 }
 
+/// `ui_editor_properties_overbright` from a material pass's
+/// `constantshadervalues` (CParticle reads it off the first pass; 1.0 when
+/// absent).
+fn pass_overbright(pass: &serde_json::Value) -> f32 {
+    pass.get("constantshadervalues")
+        .and_then(|c| c.get("ui_editor_properties_overbright"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(1.0)
+}
+
 /// Follow the model -> material -> texture chain for loose files on disk.
-fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>)> {
+fn find_model_chain_tex_dir(
+    dir: &Path,
+    json_path: &str,
+) -> Result<(TexFile, Option<String>, f32)> {
     let data = std::fs::read(dir.join(json_path))
         .ok()
         .or_else(|| read_from_global_assets(json_path))
@@ -1033,6 +1306,7 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
                 .get("blending")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let overbright = pass_overbright(pass);
             if let Some(textures) = pass.get("textures").and_then(|v| v.as_array()) {
                 for tex_ref in textures {
                     if let Some(tex_name) = tex_ref.as_str() {
@@ -1041,7 +1315,7 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
                             .ok()
                             .or_else(|| read_from_global_assets(&tex_path))
                         {
-                            return Ok((TexFile::parse(&tex_data)?, blending));
+                            return Ok((TexFile::parse(&tex_data)?, blending, overbright));
                         }
                     }
                 }
@@ -1053,14 +1327,24 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
-    let atlas = tex_to_rgba(&find_model_chain_tex_pkg(pkg, json_path)?.0)?;
+    let tex = find_model_chain_tex_pkg(pkg, json_path)?.0;
+    if let Some(bytes) = tex.video_bytes() {
+        // e.g. 2914504963's Taj Mahal backdrop: the model chain resolves to
+        // an embedded-video texture — stream it instead of puppet handling.
+        return video_tex_to_loaded(&tex, bytes);
+    }
+    let atlas = tex.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
     }))
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
-    let atlas = tex_to_rgba(&find_model_chain_tex_dir(dir, json_path)?.0)?;
+    let tex = find_model_chain_tex_dir(dir, json_path)?.0;
+    if let Some(bytes) = tex.video_bytes() {
+        return video_tex_to_loaded(&tex, bytes);
+    }
+    let atlas = tex.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         std::fs::read(dir.join(rel))
             .ok()
@@ -1091,15 +1375,16 @@ fn apply_puppet_mesh(
         return plain(atlas);
     };
     let Some(mdl_bytes) = read(puppet_path) else {
-        eprintln!("[scene] puppet mesh '{puppet_path}' not found — drawing raw atlas");
+        tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' not found — drawing raw atlas");
         return plain(atlas);
     };
     let Some(model) = crate::engine::puppet::parse_model(&mdl_bytes) else {
-        eprintln!("[scene] puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
+        tracing::warn!(target: "scene", "puppet mesh '{puppet_path}' unparsable — drawing raw atlas");
         return plain(atlas);
     };
-    eprintln!(
-        "[scene] puppet '{puppet_path}': {} vertices, {} triangles, {} bones, {} animations",
+    tracing::debug!(
+        target: "scene",
+        "puppet '{puppet_path}': {} vertices, {} triangles, {} bones, {} animations",
         model.mesh.positions.len(),
         model.mesh.indices.len() / 3,
         model.bones.len(),
@@ -1140,12 +1425,13 @@ fn resolve_particle_sprite_pkg(
     pkg: &Package,
     json_path: &str,
 ) -> Result<(particle::ParticleSprite, Option<String>)> {
-    let (tex, blending) = find_model_chain_tex_pkg(pkg, json_path)?;
+    let (tex, blending, overbright) = find_model_chain_tex_pkg(pkg, json_path)?;
     let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
     Ok((
         particle::ParticleSprite {
             frames: tex.to_particle_rgba_frames()?,
             duration,
+            overbright,
         },
         blending,
     ))
@@ -1155,18 +1441,27 @@ fn resolve_particle_sprite_dir(
     dir: &Path,
     json_path: &str,
 ) -> Result<(particle::ParticleSprite, Option<String>)> {
-    let (tex, blending) = find_model_chain_tex_dir(dir, json_path)?;
+    let (tex, blending, overbright) = find_model_chain_tex_dir(dir, json_path)?;
     let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
     Ok((
         particle::ParticleSprite {
             frames: tex.to_particle_rgba_frames()?,
             duration,
+            overbright,
         },
         blending,
     ))
 }
 
 fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
+    // Perspective 3D scenes have no orthogonal projection and their layer
+    // sizes are world-space, not pixels — inferring pixel dimensions from
+    // them yields garbage (e.g. 1619x29). Render at a fixed 16:9 target; the
+    // perspective camera maps world → NDC independently of this resolution.
+    if scene.is_perspective() {
+        return (1920, 1080);
+    }
+
     // 1. Try orthogonal projection dimensions from camera or general settings
     if let Some(cam) = &scene.camera {
         if let Some(proj) = &cam.orthogonal_projection {
@@ -1282,14 +1577,18 @@ mod tests {
             scale: [1.0, 1.0, 1.0],
             parallax_depth: [0.0, 0.0],
             angle: 0.0,
+            angles: [0.0, 0.0, 0.0],
             blend_mode: 0,
             alpha: 1.0,
+            alpha_script: None,
             color: [1.0, 1.0, 1.0],
             brightness: 1.0,
             copybackground: false,
             no_interpolation: true,
             clamp_uvs: false,
             puppet: None,
+            video: None,
+            text_dynamic: None,
             order_index: 1,
         }];
 
@@ -1303,6 +1602,7 @@ mod tests {
                 sprite_texture: None,
                 additive_blend: false,
                 order_index: 0,
+                children: Vec::new(),
             },
             ParticleLayer {
                 name: "green_particles".to_string(),
@@ -1313,6 +1613,7 @@ mod tests {
                 sprite_texture: None,
                 additive_blend: false,
                 order_index: 2,
+                children: Vec::new(),
             },
         ];
 

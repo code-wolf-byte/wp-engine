@@ -6,8 +6,10 @@ fn scene_with_camera_proj(w: u32, h: u32) -> Scene {
         camera: Some(Camera {
             center: None,
             eye: None,
+            up: None,
             parallax_amount: None,
             orthogonal_projection: Some(OrthogonalProjection {
+                auto: None,
                 width: Some(w),
                 height: Some(h),
             }),
@@ -22,6 +24,7 @@ fn scene_with_general_proj(w: u32, h: u32) -> Scene {
         camera: None,
         general: Some(General {
             orthogonal_projection: Some(OrthogonalProjection {
+                auto: None,
                 width: Some(w),
                 height: Some(h),
             }),

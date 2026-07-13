@@ -12,6 +12,7 @@ name = "scan-wallpapers"
 path = "src/tests/scan_wallpapers.rs"
 
 [dependencies]
+# Structured logging (spans/targets); the subscriber is initialized in main.
 # Wayland renderer
 smithay-client-toolkit  = "0.18"
 wayland-client          = "0.31"
@@ -60,5 +61,12 @@ fontdue  = "0.9"
 anyhow = "1"
 dirs   = "5"
 
+# Structured logging — verbose, per-step diagnostics gated by -v/RUST_LOG.
+# tracing-subscriber's default features (fmt, ansi, tracing-log) let us also
+# capture wgpu/naga's `log` output; env-filter adds RUST_LOG-style filtering.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # Preview window (animation testing without Wayland)
 minifb = "0.27"
+boa_engine = "0.21.1"

@@ -446,21 +446,77 @@ struct ShakeParams {
     time: f32,
     speed: f32,
     strength: f32,
-    _pad: f32,
+    // DIRECTION combo: 0 = center (offset*2-1), 1 = left (as-is), 2 = right
+    // (offset-1) — shake.frag's remaps.
+    direction: f32,
+    friction_x: f32,
+    friction_y: f32,
+    // Precomputed v_Bounds from shake.vert: (bounds.x, 1/(bounds.y-bounds.x)).
+    bounds_x: f32,
+    bounds_y_recip: f32,
+    // NOISE combo: 1 = four layered incommensurate sines instead of one.
+    noise: f32,
+    _p1: f32,
+    _p2: f32,
+    _p3: f32,
 }
 @group(1) @binding(0) var<uniform> shake: ShakeParams;
 
+const TAU: f32 = 6.28318530718;
+
+// Faithful port of shake.frag. Displacement is per-pixel: `offset(t) *
+// strength^2 * flowMask`, where flowMask decodes the author-painted flow map
+// (g_Texture1, slot 1 → dest_copy_tex): rg = 0.498 gray means "this pixel
+// does not move" — WITHOUT a painted flow map the effect is static, which is
+// why sampling an opacity mask here (the old kernel) slid entire layers
+// left-right. g_Texture2 (slot 2 → extra_tex1) is a per-pixel time-offset
+// phase; g_Texture3 (slot 3 → extra_tex2) an opacity mask gating the result.
 @fragment
 fn fs_shake(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-    let t = shake.speed * shake.time;
-    var offset = sin(fract(t / 6.28318) * 6.28318);
-    offset = offset * 0.498 + 0.5;
-    let base = step(0.0, cos(t));
-    offset = mix(1.0 - pow(max(1.0 - offset, 0.001), 2.0), pow(max(offset, 0.001), 2.0), base);
-    offset = offset * 2.0 - 1.0;
+    // White 1x1 dummy fallback gives phase 1.0 * TAU, which is congruent to
+    // the authored black default's 0.0.
+    let flow_phase = textureSample(extra_tex1, src_sampler, uv).r * TAU;
+    let flow_colors = textureSample(dest_copy_tex, src_sampler, uv).rg;
+    let flow = (flow_colors - vec2(0.498, 0.498)) * 2.0;
+
+    var offset = 0.0;
+    if shake.noise > 0.5 {
+        var sines = vec4(flow_phase)
+            + fract(shake.speed * shake.time / TAU * vec4(1.0, -0.16161616, 0.0083333, -0.00019841))
+            * TAU;
+        let csines = cos(sines);
+        var sn = sin(sines) * 0.498 + vec4(0.5);
+        let base = step(vec4(0.0), csines);
+        sn = mix(
+            vec4(1.0) - pow(max(vec4(1.0) - sn, vec4(0.0)), vec4(shake.friction_x)),
+            pow(max(sn, vec4(0.0)), vec4(shake.friction_y)),
+            base,
+        );
+        offset = dot(vec4(0.5), sn);
+    } else {
+        let t = shake.speed * shake.time + flow_phase;
+        var o = sin(fract(t / TAU) * TAU);
+        o = o * 0.498 + 0.5;
+        let base = step(0.0, cos(t));
+        offset = mix(
+            1.0 - pow(max(1.0 - o, 0.0), shake.friction_x),
+            pow(max(o, 0.0), shake.friction_y),
+            base,
+        );
+    }
+    offset = clamp((offset - shake.bounds_x) * shake.bounds_y_recip, 0.0, 1.0);
+
+    if shake.direction < 0.5 {
+        offset = offset * 2.0 - 1.0;
+    } else if shake.direction >= 1.5 {
+        offset = offset - 1.0;
+    }
+
+    let disp = offset * shake.strength * shake.strength * flow;
+    let displaced = textureSample(src_tex, src_sampler, uv + disp);
+    let undisplaced = textureSample(src_tex, src_sampler, uv);
     let mask = textureSample(extra_tex2, src_sampler, uv).r;
-    let tc = uv + vec2(offset * shake.strength * shake.strength * mask, 0.0);
-    return textureSample(src_tex, src_sampler, tc);
+    return mix(undisplaced, displaced, mask);
 }
 
 // ── Tint ─────────────────────────────────────────────────────────────────────

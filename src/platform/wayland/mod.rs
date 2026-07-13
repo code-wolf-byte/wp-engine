@@ -75,7 +75,7 @@ fn spawn_wayland_wallpaper(
     let settings_thread = Arc::clone(&settings);
     let thread = thread::spawn(move || {
         if let Err(e) = wallpaper_loop(content, settings_thread, signal_tx) {
-            eprintln!("wallpaper thread error: {e}");
+            tracing::error!(target: "wallpaper", "wallpaper thread error: {e}");
         }
     });
 
@@ -172,8 +172,9 @@ impl WallpaperState {
             match self.create_gpu_surface(idx) {
                 Ok(gpu) => self.surfaces[idx].gpu = Some(gpu),
                 Err(e) => {
-                    eprintln!(
-                        "wallpaper: GPU surface unavailable for output {idx}: {e} — using SHM path"
+                    tracing::warn!(
+                        target: "wallpaper",
+                        "GPU surface unavailable for output {idx}: {e} — using SHM path"
                     );
                     self.surfaces[idx].gpu_failed = true;
                     return;
@@ -294,13 +295,13 @@ impl WallpaperState {
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("wallpaper: surface acquire failed after reconfigure: {e}");
+                        tracing::error!(target: "wallpaper", "surface acquire failed after reconfigure: {e}");
                         return;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("wallpaper: surface acquire failed: {e}");
+                tracing::error!(target: "wallpaper", "surface acquire failed: {e}");
                 return;
             }
         };
@@ -328,7 +329,7 @@ impl WallpaperState {
             ContentRenderer::Scene(instance) => match instance.render_rgba() {
                 Ok(img) => Arc::new(img),
                 Err(e) => {
-                    eprintln!("wallpaper: scene readback failed: {e}");
+                    tracing::error!(target: "wallpaper", "scene readback failed: {e}");
                     return;
                 }
             },
@@ -340,7 +341,7 @@ impl WallpaperState {
         let mut pool = match SlotPool::new(active_len, &self.shm) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("wallpaper: failed to create shm pool: {e}");
+                tracing::error!(target: "wallpaper", "failed to create shm pool: {e}");
                 return;
             }
         };
@@ -353,7 +354,7 @@ impl WallpaperState {
         ) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("wallpaper: failed to create buffer: {e}");
+                tracing::error!(target: "wallpaper", "failed to create buffer: {e}");
                 return;
             }
         };
@@ -363,8 +364,9 @@ impl WallpaperState {
             .gpu_scaler
             .scale(frame.as_ref(), width, height, quality);
         if pixels.len() != active_len {
-            eprintln!(
-                "wallpaper: scaler returned {} bytes for {}x{} frame, expected {}",
+            tracing::error!(
+                target: "wallpaper",
+                "scaler returned {} bytes for {}x{} frame, expected {}",
                 pixels.len(),
                 width,
                 height,
@@ -446,7 +448,7 @@ fn wallpaper_loop(
             match GpuSceneInstance::with_device(device.clone(), queue.clone(), &dir) {
                 Ok(instance) => ContentRenderer::Scene(Box::new(instance)),
                 Err(e) => {
-                    eprintln!("wallpaper: GPU scene init failed ({e}); using frame-loop fallback");
+                    tracing::warn!(target: "wallpaper", "GPU scene init failed ({e}); using frame-loop fallback");
                     ContentRenderer::Frames(FrameSource::from_content(WallpaperContent::Scene {
                         dir,
                     })?)

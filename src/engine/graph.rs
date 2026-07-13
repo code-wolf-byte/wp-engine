@@ -12,7 +12,9 @@ pub struct SceneGraph {
 }
 
 impl SceneGraph {
+    #[tracing::instrument(target = "scene", level = "debug", fields(dir = %dir.display()))]
     pub fn from_directory(dir: &Path) -> Result<Self> {
+        tracing::debug!(target: "scene", "building scene graph from directory");
         let assets = AssetStore::from_directory(dir)?;
         let scene_json = assets.scene_json()?;
         let scene = Scene::from_json(&scene_json)?;
@@ -39,7 +41,7 @@ impl SceneGraph {
             let model = match model {
                 Ok(model) => model,
                 Err(err) => {
-                    eprintln!("warn: could not resolve model for {:?}: {err}", object.name);
+                    tracing::warn!(target: "scene", "could not resolve model for {:?}: {err}", object.name);
                     None
                 }
             };
@@ -58,8 +60,9 @@ impl SceneGraph {
                         definition,
                     }),
                     Err(err) => {
-                        eprintln!(
-                            "warn: could not resolve effect {file:?} for {:?}: {err}",
+                        tracing::warn!(
+                            target: "scene",
+                            "could not resolve effect {file:?} for {:?}: {err}",
                             object.name
                         );
                     }
@@ -81,6 +84,7 @@ impl SceneGraph {
             });
         }
 
+        tracing::debug!(target: "scene", images = images.len(), "scene graph built");
         Ok(Self {
             assets,
             scene,

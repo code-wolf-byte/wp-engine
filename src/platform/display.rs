@@ -61,8 +61,10 @@ pub trait DisplayPlatform {
 /// `WaylandPlatform`. Returns an error if no supported platform is found.
 pub fn detect_platform() -> Box<dyn DisplayPlatform> {
     if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("WAYLAND_SOCKET").is_ok() {
+        tracing::debug!(target: "platform", "detected Wayland display platform");
         return Box::new(super::wayland::WaylandPlatform);
     }
+    tracing::error!(target: "platform", "no supported display platform detected (WAYLAND_DISPLAY/WAYLAND_SOCKET unset)");
     eprintln!(
         "error: no supported display platform detected.\n\
          wp-engine requires a Wayland compositor with wlr-layer-shell support.\n\

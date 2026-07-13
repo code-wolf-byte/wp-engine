@@ -16,6 +16,16 @@ use wp_engine::{engine, platform, ui};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Increase logging verbosity: -v (debug), -vv (trace), -vvv (+ deps).
+    /// `RUST_LOG` overrides this if set.
+    #[arg(
+        short,
+        long,
+        action = clap::ArgAction::Count,
+        global = true,
+    )]
+    verbose: u8,
 }
 
 #[derive(Subcommand)]
@@ -96,6 +106,8 @@ enum Command {
 
 fn main() {
     let cli = Cli::parse();
+    wp_engine::logging::init(cli.verbose);
+    tracing::debug!(target: "cli", verbosity = cli.verbose, "wp-engine starting");
 
     let result = match cli.command {
         // No subcommand → open GUI
@@ -465,7 +477,7 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     let render_dir = dir.clone();
     let handle = std::thread::spawn(move || {
         if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
-            eprintln!("gpu scene error: {e}");
+            tracing::error!(target: "render", "gpu scene error: {e}");
         }
     });
 
@@ -566,7 +578,7 @@ fn cmd_preview_scene(id_or_path: &str, width: u32, height: u32) -> Result<()> {
     let render_dir = dir.clone();
     let handle = std::thread::spawn(move || {
         if let Err(e) = engine::gpu_renderer::gpu_scene_render_loop(&render_dir, &tx, 30.0) {
-            eprintln!("gpu scene error: {e}");
+            tracing::error!(target: "render", "gpu scene error: {e}");
         }
     });
 

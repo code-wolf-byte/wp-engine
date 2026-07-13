@@ -193,6 +193,15 @@ fn load_particles(
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    // `instanceoverride.enabled: false` turns the whole system off.
+    if overrides.as_ref().is_some_and(|o| {
+        o.enabled
+            .as_ref()
+            .is_some_and(|v| v.as_bool() == Some(false) || v.as_u64() == Some(0))
+    }) {
+        return;
+    }
+
     if let Ok(config) = serde_json::from_str::<ParticleConfig>(&data) {
         let sprite = config
             .material
@@ -240,7 +249,7 @@ fn resolve_particle_sprite_asset(assets: &AssetStore, tex_name: &str) -> Option<
             let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
             tex.to_particle_rgba_frames()
                 .ok()
-                .map(|frames| ParticleSprite { frames, duration })
+                .map(|frames| ParticleSprite { frames, duration, overbright: 1.0 })
         }
         Err(_) => image::load_from_memory(&asset.bytes)
             .ok()
