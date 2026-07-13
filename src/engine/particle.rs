@@ -133,6 +133,12 @@ pub struct Emitter {
     pub distancemin: Option<serde_json::Value>,
     #[serde(default)]
     pub distancemax: Option<serde_json::Value>,
+    /// Optional emitter-driven radial speed range (rare; most presets set
+    /// velocity via initializers).
+    #[serde(default)]
+    pub speedmin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub speedmax: Option<serde_json::Value>,
     #[serde(default)]
     pub sign: Option<String>,
     #[serde(default)]
@@ -511,6 +517,9 @@ pub struct ParticleSystem {
     /// Simulation clock (sum of `step` dts) — drives the time-scrolled
     /// noise fields, the reference's `m_time`/`currentTime`.
     time: f32,
+    /// Preset `flags & 4` (perspective particles): sphere emitters use the
+    /// 3D spherical-shell spawn distribution instead of the 2D disk.
+    shell_3d: bool,
     /// Monotonic source for `Particle::id`.
     next_particle_id: u64,
     /// Attached child presets (see [`ChildRef`]); each holds its own live
@@ -645,12 +654,19 @@ struct EmitterState {
     origin: [f32; 3],
     directions: [f32; 3],
     sign: [f32; 3],
+    /// True for `sphererandom` (annulus/shell spawn), false for box.
+    is_sphere: bool,
+    /// Spawn-offset range: sphere radius in `[0]` (min/max annulus), or the
+    /// box emitter's per-axis half-extents. CParticle.cpp spawns particles
+    /// randomly WITHIN this volume, scaled per-axis by `directions` —
+    /// distancemax is a POSITION range, never a velocity.
+    distance_min: [f32; 3],
+    distance_max: [f32; 3],
+    /// Optional emitter-driven radial speed (`speedmin`/`speedmax` JSON
+    /// fields — distinct from distance!). 0 = the reference's default:
+    /// emitters set no velocity, initializers do.
     speed_min: f32,
     speed_max: f32,
-    /// Spawn-position spread around `origin`: a box emitter's real extent
-    /// (from `distancemax`, an `"x y z"` vector) when available, else a small
-    /// default so particles don't all spawn from the exact same point.
-    spread: [f32; 2],
     accumulator: f32,
 }
 
@@ -675,28 +691,19 @@ impl ParticleSystem {
                 let sign = parse_f32_vec3(e.sign.as_deref());
                 let is_sphere = e.name == "sphererandom";
 
-                // Sphere emitters use a scalar radius for distancemin/max;
-                // box emitters use an "x y z" extent vector — mixing the two
-                // representations up would misparse either shape's real values.
-                let (speed_min, speed_max, spread) = if is_sphere {
-                    let min = e
-                        .distancemin
-                        .as_ref()
-                        .and_then(value_as_f32)
-                        .unwrap_or(10.0);
-                    let max = e
-                        .distancemax
-                        .as_ref()
-                        .and_then(value_as_f32)
-                        .unwrap_or(100.0);
-                    (min, max, [30.0, 30.0])
-                } else {
-                    let extent = e.distancemax.as_ref().and_then(value_as_vec3);
-                    let spread = extent
-                        .map(|v| [v[0].abs().max(1.0), v[1].abs().max(1.0)])
-                        .unwrap_or([60.0, 60.0]);
-                    (10.0, 100.0, spread)
+                // Sphere radii are scalars, box extents "x y z" vectors —
+                // accept either shape for both (splat scalars).
+                let dist = |v: &Option<serde_json::Value>, default: f32| -> [f32; 3] {
+                    v.as_ref()
+                        .and_then(|v| {
+                            value_as_vec3(v).or_else(|| value_as_f32(v).map(|f| [f, f, f]))
+                        })
+                        .unwrap_or([default, default, default])
                 };
+                let distance_min = dist(&e.distancemin, 0.0);
+                let distance_max = dist(&e.distancemax, if is_sphere { 100.0 } else { 60.0 });
+                let speed_min = e.speedmin.as_ref().and_then(value_as_f32).unwrap_or(0.0);
+                let speed_max = e.speedmax.as_ref().and_then(value_as_f32).unwrap_or(0.0);
 
                 EmitterState {
                     id: e.id.unwrap_or(0),
@@ -715,9 +722,11 @@ impl ParticleSystem {
                     ],
                     directions,
                     sign,
+                    is_sphere,
+                    distance_min,
+                    distance_max,
                     speed_min,
                     speed_max,
-                    spread,
                     accumulator: 0.0,
                 }
             })
@@ -1112,6 +1121,7 @@ impl ParticleSystem {
             rope_uv_scale,
             rope_uv_scrolling,
             rope_uv_smoothing,
+            shell_3d: config.flags.unwrap_or(0) & 4 != 0,
             next_particle_id: 0,
             children: Vec::new(),
             angular_velocity_min,
@@ -1448,6 +1458,60 @@ impl ParticleSystem {
                 let ox = emitter.origin[0];
                 let oy = emitter.origin[1];
 
+                // Spawn offset — CParticle.cpp's create{Box,Sphere}Emitter:
+                // a random point WITHIN the emitter volume, scaled per-axis
+                // by `directions` (the emitter never encodes velocity in
+                // its distances; rainperspective's 1024 radius is a spawn
+                // band, which our old model collapsed into a ±15px column
+                // at the emitter origin while misreading the radius as a
+                // fallback speed).
+                let mut offset = if emitter.is_sphere {
+                    let (rmin, rmax) = (emitter.distance_min[0], emitter.distance_max[0]);
+                    if self.shell_3d {
+                        // flags & 4 (perspective): 3D spherical shell,
+                        // cbrt-uniform radius; our 2D sim keeps xy.
+                        let theta = fastrand::f32() * std::f32::consts::TAU;
+                        let cos_t = fastrand::f32() * 2.0 - 1.0;
+                        let sin_t = (1.0 - cos_t * cos_t).sqrt();
+                        let r = (rmin.powi(3)
+                            + fastrand::f32() * (rmax.powi(3) - rmin.powi(3)))
+                        .cbrt();
+                        [sin_t * theta.cos() * r, sin_t * theta.sin() * r]
+                    } else {
+                        // 2D disk/annulus, sqrt-uniform for even area density.
+                        let angle = fastrand::f32() * std::f32::consts::TAU;
+                        let r2 = rmin * rmin + fastrand::f32() * (rmax * rmax - rmin * rmin);
+                        let r = r2.max(0.0).sqrt();
+                        [angle.cos() * r, angle.sin() * r]
+                    }
+                } else {
+                    // Box: per-axis distance in [min, max], random sign flip.
+                    let mut o = [0.0f32; 2];
+                    for (axis, out) in o.iter_mut().enumerate() {
+                        let d = emitter.distance_min[axis]
+                            + fastrand::f32()
+                                * (emitter.distance_max[axis] - emitter.distance_min[axis]);
+                        *out = if fastrand::f32() < 0.5 { -d } else { d };
+                    }
+                    o
+                };
+                offset[0] *= emitter.directions[0];
+                offset[1] *= emitter.directions[1];
+                // `sign`: 1 forces positive, -1 negative, 0 leaves both.
+                for axis in 0..2 {
+                    if emitter.sign[axis] >= 1.0 {
+                        offset[axis] = offset[axis].abs();
+                    } else if emitter.sign[axis] <= -1.0 {
+                        offset[axis] = -offset[axis].abs();
+                    }
+                }
+                let mut spawn_x = ox + offset[0];
+                let mut spawn_y = oy + offset[1];
+
+                // Velocity: velocityrandom initializer first; else the
+                // emitter's own optional radial speed (`speedmin`/`speedmax`
+                // fields, pointing outward from the offset); else zero —
+                // "Emitter does not set velocity - initializers handle that".
                 let (mut vx, mut vy) = if let (Some(min), Some(max)) =
                     (self.velocity_min, self.velocity_max)
                 {
