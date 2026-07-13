@@ -113,6 +113,9 @@ pub struct Layer {
     /// Animated puppet runtime (mesh + skeleton + MDLA animations) — the
     /// live GPU path re-poses and re-rasterizes `image` from this.
     pub puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    /// Embedded-video stream (mp4 inside the .tex) — the live GPU path
+    /// re-uploads decoded frames from this; `image` is the first frame.
+    pub video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
@@ -130,6 +133,9 @@ struct LoadedImage {
     /// MDLA animations): `image` holds the rest pose, and the live GPU
     /// path re-poses/re-rasterizes from this over time.
     puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
+    /// Present for embedded-video textures: `image` holds the first frame,
+    /// and the live GPU path re-uploads frames from this stream over time.
+    video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
 }
 
 impl LoadedImage {
@@ -141,6 +147,7 @@ impl LoadedImage {
             no_interpolation: false,
             clamp_uvs: false,
             puppet: None,
+            video: None,
         }
     }
 
@@ -165,14 +172,18 @@ impl LoadedImage {
                         no_interpolation,
                         clamp_uvs,
                         puppet: None,
+                        video: None,
                     });
                 }
             }
         }
+        if let Some(bytes) = tex.video_bytes() {
+            return video_tex_to_loaded(tex, bytes);
+        }
         Ok(Self {
             no_interpolation,
             clamp_uvs,
-            ..Self::single(tex_to_rgba(tex)?)
+            ..Self::single(tex.to_rgba()?)
         })
     }
 }
@@ -734,6 +745,7 @@ fn layer_from_object(
         no_interpolation: loaded.no_interpolation,
         clamp_uvs: loaded.clamp_uvs,
         puppet: loaded.puppet,
+        video: loaded.video,
         order_index: 0,
     }
 }
@@ -970,27 +982,80 @@ fn text_layer_from_object(
     ))
 }
 
-/// Decode a parsed .tex to RGBA, routing embedded-video payloads (mp4
-/// inside the container, e.g. 2914504963's Taj Mahal backdrop) through
-/// ffmpeg's first-frame decode instead of the pixel path — a static frame
-/// of the right content beats the gray placeholder the layer otherwise
-/// falls back to. (Streaming playback of embedded videos is future work.)
-fn tex_to_rgba(tex: &TexFile) -> Result<RgbaImage> {
-    if let Some(bytes) = tex.video_bytes() {
-        let tmp = std::env::temp_dir().join(format!(
-            "we_embvid_{}.mp4",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::write(&tmp, bytes)
-            .with_context(|| format!("writing embedded video temp file: {}", tmp.display()))?;
-        let result = crate::render::ffmpeg::decode_first_frame(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        return result;
+/// A live decode stream for an embedded-video texture layer: a detached
+/// ffmpeg thread loops the video (PTS-paced, same `video_decode_loop` the
+/// full-video wallpaper path uses) and feeds frames through a small bounded
+/// channel. The consumer drains to the newest frame each render tick, so
+/// slow consumers drop frames instead of lagging. The thread exits on its
+/// own once this struct (the receiver) is dropped, and the temp file
+/// backing the looping decoder is removed then too.
+pub struct VideoLayerStream {
+    rx: std::sync::mpsc::Receiver<std::sync::Arc<RgbaImage>>,
+    /// Temp file the decoder re-opens on every loop — must outlive playback.
+    path: std::path::PathBuf,
+}
+
+impl VideoLayerStream {
+    /// Newest decoded frame since the last call, if any arrived.
+    pub fn latest_frame(&self) -> Option<std::sync::Arc<RgbaImage>> {
+        let mut latest = None;
+        while let Ok(frame) = self.rx.try_recv() {
+            latest = Some(frame);
+        }
+        latest
     }
-    tex.to_rgba()
+}
+
+impl Drop for VideoLayerStream {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Start looping playback for an embedded video payload: writes the bytes
+/// to a temp file, decodes the first frame synchronously (so the layer has
+/// correct content immediately), and spawns the paced decode loop for the
+/// rest.
+fn start_video_stream(bytes: &[u8]) -> Result<(RgbaImage, VideoLayerStream)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "we_embvid_{}_{}.mp4",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes)
+        .with_context(|| format!("writing embedded video temp file: {}", tmp.display()))?;
+    let first = match crate::render::ffmpeg::decode_first_frame(&tmp) {
+        Ok(img) => img,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::sync::Arc<RgbaImage>>(2);
+    let decode_path = tmp.clone();
+    std::thread::spawn(move || {
+        // Exits when the receiver (VideoLayerStream) is dropped.
+        if let Err(e) = crate::render::ffmpeg::video_decode_loop(&decode_path, &tx) {
+            eprintln!(
+                "embedded video decoder error for '{}': {e}",
+                decode_path.display()
+            );
+        }
+    });
+    Ok((first, VideoLayerStream { rx, path: tmp }))
+}
+
+/// Build a `LoadedImage` for an embedded-video texture: first frame as the
+/// image, plus the live stream for the GPU path to animate.
+fn video_tex_to_loaded(tex: &TexFile, bytes: &[u8]) -> Result<LoadedImage> {
+    let (first, stream) = start_video_stream(bytes)?;
+    let mut loaded = LoadedImage::single(first);
+    loaded.no_interpolation = tex.no_interpolation();
+    loaded.clamp_uvs = tex.clamp_uvs();
+    loaded.video = Some(std::sync::Arc::new(std::sync::Mutex::new(stream)));
+    Ok(loaded)
 }
 
 fn load_texture_from_dir(dir: &Path, image_path: &str) -> Result<LoadedImage> {
@@ -1206,14 +1271,24 @@ fn find_model_chain_tex_dir(
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
-    let atlas = tex_to_rgba(&find_model_chain_tex_pkg(pkg, json_path)?.0)?;
+    let tex = find_model_chain_tex_pkg(pkg, json_path)?.0;
+    if let Some(bytes) = tex.video_bytes() {
+        // e.g. 2914504963's Taj Mahal backdrop: the model chain resolves to
+        // an embedded-video texture — stream it instead of puppet handling.
+        return video_tex_to_loaded(&tex, bytes);
+    }
+    let atlas = tex.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
     }))
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
-    let atlas = tex_to_rgba(&find_model_chain_tex_dir(dir, json_path)?.0)?;
+    let tex = find_model_chain_tex_dir(dir, json_path)?.0;
+    if let Some(bytes) = tex.video_bytes() {
+        return video_tex_to_loaded(&tex, bytes);
+    }
+    let atlas = tex.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
         std::fs::read(dir.join(rel))
             .ok()
@@ -1456,6 +1531,7 @@ mod tests {
             no_interpolation: true,
             clamp_uvs: false,
             puppet: None,
+            video: None,
             order_index: 1,
         }];
 

@@ -1086,6 +1086,10 @@ struct SceneLayerGpu {
     puppet: Option<std::sync::Arc<crate::engine::puppet::PuppetRuntime>>,
     /// Last animation time `frames[0]` was posed at, seconds.
     puppet_posed_at: f32,
+    /// Embedded-video stream — `frames[0]` is replaced with the newest
+    /// decoded frame each tick (the decoder thread paces itself by PTS;
+    /// draining to the latest frame drops rather than lags).
+    video: Option<std::sync::Arc<std::sync::Mutex<crate::engine::render::VideoLayerStream>>>,
     blend_mode: u32,
     /// Live alpha for the current frame. When `alpha_script` is present this is
     /// recomputed each frame from `alpha_base`; otherwise it stays constant.
@@ -1343,6 +1347,7 @@ impl GpuSceneInstance {
                     frames,
                     puppet: l.puppet.clone(),
                     puppet_posed_at: 0.0,
+                    video: l.video.clone(),
                     blend_mode: l.blend_mode,
                     alpha: l.alpha,
                     alpha_base: l.alpha,
@@ -1558,6 +1563,20 @@ impl GpuSceneInstance {
         // PUPPET_UPDATE_INTERVAL rather than every frame — the idle-style
         // animations these carry (breathing, hair sway) are far slower than
         // even that.
+        // Pull the newest decoded frame for embedded-video layers (the
+        // ffmpeg thread paces itself; an empty channel means no new frame
+        // this tick and the current texture stays).
+        for i in 0..self.layers.len() {
+            let Some(stream) = self.layers[i].video.clone() else {
+                continue;
+            };
+            let Some(frame) = stream.lock().ok().and_then(|s| s.latest_frame()) else {
+                continue;
+            };
+            let tex = self.renderer.upload_texture(&frame);
+            self.layers[i].frames[0] = tex;
+        }
+
         const PUPPET_UPDATE_INTERVAL: f32 = 1.0 / 15.0;
         for i in 0..self.layers.len() {
             let Some(runtime) = self.layers[i].puppet.clone() else {
