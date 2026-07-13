@@ -89,7 +89,7 @@ impl Default for ScriptContext {
 /// in our realm anyway. Strip module syntax line-by-line: drop `import`
 /// lines, peel `export ` off declarations.
 fn strip_module_syntax(script: &str) -> String {
-    script
+    let out = script
         .lines()
         .map(|line| {
             let t = line.trim_start();
@@ -102,7 +102,14 @@ fn strip_module_syntax(script: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // Minified/concatenated modules pack several statements per line, e.g.
+    // `"use strict";export var x=…;…;export function update(){}` — the
+    // line-start peel above misses those inner `export`s. Strip them at their
+    // statement boundary (after `;` or `}`) too. `export` is a reserved word,
+    // so it can only appear as a statement keyword outside strings/comments,
+    // which these date/clock scripts don't contain.
+    out.replace(";export ", ";").replace("}export ", "}")
 }
 
 /// Wrap a user script in an IIFE so it can be re-evaluated every frame in
@@ -144,7 +151,7 @@ impl ScriptContext {
         let _ = context.eval(Source::from_bytes(
             "var value;\n\
              var update;\n\
-             var engine = { runtime: 0, timeOfDay: 0, registerTimeEvent: function(){}, userProperties: {} };\n\
+             var engine = { runtime: 0, timeOfDay: 0, frametime: 0, registerTimeEvent: function(){}, userProperties: {} };\n\
              var shared = {};\n\
              var console = { log: function(){}, warn: function(){}, error: function(){} };\n\
              function createScriptProperties() {\n\
@@ -182,14 +189,58 @@ impl ScriptContext {
     }
 
     /// Update the clock globals for the current frame. Call once per frame
-    /// before evaluating this frame's property scripts.
-    pub fn set_time(&mut self, runtime: f32, time_of_day: f32) {
+    /// before evaluating this frame's property scripts. `frametime` is the
+    /// delta since the previous frame in seconds (real transform scripts read
+    /// `engine.frametime` to make motion frame-rate independent).
+    pub fn set_time(&mut self, runtime: f32, time_of_day: f32, frametime: f32) {
         let src = format!(
-            "engine.runtime = {}; engine.timeOfDay = {};",
+            "engine.runtime = {}; engine.timeOfDay = {}; engine.frametime = {};",
             js_num(runtime),
             js_num(time_of_day),
+            js_num(frametime),
         );
         let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+    }
+
+    /// Evaluate a Vec3-valued property's `update(value)` (WE `origin`/`scale`/
+    /// `angles`): `value` is passed as a `Vec3(x, y, z)` and the returned Vec3
+    /// is read back. `None` when the script throws or yields a non-finite/
+    /// non-Vec3 result, so callers keep the property's base value.
+    ///
+    /// The result is marshalled through a `"x y z"` string rather than boa's
+    /// object-field API — same plumbing as [`Self::eval_update_string`], and
+    /// it sidesteps the accessor churn across boa versions.
+    pub fn eval_update_vec3(&mut self, script: &str, base: [f32; 3]) -> Option<[f32; 3]> {
+        let _ = self
+            .context
+            .eval(Source::from_bytes(b"update = undefined;"));
+        let src = format!(
+            "value = new Vec3({x}, {y}, {z});\nvar __out = {body};\n\
+             (__out && typeof __out === 'object') ? (__out.x + ' ' + __out.y + ' ' + __out.z) : ''",
+            x = js_num(base[0]),
+            y = js_num(base[1]),
+            z = js_num(base[2]),
+            body = iife_body(script, None),
+        );
+        let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
+        let s = result
+            .to_string(&mut self.context)
+            .ok()?
+            .to_std_string_escaped();
+        let parts: Vec<f32> = s
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        (parts.len() == 3 && parts.iter().all(|v| v.is_finite()))
+            .then(|| [parts[0], parts[1], parts[2]])
+    }
+
+    /// Evaluate a boolean-valued property's `update(value)` (WE `visible`):
+    /// `value` is passed as `0`/`1` and the truthy result maps back to a bool.
+    /// `None` when the script throws, so callers keep the base visibility.
+    pub fn eval_update_bool(&mut self, script: &str, base: bool) -> Option<bool> {
+        self.eval_update(script, if base { 1.0 } else { 0.0 })
+            .map(|n| n >= 0.5)
     }
 
     /// Evaluate one property's `update(value)` against the persistent context,
@@ -201,7 +252,9 @@ impl ScriptContext {
     pub fn eval_update(&mut self, script: &str, current_value: f32) -> Option<f32> {
         // Reset in its own program: a function-declaration hoist in the user
         // script must win, which it can't if the reset shared the same program.
-        let _ = self.context.eval(Source::from_bytes(b"update = undefined;"));
+        let _ = self
+            .context
+            .eval(Source::from_bytes(b"update = undefined;"));
         let src = format!(
             "value = {v};\n{body}",
             v = js_num(current_value),
@@ -223,7 +276,9 @@ impl ScriptContext {
         current_value: &str,
         authored_props: Option<&serde_json::Value>,
     ) -> Option<String> {
-        let _ = self.context.eval(Source::from_bytes(b"update = undefined;"));
+        let _ = self
+            .context
+            .eval(Source::from_bytes(b"update = undefined;"));
         // serde_json string-escapes into a valid JS string literal.
         let quoted = serde_json::to_string(current_value).ok()?;
         let src = format!(
@@ -332,11 +387,11 @@ mod tests {
         let mut ctx = ScriptContext::new();
         let script = "function update(value) { return engine.runtime * 2; }";
 
-        ctx.set_time(1.0, 0.0);
+        ctx.set_time(1.0, 0.0, 0.016);
         assert_eq!(ctx.eval_update(script, 0.0), Some(2.0));
 
         // Same context, new frame: only the clock changed, result tracks it.
-        ctx.set_time(5.5, 0.0);
+        ctx.set_time(5.5, 0.0, 0.016);
         assert_eq!(ctx.eval_update(script, 0.0), Some(11.0));
     }
 
@@ -364,9 +419,15 @@ mod tests {
     #[test]
     fn persistent_context_survives_a_throwing_script() {
         let mut ctx = ScriptContext::new();
-        assert_eq!(ctx.eval_update("function update(v){ return boom.x; }", 2.0), None);
+        assert_eq!(
+            ctx.eval_update("function update(v){ return boom.x; }", 2.0),
+            None
+        );
         // The context is still usable afterwards.
-        assert_eq!(ctx.eval_update("function update(v){ return v * 10; }", 2.0), Some(20.0));
+        assert_eq!(
+            ctx.eval_update("function update(v){ return v * 10; }", 2.0),
+            Some(20.0)
+        );
     }
 
     /// Real workshop text scripts are ES modules with `import`/`export` and a
@@ -392,6 +453,47 @@ export function update(value) {
         );
     }
 
+    /// A Vec3 `scale`/`origin`/`angles` script: `value` arrives as a Vec3 and
+    /// the returned Vec3 is read back component-wise.
+    #[test]
+    fn vec3_script_reads_and_returns_vec3() {
+        let mut ctx = ScriptContext::new();
+        // Doubles x, passes y through, zeroes z.
+        let script = "export function update(value) { \
+            return new Vec3(value.x * 2, value.y, 0); }";
+        assert_eq!(
+            ctx.eval_update_vec3(script, [3.0, 5.0, 9.0]),
+            Some([6.0, 5.0, 0.0])
+        );
+    }
+
+    /// The real `angles` idiom mutates `value` in place and returns it.
+    #[test]
+    fn vec3_script_mutate_in_place() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_time(0.0, 0.0, 0.5);
+        let script = "export function update(value) { \
+            value.x += engine.frametime; return value; }";
+        assert_eq!(
+            ctx.eval_update_vec3(script, [1.0, 2.0, 3.0]),
+            Some([1.5, 2.0, 3.0])
+        );
+    }
+
+    /// A `visible` script returns a boolean; `value` arrives as 0/1.
+    #[test]
+    fn bool_script_toggles_visibility() {
+        let mut ctx = ScriptContext::new();
+        assert_eq!(
+            ctx.eval_update_bool("export function update(value) { return !value; }", true),
+            Some(false)
+        );
+        assert_eq!(
+            ctx.eval_update_bool("export function update(value) { return value > 0; }", true),
+            Some(true)
+        );
+    }
+
     /// A clock-style script using `Date` must produce plausible digits.
     #[test]
     fn date_script_returns_time_digits() {
@@ -401,8 +503,21 @@ export function update(value) {
             var h = d.getHours();
             return (h < 10 ? '0' : '') + h;
         }"#;
-        let out = ctx.eval_update_string(script, "", None).expect("should evaluate");
+        let out = ctx
+            .eval_update_string(script, "", None)
+            .expect("should evaluate");
         let n: u32 = out.parse().expect("two digits");
         assert!(n < 24, "hours out of range: {out}");
+    }
+
+    /// Minified module scripts pack `"use strict";export var …;…;export
+    /// function update(){}` onto one line — every inner `export` must be
+    /// stripped, not just the line-leading one.
+    #[test]
+    fn strips_inner_statement_exports() {
+        let s = strip_module_syntax(
+            "\"use strict\";export var a=1;export function update(v){return a;}",
+        );
+        assert!(!s.contains("export"), "leftover export in: {s}");
     }
 }

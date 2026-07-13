@@ -151,7 +151,9 @@ fn parse_mesh_block(
         };
         let vertices_offset = offset + MESH_HEADER_SIZE;
         let index_len_offset = vertices_offset + vertex_bytes;
-        if vertex_bytes < stride * 3 || vertex_bytes % stride != 0 || index_len_offset + 4 > mdls_offset
+        if vertex_bytes < stride * 3
+            || vertex_bytes % stride != 0
+            || index_len_offset + 4 > mdls_offset
         {
             continue;
         }
@@ -174,7 +176,10 @@ fn parse_mesh_block(
         for i in 0..vertex_count {
             let v = vertices_offset + i * stride;
             positions.push([f32_at(data, v)?, f32_at(data, v + 4)?]);
-            uvs.push([f32_at(data, v + uv_offset)?, f32_at(data, v + uv_offset + 4)?]);
+            uvs.push([
+                f32_at(data, v + uv_offset)?,
+                f32_at(data, v + uv_offset + 4)?,
+            ]);
             if has_skin {
                 bone_indices.push([
                     u32_at(data, v + 12)?,
@@ -346,8 +351,6 @@ fn parse_mdla(data: &[u8], bone_count: usize) -> Option<Vec<PuppetAnimation>> {
 fn find_marker(data: &[u8], marker: &[u8; 4]) -> Option<usize> {
     (0..data.len().saturating_sub(4)).find(|&o| &data[o..o + 4] == marker)
 }
-
-
 
 const AFFINE_IDENTITY: Affine = [
     [1.0, 0.0, 0.0, 0.0],

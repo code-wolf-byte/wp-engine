@@ -14,9 +14,54 @@
 
 use image::RgbaImage;
 
+/// Rasterize `text` (one or more `\n`-separated lines) at `point_size` pixels.
+/// Returns `None` for empty text. Multi-line strings (scripted clocks/dates
+/// like `"7/13/2026\n8:35 AM"`) stack their lines vertically, centered.
+pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaImage> {
+    if text.is_empty() {
+        return None;
+    }
+    if !text.contains('\n') {
+        return rasterize_line(font_data, text, point_size);
+    }
+    // Multi-line: rasterize each line, then stack. Blank lines reserve a gap.
+    let font = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).ok()?;
+    let line_h = font
+        .horizontal_line_metrics(point_size)
+        .map(|m| (m.ascent - m.descent + m.line_gap).ceil() as u32)
+        .unwrap_or((point_size * 1.2).ceil() as u32)
+        .max(1);
+    let lines: Vec<Option<RgbaImage>> = text
+        .split('\n')
+        .map(|l| rasterize_line(font_data, l, point_size))
+        .collect();
+    let width = lines
+        .iter()
+        .filter_map(|l| l.as_ref().map(|i| i.width()))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let height = (line_h * lines.len() as u32).max(1);
+    let mut img = RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 0]));
+    for (i, line) in lines.iter().enumerate() {
+        let Some(line) = line else { continue };
+        // Center each line horizontally within the block, top-align in its row.
+        let ox = (width - line.width()) / 2;
+        let oy = i as u32 * line_h;
+        for (x, y, px) in line.enumerate_pixels() {
+            if px[3] > 0 {
+                if let Some(dst) = img.get_pixel_mut_checked(ox + x, oy + y) {
+                    *dst = *px;
+                }
+            }
+        }
+    }
+    Some(img)
+}
+
 /// Rasterize a single line of `text` at `point_size` pixels using `font_data`.
 /// Returns `None` for empty text (nothing to draw).
-pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaImage> {
+fn rasterize_line(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaImage> {
     if text.is_empty() {
         return None;
     }
@@ -46,7 +91,11 @@ pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaIm
 
     let width = (pen_x.ceil() as u32).max(1);
     let height = ((max_ascent + max_descent).max(1)) as u32;
-    let mut img = RgbaImage::new(width, height);
+    // Fill RGB white with alpha 0 (not the default all-zero = black/transparent).
+    // Glyphs are white with coverage-as-alpha, so linear filtering / downscaling
+    // interpolates white↔white at edges instead of white↔black — the latter
+    // leaves a dark halo/outline around every glyph.
+    let mut img = RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 0]));
 
     for g in &glyphs {
         let dst_x0 = g.pen_x as i32 + g.metrics.xmin;

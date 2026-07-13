@@ -57,6 +57,9 @@ pub struct GpuSceneRenderer {
     samplers: [wgpu::Sampler; 4],
     base_bgl: wgpu::BindGroupLayout,
     effect_bgl: wgpu::BindGroupLayout,
+    /// The g_AudioSpectrum* UBO (effect_bgl binding 1), rewritten each frame
+    /// from the FFT. Zero-filled when no audio is captured.
+    audio_buf: wgpu::Buffer,
     composite_pipelines: Vec<(u32, wgpu::RenderPipeline)>,
     /// Same vs_composite_quad/fs_composite pair as `composite_pipelines[0]`
     /// but with blending disabled (plain overwrite): used for the intra-chain
@@ -176,18 +179,43 @@ impl GpuSceneRenderer {
 
         let effect_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("effect_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                // VERTEX too: real WE vertex shaders read the shared UBO
-                // (g_ModelViewProjectionMatrix, animation params, ...).
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    // VERTEX too: real WE vertex shaders read the shared UBO
+                    // (g_ModelViewProjectionMatrix, animation params, ...).
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // binding 1: the g_AudioSpectrum* storage buffer, updated per
+                // frame from the FFT. Read-only storage (not uniform) because a
+                // `float[N]` needs WGSL-illegal 16-byte uniform array stride;
+                // storage packs tightly. Always present so every effect
+                // pipeline's layout matches; audio shaders read it in the
+                // fragment stage, others ignore the binding.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let audio_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("audio_spectrum"),
+            size: crate::engine::audio::UNIFORM_BYTES as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let composite_pipeline_layout =
@@ -421,6 +449,7 @@ impl GpuSceneRenderer {
             samplers,
             base_bgl,
             effect_bgl,
+            audio_buf,
             composite_pipelines,
             base_pass_pipeline,
             effect_pipelines,
@@ -825,7 +854,11 @@ impl GpuSceneRenderer {
                 wgpu::TexelCopyTextureInfo {
                     texture: &tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 padded.as_raw(),
@@ -967,10 +1000,16 @@ impl GpuSceneRenderer {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.effect_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: param_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: param_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.audio_buf.as_entire_binding(),
+                },
+            ],
         })
     }
 
@@ -1173,6 +1212,8 @@ struct EffectRuntime {
     passes: Vec<EffectPassRuntime>,
     /// (name, downscale divisor) — allocated per instance in the pool.
     fbos: Vec<(String, f32)>,
+    /// True when any pass reads `g_AudioSpectrum*` — drives lazy capture start.
+    uses_audio: bool,
 }
 
 /// Per-frame values for WE's engine-provided uniforms (the counterpart of
@@ -1267,6 +1308,21 @@ struct SceneLayerGpu {
     angle: f32,
     /// Object quad: (center_ndc.x, center_ndc.y, half_extent_ndc.x, half_extent_ndc.y).
     rect: [f32; 4],
+    /// Live visibility for this frame. Starts `true`; only a `visible` script
+    /// can flip it off. `render()` skips the layer entirely when `false`.
+    visible: bool,
+    /// Per-frame transform scripts (visible/scale/origin/angles). When
+    /// scale/origin are present, `rect` is recomputed each frame from the
+    /// base values below; angles rebuilds `angle`. Only honored in the 2D
+    /// (orthographic) path — perspective layers keep their projected rect.
+    transform_scripts: crate::engine::render::TransformScripts,
+    /// Base values fed to the transform scripts as `value` and used to rebuild
+    /// `rect`: object size in px (pre-scale), authored origin (scene coords,
+    /// alignment folded in), scale multiplier, and full angles (radians).
+    effective_size: [f64; 2],
+    origin_base: [f64; 3],
+    scale_base: [f32; 3],
+    angles_base: [f32; 3],
     no_interpolation: bool,
     clamp_uvs: bool,
     /// Unscaled object size in pixels — matches the reference's `CImage::m_size`
@@ -1356,6 +1412,10 @@ pub struct GpuSceneInstance {
     /// frame. Lives here (on the render thread) because boa's `Context` is
     /// `!Send`; created and used entirely within this instance.
     script_ctx: crate::engine::script::ScriptContext,
+    /// Desktop-audio capture, started only when an effect reads
+    /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
+    /// once per frame into the renderer's `audio_buf`.
+    audio_capture: Option<crate::engine::audio::AudioCapture>,
     /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
@@ -1544,12 +1604,27 @@ impl GpuSceneInstance {
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
                     order_index: l.order_index,
+                    visible: true,
+                    transform_scripts: l.transform_scripts.clone(),
+                    effective_size,
+                    origin_base: l.origin,
+                    scale_base: [l.scale[0] as f32, l.scale[1] as f32, l.scale[2] as f32],
+                    angles_base: l.angles,
                 }
             })
             .collect();
 
         let scene_effects = collect_effects(&scene_model);
         let effect_runtimes = load_effect_runtimes(&mut renderer, dir, &scene_effects);
+
+        // Start desktop-audio capture only for scenes that actually react to
+        // it (avoids opening a capture device for every wallpaper).
+        let uses_audio = effect_runtimes.iter().flatten().any(|r| r.uses_audio);
+        let audio_capture = if uses_audio {
+            crate::engine::audio::AudioCapture::start()
+        } else {
+            None
+        };
 
         // Allocate all persistent render targets up front so the render loop
         // can look them up immutably. Per-layer effect-chain FBOs (ping-pong
@@ -1666,7 +1741,9 @@ impl GpuSceneInstance {
                 ..Default::default()
             })
         };
-        let make_gpu_tex = |sprite: Option<&particle::ParticleSprite>, rope: bool| -> ParticleGpuTex {
+        let make_gpu_tex = |sprite: Option<&particle::ParticleSprite>,
+                            rope: bool|
+         -> ParticleGpuTex {
             match sprite {
                 Some(sp) if !sp.frames.is_empty() => {
                     let (tex, frames) = renderer.upload_texture_array(&sp.frames);
@@ -1725,6 +1802,7 @@ impl GpuSceneInstance {
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
             script_ctx: crate::engine::script::ScriptContext::new(),
+            audio_capture,
             perspective: camera3d.is_some(),
         })
     }
@@ -1762,11 +1840,67 @@ impl GpuSceneInstance {
                 .map(|d| d.as_secs() % 86_400)
                 .unwrap_or(0);
             let time_of_day = secs_into_day as f32 / 3600.0;
+            let (w, h, persp) = (self.width, self.height, self.perspective);
             let ctx = &mut self.script_ctx;
-            ctx.set_time(time, time_of_day);
+            ctx.set_time(time, time_of_day, (time - self.last_time).max(0.0));
             for layer in &mut self.layers {
                 if let Some(script) = &layer.alpha_script {
-                    layer.alpha = ctx.eval_update(script, layer.alpha_base).unwrap_or(layer.alpha_base);
+                    layer.alpha = ctx
+                        .eval_update(script, layer.alpha_base)
+                        .unwrap_or(layer.alpha_base);
+                }
+                // Transform scripts. `visible` gates the draw; scale/origin
+                // rebuild `rect`; angles rebuilds `angle`. The rect rebuild is
+                // 2D-only (perspective layers keep their camera-projected rect).
+                // Each script borrow is scoped to its eval so the `rect`/`angle`
+                // writes below don't overlap it.
+                if let Some(v) = layer
+                    .transform_scripts
+                    .visible
+                    .as_ref()
+                    .and_then(|s| ctx.eval_update_bool(s, true))
+                {
+                    layer.visible = v;
+                }
+                if !persp
+                    && (layer.transform_scripts.scale.is_some()
+                        || layer.transform_scripts.origin.is_some())
+                {
+                    let scale = match &layer.transform_scripts.scale {
+                        Some(s) => ctx
+                            .eval_update_vec3(s, layer.scale_base)
+                            .unwrap_or(layer.scale_base),
+                        None => layer.scale_base,
+                    };
+                    let origin_base = [
+                        layer.origin_base[0] as f32,
+                        layer.origin_base[1] as f32,
+                        layer.origin_base[2] as f32,
+                    ];
+                    let origin = match &layer.transform_scripts.origin {
+                        Some(s) => ctx.eval_update_vec3(s, origin_base).unwrap_or(origin_base),
+                        None => origin_base,
+                    };
+                    let size_px = [
+                        layer.effective_size[0] * scale[0] as f64,
+                        layer.effective_size[1] * scale[1] as f64,
+                    ];
+                    layer.rect = [
+                        (2.0 * origin[0] as f64 / w as f64 - 1.0) as f32,
+                        (2.0 * origin[1] as f64 / h as f64 - 1.0) as f32,
+                        (size_px[0] / w as f64) as f32,
+                        (size_px[1] / h as f64) as f32,
+                    ];
+                }
+                if !persp {
+                    if let Some(a) = layer
+                        .transform_scripts
+                        .angles
+                        .as_ref()
+                        .and_then(|s| ctx.eval_update_vec3(s, layer.angles_base))
+                    {
+                        layer.angle = -a[2];
+                    }
                 }
                 // Script-driven text: re-evaluate; only a CHANGED string pays
                 // for rasterization + upload (a clock re-rasterizes once per
@@ -1794,10 +1928,7 @@ impl GpuSceneInstance {
                                     Some(&td.alignment),
                                     scaled,
                                 );
-                                let origin = [
-                                    td.raw_origin[0] + off[0],
-                                    td.raw_origin[1] + off[1],
-                                ];
+                                let origin = [td.raw_origin[0] + off[0], td.raw_origin[1] + off[1]];
                                 layer.rect = [
                                     (2.0 * origin[0] / self.width as f64 - 1.0) as f32,
                                     (2.0 * origin[1] / self.height as f64 - 1.0) as f32,
@@ -1811,6 +1942,14 @@ impl GpuSceneInstance {
                     }
                 }
             }
+        }
+
+        // Refresh the g_AudioSpectrum* UBO from the latest captured window.
+        if let Some(cap) = &self.audio_capture {
+            let bytes = cap.spectrum().to_uniform_bytes();
+            self.renderer
+                .queue
+                .write_buffer(&self.renderer.audio_buf, 0, &bytes);
         }
 
         let target_view = self.target.create_view(&Default::default());
@@ -1890,6 +2029,8 @@ impl GpuSceneInstance {
             .layers
             .iter()
             .enumerate()
+            // A `visible` script can hide a layer this frame — drop it here.
+            .filter(|(_, l)| l.visible)
             .map(|(i, l)| (l.order_index, DrawItem::Image(i)))
             .chain(
                 self.particle_systems
@@ -1923,7 +2064,13 @@ impl GpuSceneInstance {
         for (_, item) in items {
             match item {
                 DrawItem::Image(layer_idx) => {
-                    self.draw_image_layer_gpu(&mut encoder, &target_view, layer_idx, time, dynamics);
+                    self.draw_image_layer_gpu(
+                        &mut encoder,
+                        &target_view,
+                        layer_idx,
+                        time,
+                        dynamics,
+                    );
                 }
                 DrawItem::Particle(idx) => {
                     self.draw_particle_layer_gpu(&mut encoder, &target_view, idx, delta);
@@ -2835,21 +2982,38 @@ fn load_effect_instance(
                         let candidates = [format!("materials/{n}.tex"), format!("{n}.tex")];
                         candidates.iter().find_map(|rel| {
                             let bytes = resolver.read(rel)?;
-                            crate::engine::tex::TexFile::parse(&bytes).ok()?.to_rgba().ok()
+                            crate::engine::tex::TexFile::parse(&bytes)
+                                .ok()?
+                                .to_rgba()
+                                .ok()
                         })
                     });
-                // Missing-slot fallback is normally white (= unmasked), but
+                // Missing-slot fallbacks: normally white (= unmasked), but
                 // shake's slot 1 is a FLOW map whose authored default is
-                // util/noflow — rg 0.498 gray, "no pixel moves". A white
-                // fallback there would shear the whole layer diagonally.
+                // util/noflow — rg 0.498 gray, "no pixel moves" (white would
+                // shear the whole layer diagonally), and pulse's slot 1 is
+                // its noise source, authored default util/noise.
+                let img = img.or_else(|| {
+                    if effect_name == "pulse" && slot_i == 0 {
+                        let bytes = resolver.read("materials/util/noise.tex")?;
+                        crate::engine::tex::TexFile::parse(&bytes)
+                            .ok()?
+                            .to_rgba()
+                            .ok()
+                    } else {
+                        None
+                    }
+                });
                 let fallback = if effect_name == "shake" && slot_i == 0 {
                     image::Rgba([127, 127, 127, 255])
                 } else {
                     image::Rgba([255, 255, 255, 255])
                 };
-                textures.push(renderer.upload_texture(
-                    &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
-                ));
+                textures.push(
+                    renderer.upload_texture(
+                        &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
+                    ),
+                );
             }
         }
         // A shake with no texture overrides at all authors no flow map either
@@ -2889,6 +3053,7 @@ fn load_effect_instance(
                 vertex_buffers: Vec::new(),
             }],
             fbos: Vec::new(),
+            uses_audio: false,
         });
     }
     let Ok(eff_def) = effect_def::load_effect_by_file(resolver, &inst.file) else {
@@ -2920,6 +3085,7 @@ fn load_effect_instance(
 
     let default_override = PassOverride::default();
     let mut passes: Vec<EffectPassRuntime> = Vec::new();
+    let mut uses_audio = false;
     for (pass_idx, pass) in eff_def.passes.iter().enumerate() {
         let Some(mat_path) = pass.material.as_deref() else {
             continue;
@@ -3050,6 +3216,7 @@ fn load_effect_instance(
                 continue;
             }
         };
+        uses_audio |= translated.uses_audio;
         let key = format!("fx{instance_idx}:{effect_name}#{pass_idx}");
         // Temporary debug hook: dump translated WGSL per pass.
         if std::env::var("WP_DEBUG_DUMP_WGSL").is_ok() {
@@ -3187,7 +3354,11 @@ fn load_effect_instance(
         return None;
     }
     tracing::debug!(target: "effect", "LOADED '{effect_name}' ({} passes)", passes.len());
-    Some(EffectRuntime { passes, fbos })
+    Some(EffectRuntime {
+        passes,
+        fbos,
+        uses_audio,
+    })
 }
 
 /// Continuously render scene frames into a channel (preview window, headless
@@ -3468,15 +3639,19 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "phase", 0.0),
             get(vals, "bounds_r", 0.0),
             get(vals, "bounds_g", 1.0),
-            0.0,
+            get(vals, "combo_BLENDMODE", 9.0),
             get(vals, "tintlow_r", 1.0),
             get(vals, "tintlow_g", 1.0),
             get(vals, "tintlow_b", 1.0),
-            0.0, // pad
+            get(vals, "combo_PULSECOLOR", 1.0),
             get(vals, "tinthigh_r", 1.0),
             get(vals, "tinthigh_g", 1.0),
             get(vals, "tinthigh_b", 1.0),
-            0.0, // pad
+            get(vals, "combo_PULSEALPHA", 0.0),
+            get(vals, "noisespeed", 0.5),
+            get(vals, "noiseamount", 0.0),
+            0.0,
+            0.0,
         ]),
         "scroll" => pack(&[
             time,
@@ -3512,7 +3687,16 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             let g = get(vals, "color_g", 0.0);
             let b = get(vals, "color_b", 0.0);
             let a = get(vals, "alpha", 1.0);
-            pack(&[r, g, b, a])
+            pack(&[
+                r,
+                g,
+                b,
+                a,
+                get(vals, "combo_BLENDMODE", 30.0),
+                0.0,
+                0.0,
+                0.0,
+            ])
         }
         "opacity" => pack(&[get(vals, "alpha", 1.0), 0.0, 0.0, 0.0]),
         "waterripple" => pack(&[
@@ -3543,7 +3727,7 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "center_g", 0.5),
             get(vals, "size", 0.1),
             get(vals, "feather", 0.002),
-            0.0,
+            get(vals, "combo_REPEAT", 1.0),
             0.0,
         ]),
         _ => vec![0u8; 32],

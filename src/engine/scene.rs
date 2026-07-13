@@ -206,6 +206,19 @@ impl SceneObject {
             _ => true,
         }
     }
+
+    /// Inline SceneScript source driving `visible`, if the property was
+    /// authored as `{"value": …, "script": "…"}`. An object with a visible
+    /// script must not be dropped by the `is_visible()` load-time filter even
+    /// when its authored value is `false` — the script may turn it on.
+    pub fn visible_script(&self) -> Option<String> {
+        match &self.visible {
+            Some(serde_json::Value::Object(m)) => {
+                m.get("script").and_then(|v| v.as_str()).map(str::to_string)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

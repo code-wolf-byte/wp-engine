@@ -143,6 +143,20 @@ pub struct Layer {
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
+    /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
+    /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
+    pub transform_scripts: TransformScripts,
+}
+
+/// The per-frame SceneScripts a layer's transform can carry. Each `update`
+/// receives the property's base value (a `Vec3` for scale/origin/angles, a
+/// bool for visible) and returns the value for this frame.
+#[derive(Clone, Default)]
+pub struct TransformScripts {
+    pub visible: Option<String>,
+    pub scale: Option<String>,
+    pub origin: Option<String>,
+    pub angles: Option<String>,
 }
 
 /// A loaded texture plus any additional animation frames (e.g. from a `.tex`
@@ -261,7 +275,7 @@ impl ResolvedScene {
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() {
+            if !obj.is_visible() && obj.visible_script().is_none() {
                 continue;
             }
             if obj.particle.is_some() {
@@ -334,7 +348,7 @@ impl ResolvedScene {
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() {
+            if !obj.is_visible() && obj.visible_script().is_none() {
                 continue;
             }
             if obj.particle.is_some() {
@@ -409,7 +423,7 @@ impl ResolvedScene {
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() {
+            if !obj.is_visible() && obj.visible_script().is_none() {
                 continue;
             }
             if obj.particle.is_some() {
@@ -502,8 +516,10 @@ impl ResolvedScene {
                 // empty, freshly-spawned system.
                 DrawItem::Particle(i) => {
                     let pl = &self.particle_layers[i];
-                    let spawn_center =
-                        [pl.origin[0] as f32, self.height as f32 - pl.origin[1] as f32];
+                    let spawn_center = [
+                        pl.origin[0] as f32,
+                        self.height as f32 - pl.origin[1] as f32,
+                    ];
                     let mut system = particle::ParticleSystem::from_config(
                         &pl.config,
                         spawn_center,
@@ -593,12 +609,8 @@ impl ResolvedScene {
                 dst[1] as f32 / 255.0,
                 dst[2] as f32 / 255.0,
             ];
-            let out = crate::engine::blend::apply_blending(
-                layer.blend_mode,
-                dest_rgb,
-                src_rgb,
-                src_a,
-            );
+            let out =
+                crate::engine::blend::apply_blending(layer.blend_mode, dest_rgb, src_rgb, src_a);
             dst[0] = (out[0].clamp(0.0, 1.0) * 255.0) as u8;
             dst[1] = (out[1].clamp(0.0, 1.0) * 255.0) as u8;
             dst[2] = (out[2].clamp(0.0, 1.0) * 255.0) as u8;
@@ -618,8 +630,7 @@ impl ResolvedScene {
             // `resized` image (nearest-neighbor).
             let ccx = px as f64 + draw_w as f64 / 2.0;
             let ccy = py as f64 + draw_h as f64 / 2.0;
-            let half_diag =
-                ((draw_w as f64 / 2.0).powi(2) + (draw_h as f64 / 2.0).powi(2)).sqrt();
+            let half_diag = ((draw_w as f64 / 2.0).powi(2) + (draw_h as f64 / 2.0).powi(2)).sqrt();
             let (sin_a, cos_a) = (layer.angle as f64).sin_cos();
             let x0 = ((ccx - half_diag).floor() as i64).max(0);
             let x1 = ((ccx + half_diag).ceil() as i64).min(cw);
@@ -694,23 +705,44 @@ fn layer_from_object(
     // WE stores angles already in radians; only the z component (2D roll)
     // applies to a flat layer quad. The reference negates it (rotate(-angle,
     // ...)) when building the object's screen transform.
-    let angles3 = obj
+    let angles_animated = obj
         .angles
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
+        .map(crate::engine::model::json_to_animated);
+    let angles3 = angles_animated
+        .as_ref()
         .and_then(|v| v.as_vec3())
         .unwrap_or([0.0, 0.0, 0.0]);
     let angle = -angles3[2];
 
-    let scale = match &obj.scale {
-        Some(v) => {
-            let s = crate::engine::scene::parse_value_vec3(v).unwrap_or([1.0, 1.0, 1.0]);
-            s
-        }
-        None => [1.0, 1.0, 1.0],
+    let scale_animated = obj
+        .scale
+        .as_ref()
+        .map(crate::engine::model::json_to_animated);
+    let scale = scale_animated
+        .as_ref()
+        .and_then(|v| v.as_vec3())
+        .map(|s| [s[0] as f64, s[1] as f64, s[2] as f64])
+        .unwrap_or([1.0, 1.0, 1.0]);
+    let origin_animated = obj
+        .origin
+        .as_ref()
+        .map(crate::engine::model::json_to_animated);
+
+    // Per-frame transform scripts (evaluated by the live GPU path). origin/
+    // scale/angles carry their script on the animated value; visible carries
+    // it on the raw `visible` object.
+    let transform_scripts = TransformScripts {
+        visible: obj.visible_script(),
+        scale: scale_animated.as_ref().and_then(|v| v.script.clone()),
+        origin: origin_animated.as_ref().and_then(|v| v.script.clone()),
+        angles: angles_animated.as_ref().and_then(|v| v.script.clone()),
     };
 
-    let alpha_animated = obj.alpha.as_ref().map(crate::engine::model::json_to_animated);
+    let alpha_animated = obj
+        .alpha
+        .as_ref()
+        .map(crate::engine::model::json_to_animated);
     let alpha = alpha_animated
         .as_ref()
         .and_then(|v| v.as_float())
@@ -735,8 +767,14 @@ fn layer_from_object(
     // its center (CImage.cpp lines 242-256), expressed here as an offset
     // folded directly into `origin` — every consumer of `Layer::origin`
     // (both render paths) then gets alignment for free.
+    // Text objects (the only caller passing `alignment_override`) size their
+    // quad from the rasterized glyph bitmap, not the scene `size` field —
+    // WE's CText uses `m_quadSize` (the raster dims) and ignores `size`
+    // (which is editor bounding-box metadata). Honoring it would stretch the
+    // glyphs to an unrelated box.
+    let is_text = alignment_override.is_some();
     let raw_size = obj.parsed_size();
-    let effective_size = if raw_size[0] > 0.0 && raw_size[1] > 0.0 {
+    let effective_size = if !is_text && raw_size[0] > 0.0 && raw_size[1] > 0.0 {
         [raw_size[0], raw_size[1]]
     } else {
         [loaded.image.width() as f64, loaded.image.height() as f64]
@@ -755,7 +793,12 @@ fn layer_from_object(
         extra_frames: loaded.extra_frames,
         frame_duration_ms: loaded.frame_duration_ms,
         origin,
-        size: obj.parsed_size(),
+        // Text: leave size 0 so both render paths fall back to the raster dims.
+        size: if is_text {
+            [0.0, 0.0, 0.0]
+        } else {
+            obj.parsed_size()
+        },
         scale,
         parallax_depth: parallax,
         angle,
@@ -772,6 +815,7 @@ fn layer_from_object(
         video: loaded.video,
         text_dynamic: None,
         order_index: 0,
+        transform_scripts,
     }
 }
 
@@ -820,7 +864,9 @@ fn particle_layer_from_object(
     };
     let json = read_particle_json(dir, pkg, particle_ref)?;
     let mut config: particle::ParticleConfig = serde_json::from_str(&json)
-        .inspect_err(|e| tracing::warn!(target: "particle", "failed to parse '{particle_ref}': {e}"))
+        .inspect_err(
+            |e| tracing::warn!(target: "particle", "failed to parse '{particle_ref}': {e}"),
+        )
         .ok()?;
     let overrides: Option<particle::InstanceOverride> = obj
         .instanceoverride
@@ -856,7 +902,9 @@ fn particle_layer_from_object(
                 continue;
             };
             while config.controlpoint.len() <= n {
-                config.controlpoint.push(particle::ControlPointConfig::default());
+                config
+                    .controlpoint
+                    .push(particle::ControlPointConfig::default());
             }
             config.controlpoint[n].offset = Some(value.clone());
             config.controlpoint[n].flags = Some(config.controlpoint[n].flags.unwrap_or(0) | 2);
@@ -873,7 +921,10 @@ fn particle_layer_from_object(
                 origin[1] as f32 - world[1],
                 world[2],
             ];
-            cp.offset = Some(serde_json::json!(format!("{} {} {}", rel[0], rel[1], rel[2])));
+            cp.offset = Some(serde_json::json!(format!(
+                "{} {} {}",
+                rel[0], rel[1], rel[2]
+            )));
             cp.flags = Some(cp.flags.unwrap_or(0) & !2);
         }
     }
@@ -938,7 +989,12 @@ fn particle_layer_from_object(
                 .as_ref()
                 .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
             let sprite = resolved.map(|(sprite, _)| sprite);
-            Some(ResolvedChildParticle { config: child_cfg, sprite, additive, child_ref })
+            Some(ResolvedChildParticle {
+                config: child_cfg,
+                sprite,
+                additive,
+                child_ref,
+            })
         })
         .collect();
 
@@ -1011,8 +1067,34 @@ fn text_layer_from_object(
                 .or_else(|| v.get("value").and_then(|v| v.as_f64()))
         })
         .unwrap_or(32.0) as f32;
+    let scale = obj
+        .scale
+        .as_ref()
+        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .unwrap_or([1.0, 1.0, 1.0]);
+    // The on-screen text height is driven by the object's `size` BOX height,
+    // not pointsize: `layer_from_object` scales the rasterized bitmap by the
+    // object's `scale`, and WE authors size text via that box (a big box +
+    // scale>1 = big text; a modest box + scale<1 = small text). Rasterize at
+    // the box height so the bitmap ≈ its on-screen size (crisp, natural aspect,
+    // no stretch). `pointsize` here is only the fallback resolution when the
+    // object ships no box (then compensate for `scale` like CText does, so the
+    // glyphs don't collapse to a couple of pixels).
+    let box_h = obj.parsed_size()[1] as f32;
+    let raster_px = if box_h > 0.0 {
+        box_h
+    } else {
+        let avg_scale = (scale[0] + scale[1]) * 0.5;
+        let compensate = if avg_scale > 0.0 && avg_scale < 1.0 {
+            (1.0 / avg_scale).min(32.0)
+        } else {
+            1.0
+        };
+        point_size * compensate
+    }
+    .clamp(1.0, 1024.0);
     let font_data = super::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
-    let image = super::text::rasterize(&font_data, &text_str, point_size)?;
+    let image = super::text::rasterize(&font_data, &text_str, raster_px)?;
 
     let halign = obj
         .horizontalalign
@@ -1028,7 +1110,7 @@ fn text_layer_from_object(
             script,
             script_properties,
             font_data,
-            point_size,
+            point_size: raster_px,
             last_text: text_str,
             raw_origin: obj.parsed_origin(),
             alignment: combined,
@@ -1227,7 +1309,9 @@ fn find_model_chain_tex_pkg(
         .get(json_path)
         .map(|d| d.to_vec())
         .or_else(|| read_from_global_assets(json_path))
-        .with_context(|| format!("model/material not found in pkg or global assets: {json_path}"))?;
+        .with_context(|| {
+            format!("model/material not found in pkg or global assets: {json_path}")
+        })?;
     let val: serde_json::Value =
         serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
@@ -1285,14 +1369,16 @@ fn pass_overbright(pass: &serde_json::Value) -> f32 {
 }
 
 /// Follow the model -> material -> texture chain for loose files on disk.
-fn find_model_chain_tex_dir(
-    dir: &Path,
-    json_path: &str,
-) -> Result<(TexFile, Option<String>, f32)> {
+fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>, f32)> {
     let data = std::fs::read(dir.join(json_path))
         .ok()
         .or_else(|| read_from_global_assets(json_path))
-        .with_context(|| format!("model/material not found in {} or global assets: {json_path}", dir.display()))?;
+        .with_context(|| {
+            format!(
+                "model/material not found in {} or global assets: {json_path}",
+                dir.display()
+            )
+        })?;
     let val: serde_json::Value =
         serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
@@ -1335,7 +1421,9 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage
     }
     let atlas = tex.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
-        pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
+        pkg.get(rel)
+            .map(|d| d.to_vec())
+            .or_else(|| read_from_global_assets(rel))
     }))
 }
 
@@ -1543,7 +1631,7 @@ mod tests {
         let json = format!(
             r#"{{
                 "maxcount": 2,
-                "emitter": [{{"name":"box","rate":1000}}],
+                "emitter": [{{"name":"box","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}}],
                 "initializer": [
                     {{"id":1,"name":"lifetimerandom","min":100,"max":100}},
                     {{"id":2,"name":"sizerandom","min":300,"max":300}},
@@ -1590,6 +1678,7 @@ mod tests {
             video: None,
             text_dynamic: None,
             order_index: 1,
+            transform_scripts: TransformScripts::default(),
         }];
 
         let particle_layers = vec![
