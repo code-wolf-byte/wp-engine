@@ -23,7 +23,7 @@ impl Scene {
     pub fn is_perspective(&self) -> bool {
         let usable = |o: &Option<OrthogonalProjection>| {
             o.as_ref()
-                .is_some_and(|p| p.width.is_some() && p.height.is_some())
+                .is_some_and(|p| (p.width.is_some() && p.height.is_some()) || p.auto == Some(true))
         };
         let has_ortho = self
             .camera
@@ -70,6 +70,9 @@ impl Camera {
 pub struct OrthogonalProjection {
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// `{"auto": true}` — ortho sized automatically (gifscenes): still an
+    /// orthogonal projection even with null width/height.
+    pub auto: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
