@@ -640,3 +640,65 @@ fn fs_spin(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     mask = mask * textureSample(dest_copy_tex, src_sampler, uv).r;
     return mix(original, spun, mask);
 }
+
+// ── GPU particles ─────────────────────────────────────────────────────────────
+// The CPU simulation emits pre-transformed triangle-list vertices (6 per
+// sprite quad / rope sub-quad, absolute scene pixels — see particle.rs's
+// GpuVertex); this pipeline replaces the old budgeted CPU rasterizer, so
+// particles draw at full output resolution with hardware filtering and
+// float blending (the reference draws GPU quads too). Sprite-sheet frames
+// are array layers; cross-fade samples two layers (genericparticle.frag's
+// SPRITESHEETBLEND) — sampled unconditionally, WGSL forbids textureSample
+// in non-uniform control flow.
+
+struct PVertex {
+    pos: vec2<f32>,
+    uv: vec2<f32>,
+    color: vec4<f32>,
+    frame_blend: vec4<f32>,
+}
+@group(0) @binding(0) var<storage, read> particle_verts: array<PVertex>;
+@group(0) @binding(1) var particle_tex: texture_2d_array<f32>;
+@group(0) @binding(2) var particle_sampler: sampler;
+struct ParticleDrawParams {
+    scene_size: vec2<f32>,
+    overbright: f32,
+    frame_count: f32,
+}
+@group(0) @binding(3) var<uniform> pdraw: ParticleDrawParams;
+
+struct ParticleVsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) frame_blend: vec2<f32>,
+}
+
+@vertex
+fn vs_particles(@builtin(vertex_index) vi: u32) -> ParticleVsOut {
+    let v = particle_verts[vi];
+    var out: ParticleVsOut;
+    // Scene pixels (y-down) -> NDC.
+    out.position = vec4(
+        v.pos.x / pdraw.scene_size.x * 2.0 - 1.0,
+        1.0 - v.pos.y / pdraw.scene_size.y * 2.0,
+        0.0,
+        1.0,
+    );
+    out.uv = v.uv;
+    out.color = v.color;
+    out.frame_blend = v.frame_blend.xy;
+    return out;
+}
+
+@fragment
+fn fs_particles(in: ParticleVsOut) -> @location(0) vec4<f32> {
+    let frames = max(pdraw.frame_count, 1.0);
+    let f0 = i32(clamp(in.frame_blend.x, 0.0, frames - 1.0));
+    let f1 = min(f0 + 1, i32(frames) - 1);
+    let s0 = textureSample(particle_tex, particle_sampler, in.uv, f0);
+    let s1 = textureSample(particle_tex, particle_sampler, in.uv, f1);
+    let s = mix(s0, s1, in.frame_blend.y);
+    // genericparticle.frag: albedo * vertex color, rgb *= g_Overbright.
+    return vec4(s.rgb * in.color.rgb * pdraw.overbright, s.a * in.color.a);
+}

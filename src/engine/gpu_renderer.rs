@@ -85,6 +85,12 @@ pub struct GpuSceneRenderer {
     bloom_combine_pipeline: wgpu::RenderPipeline,
     // Format → blit pipeline (surface presentation, FBO up/down-sampling)
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    // GPU particle pipeline (vs_particles/fs_particles): storage-buffer
+    // vertices, texture-array sprites, hardware blending straight into the
+    // scene target — replaces the budgeted CPU particle rasterizer.
+    particle_bgl: wgpu::BindGroupLayout,
+    particle_pipeline_add: wgpu::RenderPipeline,
+    particle_pipeline_over: wgpu::RenderPipeline,
 }
 
 impl GpuSceneRenderer {
@@ -314,6 +320,99 @@ impl GpuSceneRenderer {
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
+        let particle_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("particle_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let particle_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("particle_layout"),
+            bind_group_layouts: &[&particle_bgl],
+            push_constant_ranges: &[],
+        });
+        // Additive: the reference draws particle quads with
+        // glBlendFuncSeparate(SRC_ALPHA, ONE, SRC_ALPHA, ONE) (CPass.cpp).
+        let particle_add_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let particle_over_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let particle_pipeline_add = Self::create_pipeline(
+            &device,
+            &particle_layout,
+            &shader_module,
+            "vs_particles",
+            "fs_particles",
+            "particles_add",
+            Some(particle_add_blend),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let particle_pipeline_over = Self::create_pipeline(
+            &device,
+            &particle_layout,
+            &shader_module,
+            "vs_particles",
+            "fs_particles",
+            "particles_over",
+            Some(particle_over_blend),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
 
         Ok(Self {
@@ -338,6 +437,9 @@ impl GpuSceneRenderer {
             bloom_blur_pipeline,
             bloom_combine_pipeline,
             blit_pipelines: HashMap::new(),
+            particle_bgl,
+            particle_pipeline_add,
+            particle_pipeline_over,
         })
     }
 
@@ -686,6 +788,60 @@ impl GpuSceneRenderer {
             },
         );
         tex
+    }
+
+    /// Uploads sprite-sheet frames as one 2D texture array (layer per frame)
+    /// for the GPU particle pipeline. Frames are padded to the largest
+    /// extent; TEXS sheets are uniform in practice, so padding is a
+    /// theoretical safety net, not an expected path.
+    pub fn upload_texture_array(&self, frames: &[RgbaImage]) -> (wgpu::Texture, u32) {
+        let n = frames.len().max(1) as u32;
+        let w = frames.iter().map(|f| f.width()).max().unwrap_or(1).max(1);
+        let h = frames.iter().map(|f| f.height()).max().unwrap_or(1).max(1);
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("particle_sprite_array"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: n,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (i, frame) in frames.iter().enumerate() {
+            let (fw, fh) = (frame.width(), frame.height());
+            let padded = if fw == w && fh == h {
+                frame.clone()
+            } else {
+                let mut img = RgbaImage::new(w, h);
+                image::imageops::overlay(&mut img, frame, 0, 0);
+                img
+            };
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                padded.as_raw(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        (tex, frames.len().max(1) as u32)
     }
 
     pub fn create_render_target(&self, w: u32, h: u32) -> wgpu::Texture {
@@ -1135,6 +1291,23 @@ struct SceneLayerGpu {
 /// pool, and per-frame camera dynamics. Render either to RGBA (readback
 /// paths: preview/testing/SHM fallback) or straight into an external texture
 /// view (Wayland surface presentation — no readback).
+/// One sprite texture array for a GPU particle draw unit.
+struct ParticleGpuTex {
+    view: wgpu::TextureView,
+    frames: u32,
+    overbright: f32,
+    /// Ropes tile V past 1.0 (`uvscale`/scrolling) — sample with the repeat
+    /// sampler; sprite quads clamp.
+    repeat: bool,
+}
+
+/// Per-layer GPU particle textures: the parent system's sprite plus one per
+/// child preset (child *instances* spawn at runtime; textures are per child).
+struct ParticleGpuAssets {
+    parent: ParticleGpuTex,
+    children: Vec<ParticleGpuTex>,
+}
+
 pub struct GpuSceneInstance {
     renderer: GpuSceneRenderer,
     layers: Vec<SceneLayerGpu>,
@@ -1173,6 +1346,9 @@ pub struct GpuSceneInstance {
     /// instead of the default alpha-over, which otherwise makes a sprite's
     /// near-black background visibly darken/box the scene behind it.
     particle_additive: Vec<bool>,
+    /// Parallel to `particle_systems`: GPU sprite texture arrays (parent +
+    /// per-child), built once at load for the GPU particle pipeline.
+    particle_gpu_assets: Vec<ParticleGpuAssets>,
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
@@ -1465,6 +1641,68 @@ impl GpuSceneInstance {
             .map(|pl| pl.additive_blend)
             .collect();
 
+        // GPU particle sprite arrays. Sprite-less systems draw the CPU
+        // path's soft radial-falloff disc (alpha = (1-d)^2), baked once;
+        // texture-less ropes fall back to a solid white strip, matching the
+        // CPU flat fill.
+        let soft_disc = {
+            let mut img = RgbaImage::new(64, 64);
+            for y in 0..64u32 {
+                for x in 0..64u32 {
+                    let dx = (x as f32 + 0.5) / 32.0 - 1.0;
+                    let dy = (y as f32 + 0.5) / 32.0 - 1.0;
+                    let d = (dx * dx + dy * dy).sqrt().min(1.0);
+                    let t = 1.0 - d;
+                    let a = (t * t * 255.0) as u8;
+                    img.put_pixel(x, y, image::Rgba([255, 255, 255, a]));
+                }
+            }
+            img
+        };
+        let white = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+        let array_view = |tex: &wgpu::Texture| {
+            tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        };
+        let make_gpu_tex = |sprite: Option<&particle::ParticleSprite>, rope: bool| -> ParticleGpuTex {
+            match sprite {
+                Some(sp) if !sp.frames.is_empty() => {
+                    let (tex, frames) = renderer.upload_texture_array(&sp.frames);
+                    ParticleGpuTex {
+                        view: array_view(&tex),
+                        frames,
+                        overbright: sp.overbright,
+                        repeat: rope,
+                    }
+                }
+                _ => {
+                    let img = if rope { &white } else { &soft_disc };
+                    let (tex, frames) = renderer.upload_texture_array(std::slice::from_ref(img));
+                    ParticleGpuTex {
+                        view: array_view(&tex),
+                        frames,
+                        overbright: 1.0,
+                        repeat: rope,
+                    }
+                }
+            }
+        };
+        let particle_gpu_assets: Vec<ParticleGpuAssets> = resolved
+            .particle_layers
+            .iter()
+            .zip(particle_systems.iter())
+            .map(|(pl, system)| ParticleGpuAssets {
+                parent: make_gpu_tex(pl.sprite_texture.as_ref(), system.is_rope()),
+                children: system
+                    .child_sprite_info()
+                    .into_iter()
+                    .map(|(sprite, rope)| make_gpu_tex(sprite, rope))
+                    .collect(),
+            })
+            .collect();
+
         Ok(Self {
             renderer,
             layers,
@@ -1482,6 +1720,7 @@ impl GpuSceneInstance {
             particle_sprites,
             particle_order,
             particle_additive,
+            particle_gpu_assets,
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
@@ -2043,6 +2282,119 @@ impl GpuSceneInstance {
     /// the bbox size changes frame-to-frame needs UV-subregion plumbing the
     /// composite shader doesn't have today.
     fn draw_particle_layer_gpu(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        idx: usize,
+        delta: f32,
+    ) {
+        // Escape hatch for A/B comparison against the old budgeted CPU
+        // rasterizer during the GPU-pipeline transition.
+        if std::env::var("WP_PARTICLE_CPU").is_ok() {
+            self.draw_particle_layer_cpu_raster(encoder, target_view, idx, delta);
+            return;
+        }
+        self.particle_systems[idx].step(delta);
+
+        // Draw units: the parent system, then every live child instance
+        // (each child preset has its own sprite/blending).
+        let system = &self.particle_systems[idx];
+        let assets = &self.particle_gpu_assets[idx];
+        let mut units: Vec<(Vec<particle::GpuVertex>, &ParticleGpuTex, bool)> = Vec::new();
+        let mut verts = Vec::new();
+        system.emit_gpu_vertices(&mut verts, assets.parent.frames as usize);
+        if !verts.is_empty() {
+            units.push((verts, &assets.parent, self.particle_additive[idx]));
+        }
+        system.visit_gpu_children(&mut |inst, child_idx, child_additive| {
+            let tex = assets.children.get(child_idx).unwrap_or(&assets.parent);
+            let mut v = Vec::new();
+            inst.emit_gpu_vertices(&mut v, tex.frames as usize);
+            if !v.is_empty() {
+                units.push((v, tex, child_additive));
+            }
+        });
+
+        for (verts, tex, additive) in units {
+            let bytes = particle::GpuVertex::as_bytes(&verts);
+            let vbuf = self.renderer.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle_verts"),
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.renderer.queue.write_buffer(&vbuf, 0, &bytes);
+
+            let mut params = Vec::with_capacity(16);
+            for f in [
+                self.width as f32,
+                self.height as f32,
+                tex.overbright,
+                tex.frames as f32,
+            ] {
+                params.extend_from_slice(&f.to_le_bytes());
+            }
+            let pbuf = self.renderer.make_uniform_buffer(&params, 16);
+            // Linear-repeat for ropes (V tiles past 1.0), linear-clamp for
+            // sprite quads (padding-safe at the edges).
+            let sampler = &self.renderer.samplers[if tex.repeat { 0 } else { 1 }];
+            let bg = self
+                .renderer
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("particle_bg"),
+                    layout: &self.renderer.particle_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: vbuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: pbuf.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let pipeline = if additive {
+                &self.renderer.particle_pipeline_add
+            } else {
+                &self.renderer.particle_pipeline_over
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("particle_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..verts.len() as u32, 0..1);
+        }
+    }
+
+    /// The pre-GPU-pipeline particle path: budgeted CPU rasterization into a
+    /// bbox buffer, uploaded and composited as a stretched quad. Kept behind
+    /// WP_PARTICLE_CPU=1 for A/B comparison; the CPU compositor paths
+    /// (render.rs/animated.rs) share the same underlying rasterizer.
+    fn draw_particle_layer_cpu_raster(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         target_view: &wgpu::TextureView,

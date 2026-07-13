@@ -1519,31 +1519,20 @@ impl ParticleSystem {
                         (min[0] + fastrand::f32() * (max[0] - min[0])) * self.speed_mult,
                         (min[1] + fastrand::f32() * (max[1] - min[1])) * self.speed_mult,
                     )
-                } else {
+                } else if emitter.speed_max > 0.0 || emitter.speed_min != 0.0 {
+                    let len = (offset[0] * offset[0] + offset[1] * offset[1]).sqrt();
+                    let dir = if len > 0.0 {
+                        [offset[0] / len, offset[1] / len]
+                    } else {
+                        [0.0, 1.0]
+                    };
                     let speed = (emitter.speed_min
                         + fastrand::f32() * (emitter.speed_max - emitter.speed_min))
                         * self.speed_mult;
-                    let angle = fastrand::f32() * std::f32::consts::TAU;
-                    let sign_x = if emitter.sign[0] == 0.0 {
-                        1.0
-                    } else {
-                        emitter.sign[0].signum()
-                    };
-                    let sign_y = if emitter.sign[1] == 0.0 {
-                        1.0
-                    } else {
-                        emitter.sign[1].signum()
-                    };
-                    let id_phase = emitter.id as f32 * 0.173;
-                    (
-                        (angle + id_phase).cos() * speed * emitter.directions[0].max(0.1) * sign_x,
-                        (angle + id_phase).sin() * speed * emitter.directions[1].max(0.1) * sign_y,
-                    )
+                    (dir[0] * speed, dir[1] * speed)
+                } else {
+                    (0.0, 0.0)
                 };
-
-                let (spread_x, spread_y) = (emitter.spread[0], emitter.spread[1]);
-                let mut spawn_x = ox + (fastrand::f32() - 0.5) * spread_x;
-                let mut spawn_y = oy + (fastrand::f32() - 0.5) * spread_y;
 
                 // `mapsequencebetweencontrolpoints`: the Nth spawn sits at
                 // the Nth slot along the cp0->cp1 segment (mirror =
@@ -2078,16 +2067,27 @@ impl ParticleSystem {
         additive: bool,
         scale: f32,
     ) {
+        let Some(geo) = self.build_rope_geometry(origin, scale) else {
+            return;
+        };
+        let tex = sprite.and_then(|s| s.frames.first());
+        let overbright = sprite.map(|s| s.overbright).unwrap_or(1.0);
+        for &(i, v_a, v_b) in &geo.quads {
+            let (a, b) = (&geo.points[i], &geo.points[i + 1]);
+            fill_rope_segment(
+                canvas, a.pos, b.pos, a.normal, b.normal, a.size, b.size, a.color, b.color,
+                a.alpha, b.alpha, additive, tex, overbright, v_a, v_b,
+            );
+        }
+    }
+
+    /// Builds the rope's shared geometry — Catmull-Rom subpoints, per-joint
+    /// central-difference normals, and per-quad V ranges — consumed by both
+    /// the CPU scanline fill and the GPU vertex emitter.
+    fn build_rope_geometry(&self, origin: [f32; 2], scale: f32) -> Option<RopeGeometry> {
         let n = self.particles.len();
         if n < 2 {
-            return;
-        }
-
-        struct SubPoint {
-            pos: [f32; 2],
-            size: f32,
-            color: [u8; 3],
-            alpha: f32,
+            return None;
         }
 
         let subdiv = self.rope_subdivision;
@@ -2109,7 +2109,7 @@ impl ParticleSystem {
                     [p3.x, p3.y],
                     t,
                 );
-                subpoints.push(SubPoint {
+                subpoints.push(RopePoint {
                     pos: [
                         (pos[0] - origin[0]) * scale,
                         (pos[1] - origin[1]) * scale,
@@ -2121,11 +2121,12 @@ impl ParticleSystem {
                         lerp_f32(p1.color[1] as f32, p2.color[1] as f32, t) as u8,
                         lerp_f32(p1.color[2] as f32, p2.color[2] as f32, t) as u8,
                     ],
+                    normal: [0.0, 1.0],
                 });
             }
         }
         let last = &self.particles[n - 1];
-        subpoints.push(SubPoint {
+        subpoints.push(RopePoint {
             pos: [
                 (last.x - origin[0]) * scale,
                 (last.y - origin[1]) * scale,
@@ -2133,12 +2134,8 @@ impl ParticleSystem {
             size: last.size * scale,
             color: last.color,
             alpha: last.alpha,
+            normal: [0.0, 1.0],
         });
-
-        // Rope texture: frame 0 of the resolved material sprite. Rope
-        // materials are plain beam/trail strips, not animated sheets.
-        let tex = sprite.and_then(|s| s.frames.first());
-        let overbright = sprite.map(|s| s.overbright).unwrap_or(1.0);
 
         // V coordinates along the rope — CParticle::renderRope's exact
         // semantics: each sub-segment quad consumes 1/(trailLength-1) of UV
@@ -2189,21 +2186,204 @@ impl ParticleSystem {
             }
         };
         let normals: Vec<[f32; 2]> = (0..subpoints.len()).map(joint_normal).collect();
-
-        for (s, pair) in subpoints.windows(2).enumerate() {
-            let (a, b) = (&pair[0], &pair[1]);
-            let trail_position = if use_smoothing && total_arc > 0.0 {
-                cumulative_arc[s] / total_arc * total_sub
-            } else {
-                s as f32
-            } + scroll_offset;
-            let v_a = trail_position / usable_len;
-            let v_b = (trail_position + 1.0) / usable_len;
-            fill_rope_segment(
-                canvas, a.pos, b.pos, normals[s], normals[s + 1], a.size, b.size, a.color,
-                b.color, a.alpha, b.alpha, additive, tex, overbright, v_a, v_b,
-            );
+        for (i, n) in normals.into_iter().enumerate() {
+            subpoints[i].normal = n;
         }
+
+        let quads = (0..subpoints.len() - 1)
+            .map(|s| {
+                let trail_position = if use_smoothing && total_arc > 0.0 {
+                    cumulative_arc[s] / total_arc * total_sub
+                } else {
+                    s as f32
+                } + scroll_offset;
+                (s, trail_position / usable_len, (trail_position + 1.0) / usable_len)
+            })
+            .collect();
+
+        Some(RopeGeometry { points: subpoints, quads })
+    }
+
+    /// Appends pre-transformed triangle-list vertices for the GPU particle
+    /// pipeline: 6 per sprite quad (rotation/spritetrail applied here, the
+    /// same math as the CPU textured draw) or 6 per rope sub-quad. Positions
+    /// are absolute scene pixels; the vertex shader converts to NDC.
+    /// `frame_count` is the sprite's frame count (0/1 = static frame 0).
+    pub fn emit_gpu_vertices(&self, out: &mut Vec<GpuVertex>, frame_count: usize) {
+        if self.rope_mode {
+            self.emit_rope_gpu_vertices(out);
+            return;
+        }
+        for p in &self.particles {
+            if p.alpha <= 0.0 || p.size <= 0.0 {
+                continue;
+            }
+            // Frame/cross-fade selection — mirrors the CPU textured draw.
+            let (frame, blend) = if frame_count > 1 {
+                let f = p.frame.max(0.0);
+                let a = (f as usize).min(frame_count - 1);
+                let b = (a + 1).min(frame_count - 1);
+                let fract = f.fract();
+                if b != a && fract > 1.0 / 255.0 {
+                    (a as f32, fract)
+                } else {
+                    (a as f32, 0.0)
+                }
+            } else {
+                (0.0, 0.0)
+            };
+            let (half_w, half_h, rotation) = match self.sprite_trail {
+                Some(t) => {
+                    let vel_len = (p.vx * p.vx + p.vy * p.vy).sqrt();
+                    let trail = (vel_len * t.length)
+                        .clamp(t.min_length.min(t.max_length), t.max_length)
+                        .max(0.05);
+                    let angle = if vel_len > 0.0001 {
+                        p.vy.atan2(p.vx) + std::f32::consts::FRAC_PI_2
+                    } else {
+                        p.rotation
+                    };
+                    (p.size, p.size * trail, angle)
+                }
+                None => (p.size, p.size, p.rotation),
+            };
+            let (c, sn) = (rotation.cos(), rotation.sin());
+            let color = [
+                p.color[0] as f32 / 255.0,
+                p.color[1] as f32 / 255.0,
+                p.color[2] as f32 / 255.0,
+                p.alpha.clamp(0.0, 1.0),
+            ];
+            let corner = |lx: f32, ly: f32, u: f32, v: f32| GpuVertex {
+                pos: [p.x + lx * c - ly * sn, p.y + lx * sn + ly * c],
+                uv: [u, v],
+                color,
+                frame_blend: [frame, blend, 0.0, 0.0],
+            };
+            let tl = corner(-half_w, -half_h, 0.0, 0.0);
+            let tr = corner(half_w, -half_h, 1.0, 0.0);
+            let br = corner(half_w, half_h, 1.0, 1.0);
+            let bl = corner(-half_w, half_h, 0.0, 1.0);
+            out.extend_from_slice(&[tl, tr, br, br, bl, tl]);
+        }
+    }
+
+    fn emit_rope_gpu_vertices(&self, out: &mut Vec<GpuVertex>) {
+        let Some(geo) = self.build_rope_geometry([0.0, 0.0], 1.0) else {
+            return;
+        };
+        for &(i, v_a, v_b) in &geo.quads {
+            let (a, b) = (&geo.points[i], &geo.points[i + 1]);
+            // Same convexity guard as fill_rope_segment: keep both joint
+            // normals on the same side when the chain doubles back.
+            let nb = if a.normal[0] * b.normal[0] + a.normal[1] * b.normal[1] < 0.0 {
+                [-b.normal[0], -b.normal[1]]
+            } else {
+                b.normal
+            };
+            let (ha, hb) = (a.size.max(0.5), b.size.max(0.5));
+            let col = |p: &RopePoint| {
+                [
+                    p.color[0] as f32 / 255.0,
+                    p.color[1] as f32 / 255.0,
+                    p.color[2] as f32 / 255.0,
+                    p.alpha.clamp(0.0, 1.0),
+                ]
+            };
+            let (ca, cb) = (col(a), col(b));
+            let vert = |pos: [f32; 2], uv: [f32; 2], color: [f32; 4]| GpuVertex {
+                pos,
+                uv,
+                color,
+                frame_blend: [0.0, 0.0, 0.0, 0.0],
+            };
+            // U convention matches fill_rope_segment: +normal side = u 1.
+            let a1 = vert([a.pos[0] + a.normal[0] * ha, a.pos[1] + a.normal[1] * ha], [1.0, v_a], ca);
+            let b1 = vert([b.pos[0] + nb[0] * hb, b.pos[1] + nb[1] * hb], [1.0, v_b], cb);
+            let b0 = vert([b.pos[0] - nb[0] * hb, b.pos[1] - nb[1] * hb], [0.0, v_b], cb);
+            let a0 = vert([a.pos[0] - a.normal[0] * ha, a.pos[1] - a.normal[1] * ha], [0.0, v_a], ca);
+            out.extend_from_slice(&[a1, b1, b0, b0, a0, a1]);
+        }
+    }
+
+    /// Visits every live child instance with its child index (the GPU path
+    /// keys uploaded textures by child, since instances spawn at runtime)
+    /// and its material blending.
+    pub fn visit_gpu_children(&self, f: &mut dyn FnMut(&ParticleSystem, usize, bool)) {
+        for (child_idx, child) in self.children.iter().enumerate() {
+            for inst in &child.instances {
+                f(&inst.system, child_idx, child.additive);
+            }
+        }
+    }
+
+    /// Build-time child info for GPU texture upload: each child's sprite and
+    /// whether its preset uses a rope renderer.
+    pub fn child_sprite_info(&self) -> Vec<(Option<&ParticleSprite>, bool)> {
+        self.children
+            .iter()
+            .map(|c| {
+                let rope = c.config.renderer.iter().any(|r| {
+                    r.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n == "rope" || n == "ropetrail")
+                        .unwrap_or(false)
+                });
+                (c.sprite.as_ref(), rope)
+            })
+            .collect()
+    }
+
+    pub fn is_rope(&self) -> bool {
+        self.rope_mode
+    }
+}
+
+/// One point along a rope's subdivided spine (see `build_rope_geometry`).
+struct RopePoint {
+    pos: [f32; 2],
+    size: f32,
+    color: [u8; 3],
+    alpha: f32,
+    /// Per-joint central-difference perpendicular (width direction).
+    normal: [f32; 2],
+}
+
+/// Shared rope geometry: spine points and per-quad `(start_index, v_a, v_b)`.
+struct RopeGeometry {
+    points: Vec<RopePoint>,
+    quads: Vec<(usize, f32, f32)>,
+}
+
+/// One pre-transformed vertex for the GPU particle pipeline (triangle list,
+/// read from a storage buffer by `vs_particles`). 48 bytes, std430-compatible.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuVertex {
+    /// Absolute scene pixels (y-down).
+    pub pos: [f32; 2],
+    pub uv: [f32; 2],
+    /// rgb 0-1, a = particle alpha.
+    pub color: [f32; 4],
+    /// x = sprite-sheet frame, y = cross-fade weight toward frame+1.
+    pub frame_blend: [f32; 4],
+}
+
+impl GpuVertex {
+    /// Flattens vertices to the byte layout `vs_particles` reads.
+    pub fn as_bytes(verts: &[GpuVertex]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(verts.len() * 48);
+        for v in verts {
+            for f in v
+                .pos
+                .iter()
+                .chain(v.uv.iter())
+                .chain(v.color.iter())
+                .chain(v.frame_blend.iter())
+            {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        out
     }
 }
 
