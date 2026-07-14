@@ -25,6 +25,11 @@ pub struct ParticleConfig {
     /// `controlpointattract` (CParticle.cpp/ObjectParser.cpp).
     #[serde(default)]
     pub controlpoint: Vec<ControlPointConfig>,
+    /// Delay in seconds before this system begins emitting. Present on nearly
+    /// every real preset (610/610) so a burst ramps in instead of all
+    /// particles appearing at frame 0.
+    #[serde(default)]
+    pub starttime: Option<f64>,
     /// Path to the material JSON providing this system's sprite texture
     /// (e.g. `"materials/presets/water_faucet.json"`). Resolved by callers
     /// (this module stays asset-agnostic) and passed into `render_onto`.
@@ -115,6 +120,15 @@ pub struct ControlPointConfig {
     pub offset: Option<serde_json::Value>,
     #[serde(default)]
     pub flags: Option<u32>,
+    /// Orientation of the control point's local frame (z used in 2D): rotates
+    /// the `offset` about the object origin so oriented control points land in
+    /// the right place.
+    #[serde(default)]
+    pub angles: Option<serde_json::Value>,
+    /// `locktopointer`: the control point tracks the mouse cursor. Parsed;
+    /// we have no live pointer input, so it resolves to its static offset.
+    #[serde(default)]
+    pub locktopointer: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +159,26 @@ pub struct Emitter {
     pub sign: Option<String>,
     #[serde(default)]
     pub id: Option<u32>,
+    /// One-shot burst count: this many particles are emitted in a single frame
+    /// when the emitter first activates (at `starttime`), then normal `rate`
+    /// emission continues. `0`/absent = purely rate-driven.
+    #[serde(default)]
+    pub instantaneous: Option<f64>,
+    /// Emitter lifetime in seconds: after `starttime + duration`, this emitter
+    /// stops emitting. Absent = emits forever.
+    #[serde(default)]
+    pub duration: Option<f64>,
+    /// Presence of any `audioprocessing*` field makes emission react to the
+    /// captured audio level (rate scales with loudness). We use the mode as
+    /// the trigger; band bounds are parsed but not yet split per-frequency.
+    #[serde(default)]
+    pub audioprocessingmode: Option<serde_json::Value>,
+    #[serde(default)]
+    pub audioprocessingbounds: Option<serde_json::Value>,
+    #[serde(default)]
+    pub audioprocessingexponent: Option<serde_json::Value>,
+    #[serde(default)]
+    pub audioprocessingfrequencyend: Option<serde_json::Value>,
 }
 
 /// `min`/`max` are untyped because real presets mix plain numbers
@@ -160,6 +194,11 @@ pub struct Initializer {
     pub max: Option<serde_json::Value>,
     #[serde(default)]
     pub min: Option<serde_json::Value>,
+    /// Biases the uniform `random(min,max)` toward `min` (exponent > 1) or
+    /// `max` (< 1): the sample `t` is raised to this power before the lerp.
+    /// Absent = 1.0 (uniform).
+    #[serde(default)]
+    pub exponent: Option<f64>,
     /// `turbulentvelocityrandom` (CParticle.cpp
     /// createTurbulentVelocityRandomInitializer): a curl-noise-directed
     /// spawn velocity. `forward`/`right` are `"x y z"` vector strings;
@@ -430,6 +469,9 @@ pub struct ParticleSystem {
     life_max: f32,
     size_min: f32,
     size_max: f32,
+    /// `exponent` distribution bias for lifetime/size random sampling (1.0 = uniform).
+    life_exp: f32,
+    size_exp: f32,
     /// `alpharandom` initializer range (CParticle.cpp's `AlphaRandomInitializer`):
     /// defaults to `(1.0, 1.0)` — a no-op — when the config has no such
     /// initializer at all, matching `ParticleInstance::alpha`'s `1.0f` default.
@@ -440,6 +482,12 @@ pub struct ParticleSystem {
     color_min: [f32; 3],
     color_max: [f32; 3],
     gravity: [f32; 2],
+    /// Scene-global constant acceleration (`general.gravity*` + `wind*`),
+    /// added to every particle's velocity each step. Set post-construction.
+    scene_force: [f32; 2],
+    /// Current audio loudness in ~[0,1], set per frame; audio-reactive emitters
+    /// scale their emission rate by it.
+    audio_level: f32,
     /// `movement.drag`: velocity decays by `1 - drag*dt` (clamped at 0)
     /// each step, matching the reference's reversal-preventing clamp.
     movement_drag: f32,
@@ -519,6 +567,8 @@ pub struct ParticleSystem {
     /// Simulation clock (sum of `step` dts) — drives the time-scrolled
     /// noise fields, the reference's `m_time`/`currentTime`.
     time: f32,
+    /// `starttime`: emission is suppressed until the clock reaches this.
+    start_time: f32,
     /// Preset `flags & 4` (perspective particles): sphere emitters use the
     /// 3D spherical-shell spawn distribution instead of the 2D disk.
     shell_3d: bool,
@@ -670,6 +720,15 @@ struct EmitterState {
     speed_min: f32,
     speed_max: f32,
     accumulator: f32,
+    /// `instantaneous` one-shot burst count, emitted once when the emitter
+    /// activates; `burst_done` tracks that it's fired.
+    burst: u32,
+    burst_done: bool,
+    /// `duration`: emitter stops after `start_time + duration` (None = forever).
+    duration: Option<f32>,
+    /// True when the emitter has `audioprocessing*` — its rate scales with the
+    /// current audio level.
+    audio_reactive: bool,
 }
 
 impl ParticleSystem {
@@ -738,6 +797,11 @@ impl ParticleSystem {
                     speed_min,
                     speed_max,
                     accumulator: 0.0,
+                    burst: e.instantaneous.unwrap_or(0.0).max(0.0) as u32,
+                    burst_done: false,
+                    duration: e.duration.map(|d| d as f32),
+                    audio_reactive: e.audioprocessingmode.is_some()
+                        || e.audioprocessingbounds.is_some(),
                 }
             })
             .collect();
@@ -762,6 +826,8 @@ impl ParticleSystem {
             scalar_range_from_initializers(&config.initializer, "lifetimerandom", 1.0, 1.0);
         let (size_min, size_max) =
             scalar_range_from_initializers(&config.initializer, "sizerandom", 40.0, 40.0);
+        let life_exp = initializer_exponent(&config.initializer, "lifetimerandom");
+        let size_exp = initializer_exponent(&config.initializer, "sizerandom");
         let (alpha_min, alpha_max) =
             scalar_range_from_initializers(&config.initializer, "alpharandom", 1.0, 1.0);
         let velocity_range = vec3_range_from_initializers(&config.initializer, "velocityrandom");
@@ -849,11 +915,26 @@ impl ParticleSystem {
             .controlpoint
             .iter()
             .map(|cp| {
-                let offset = cp
+                let mut offset = cp
                     .offset
                     .as_ref()
                     .and_then(value_as_vec3)
                     .unwrap_or([0.0; 3]);
+                // `angles.z` rotates the offset about the object origin.
+                if let Some(az) = cp
+                    .angles
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .map(|a| a[2])
+                    .filter(|z| z.abs() > 1e-6)
+                {
+                    let (s, c) = az.sin_cos();
+                    offset = [
+                        offset[0] * c - offset[1] * s,
+                        offset[0] * s + offset[1] * c,
+                        offset[2],
+                    ];
+                }
                 [
                     spawn_center[0] + offset[0],
                     spawn_center[1] + offset[1],
@@ -1112,6 +1193,8 @@ impl ParticleSystem {
             life_max,
             size_min,
             size_max,
+            life_exp,
+            size_exp,
             alpha_min,
             alpha_max,
             velocity_min,
@@ -1169,7 +1252,20 @@ impl ParticleSystem {
             turbulence,
             vortex,
             time: 0.0,
+            start_time: config.starttime.unwrap_or(0.0).max(0.0) as f32,
+            scene_force: [0.0, 0.0],
+            audio_level: 0.0,
         }
+    }
+
+    /// Apply the scene-global constant force (`general.gravity*`/`wind*`).
+    pub fn set_scene_force(&mut self, force: [f32; 2]) {
+        self.scene_force = force;
+    }
+
+    /// Set the current audio loudness (~[0,1]) driving audio-reactive emitters.
+    pub fn set_audio_level(&mut self, level: f32) {
+        self.audio_level = level.clamp(0.0, 4.0);
     }
 
     /// Tell the system its resolved sprite's frame count/loop duration, so
@@ -1194,8 +1290,8 @@ impl ParticleSystem {
             // reversing it.
             p.x += p.vx * dt;
             p.y += p.vy * dt;
-            p.vx += self.gravity[0] * dt * self.speed_mult;
-            p.vy += self.gravity[1] * dt * self.speed_mult;
+            p.vx += (self.gravity[0] * self.speed_mult + self.scene_force[0]) * dt;
+            p.vy += (self.gravity[1] * self.speed_mult + self.scene_force[1]) * dt;
             let drag_factor = (1.0 - self.movement_drag * dt).max(0.0);
             p.vx *= drag_factor;
             p.vy *= drag_factor;
@@ -1462,20 +1558,45 @@ impl ParticleSystem {
         }
         self.particles.retain(|p| p.life > 0.0);
 
+        // Hold off emission until `starttime` — existing particles still
+        // simulate and die, the burst just ramps in from zero at start_time.
+        let emitting = self.time >= self.start_time;
+        let since_start = self.time - self.start_time;
         for emitter in &mut self.emitters {
-            emitter.accumulator += emitter.rate * self.rate_mult * dt;
+            // Per-emitter `duration` cutoff (after start_time).
+            let expired = emitter.duration.is_some_and(|d| since_start > d);
+            if !emitting || expired {
+                continue;
+            }
+            // One-shot burst: seed the accumulator with the full count once, so
+            // the spawn loop below emits it in this frame (capped by max_count).
+            if !emitter.burst_done {
+                emitter.accumulator += emitter.burst as f32;
+                emitter.burst_done = true;
+            }
+            // Audio-reactive emitters scale their rate with loudness (a small
+            // baseline keeps a trickle when quiet).
+            let audio_gain = if emitter.audio_reactive {
+                0.15 + self.audio_level
+            } else {
+                1.0
+            };
+            emitter.accumulator += emitter.rate * self.rate_mult * audio_gain * dt;
             while emitter.accumulator >= 1.0 && self.particles.len() < self.max_count {
                 emitter.accumulator -= 1.0;
                 // `createLifetimeRandomInitializer`: `p.lifetime =
-                // random(min, max) * lifetimeOverride`.
+                // random(min, max) * lifetimeOverride`. `exponent` biases the
+                // uniform sample toward one end before the lerp.
                 let life = (self.life_min
-                    + fastrand::f32() * (self.life_max - self.life_min).max(0.0))
+                    + fastrand::f32().powf(self.life_exp)
+                        * (self.life_max - self.life_min).max(0.0))
                     * self.lifetime_mult;
                 // Reference halves the sizerandom range (CParticle.cpp: `size = (min +
                 // t*(max-min)) * override / 2.0`) — the initializer's value is a
                 // diameter, not a radius.
                 let size = (self.size_min
-                    + fastrand::f32() * (self.size_max - self.size_min).max(0.0))
+                    + fastrand::f32().powf(self.size_exp)
+                        * (self.size_max - self.size_min).max(0.0))
                     * self.size_mult
                     / 2.0;
 
@@ -2875,6 +2996,17 @@ fn fade_value(t: f32, start: f32, end: f32, start_val: f32, end_val: f32) -> f32
 /// `turbulentvelocityrandom`/`angularvelocityrandom` shadow
 /// `velocityrandom` (or `angularmovement` shadow `movement`) depending on
 /// declaration order.
+/// The `exponent` (distribution bias) of a named initializer, or 1.0 (uniform).
+fn initializer_exponent(initializers: &[Initializer], name: &str) -> f32 {
+    initializers
+        .iter()
+        .find(|i| i.name == name)
+        .and_then(|i| i.exponent)
+        .map(|e| e as f32)
+        .filter(|e| *e > 0.0)
+        .unwrap_or(1.0)
+}
+
 fn scalar_range_from_initializers(
     initializers: &[Initializer],
     name: &str,

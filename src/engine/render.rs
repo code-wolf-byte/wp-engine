@@ -278,6 +278,13 @@ impl ResolvedScene {
             if !obj.is_visible() && obj.visible_script().is_none() {
                 continue;
             }
+            if obj.light.is_some() && obj.image.is_none() {
+                if let Some(mut layer) = light_layer_from_object(obj) {
+                    layer.order_index = obj_index;
+                    layers.push(layer);
+                }
+                continue;
+            }
             if obj.particle.is_some() {
                 if let Some(mut pl) = particle_layer_from_object(obj, Some(dir), None) {
                     pl.order_index = obj_index;
@@ -349,6 +356,13 @@ impl ResolvedScene {
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
             if !obj.is_visible() && obj.visible_script().is_none() {
+                continue;
+            }
+            if obj.light.is_some() && obj.image.is_none() {
+                if let Some(mut layer) = light_layer_from_object(obj) {
+                    layer.order_index = obj_index;
+                    layers.push(layer);
+                }
                 continue;
             }
             if obj.particle.is_some() {
@@ -424,6 +438,13 @@ impl ResolvedScene {
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
             if !obj.is_visible() && obj.visible_script().is_none() {
+                continue;
+            }
+            if obj.light.is_some() && obj.image.is_none() {
+                if let Some(mut layer) = light_layer_from_object(obj) {
+                    layer.order_index = obj_index;
+                    layers.push(layer);
+                }
                 continue;
             }
             if obj.particle.is_some() {
@@ -810,7 +831,16 @@ fn layer_from_object(
         brightness,
         copybackground: obj.copybackground,
         no_interpolation: loaded.no_interpolation,
-        clamp_uvs: loaded.clamp_uvs,
+        // Object-level `clampuvs` overrides the .tex ClampUVs flag when set.
+        clamp_uvs: loaded.clamp_uvs
+            || obj
+                .clampuvs
+                .as_ref()
+                .and_then(|v| {
+                    v.as_bool()
+                        .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+                })
+                .unwrap_or(false),
         puppet: loaded.puppet,
         video: loaded.video,
         text_dynamic: None,
@@ -1094,7 +1124,76 @@ fn text_layer_from_object(
     }
     .clamp(1.0, 1024.0);
     let font_data = super::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
+    // Word-wrap to `maxwidth` (scene px == bitmap px at our raster resolution)
+    // and cap at `maxrows`, if authored.
+    let text_str = match obj
+        .maxwidth
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .filter(|w| *w > 0.0)
+    {
+        Some(mw) => {
+            let rows = obj
+                .maxrows
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_f32)
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            super::text::wrap_text(&font_data, &text_str, raster_px, mw, rows)
+        }
+        None => text_str,
+    };
     let image = super::text::rasterize(&font_data, &text_str, raster_px)?;
+
+    // Opaque background box: bake the text color + bg color + padding into the
+    // bitmap and neutralize the layer tint (color set to white below). `pad`
+    // is authored in scene px, which maps 1:1 to bitmap px (we raster at the
+    // box height). Off by default — `opaquebackground` is usually false.
+    let opaque_bg = obj
+        .opaquebackground
+        .as_ref()
+        .and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+        })
+        .unwrap_or(false);
+    let (image, bg_baked) = if opaque_bg {
+        let text_color = obj
+            .color
+            .as_ref()
+            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+            .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let bright = obj
+            .backgroundbrightness
+            .as_ref()
+            .and_then(crate::engine::scene::parse_value_f32)
+            .unwrap_or(1.0);
+        let bg = obj
+            .backgroundcolor
+            .as_ref()
+            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+            .map(|c| {
+                [
+                    c[0] as f32 * bright,
+                    c[1] as f32 * bright,
+                    c[2] as f32 * bright,
+                ]
+            })
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let pad = obj
+            .padding
+            .as_ref()
+            .and_then(crate::engine::scene::parse_value_f32)
+            .unwrap_or(0.0)
+            .max(0.0) as u32;
+        (
+            super::text::with_background(&image, text_color, bg, pad),
+            true,
+        )
+    } else {
+        (image, false)
+    };
 
     let halign = obj
         .horizontalalign
@@ -1105,6 +1204,10 @@ fn text_layer_from_object(
     let combined = format!("{halign} {valign}");
 
     let mut layer = layer_from_object(obj, LoadedImage::single(image), Some(&combined));
+    if bg_baked {
+        // Text + bg colors are baked into the bitmap; don't tint it again.
+        layer.color = [1.0, 1.0, 1.0];
+    }
     if let Some(script) = script {
         layer.text_dynamic = Some(TextDynamic {
             script,
@@ -1117,6 +1220,57 @@ fn text_layer_from_object(
             scale: layer.scale,
         });
     }
+    Some(layer)
+}
+
+/// A WE light object rendered as an additive radial glow — a minimal stand-in
+/// for the full lighting model. Colored by `color`, sized by `radius`, with a
+/// smooth quadratic falloff scaled by `intensity`. Additively blended so it
+/// brightens whatever is behind it (like a real light).
+fn light_layer_from_object(obj: &SceneObject) -> Option<Layer> {
+    let radius = obj
+        .radius
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .unwrap_or(256.0)
+        .max(1.0);
+    let intensity = obj
+        .intensity
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let color = obj
+        .color
+        .as_ref()
+        .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .unwrap_or([1.0, 1.0, 1.0]);
+
+    let d = (radius * 2.0).min(2048.0) as u32;
+    let mut img = RgbaImage::new(d, d);
+    let c = d as f32 / 2.0;
+    for y in 0..d {
+        for x in 0..d {
+            let dist = (((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt() / c).min(1.0);
+            let a = (1.0 - dist).powi(2) * intensity; // quadratic falloff
+            img.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (color[0] * 255.0) as u8,
+                    (color[1] * 255.0) as u8,
+                    (color[2] * 255.0) as u8,
+                    (a * 255.0) as u8,
+                ]),
+            );
+        }
+    }
+
+    let mut layer = layer_from_object(obj, LoadedImage::single(img), None);
+    // colorBlendMode 9 = Add (linear dodge) — the glow adds light.
+    layer.blend_mode = 9;
+    layer.color = [1.0, 1.0, 1.0];
     Some(layer)
 }
 

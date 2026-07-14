@@ -115,6 +115,67 @@ pub struct General {
     pub bloom_strength: Option<serde_json::Value>,
     #[serde(rename = "bloomthreshold")]
     pub bloom_threshold: Option<serde_json::Value>,
+    // HDR bloom (99/195 wallpapers). We run one SDR bloom chain, so when `hdr`
+    // is on we feed it the HDR-tuned strength/threshold instead.
+    pub hdr: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrstrength")]
+    pub bloom_hdr_strength: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrthreshold")]
+    pub bloom_hdr_threshold: Option<serde_json::Value>,
+    // Camera zoom (105/195) — scales the whole scene about its center.
+    pub zoom: Option<serde_json::Value>,
+    // Whether the frame is cleared to clearcolor each frame (else transparent).
+    pub clearenabled: Option<serde_json::Value>,
+    // Scene ambient / sky lighting — applied as a global additive/multiplicative
+    // tint (a minimal lighting approximation, no per-normal shading).
+    pub ambientcolor: Option<serde_json::Value>,
+    pub skylightcolor: Option<serde_json::Value>,
+    // Bloom color tint.
+    pub bloomtint: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrfeather")]
+    pub bloom_hdr_feather: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrscatter")]
+    pub bloom_hdr_scatter: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdriterations")]
+    pub bloom_hdr_iterations: Option<serde_json::Value>,
+    // Global particle forces (12/195).
+    pub winddirection: Option<serde_json::Value>,
+    pub windstrength: Option<serde_json::Value>,
+    pub windenabled: Option<serde_json::Value>,
+    pub gravitydirection: Option<serde_json::Value>,
+    pub gravitystrength: Option<serde_json::Value>,
+    // Per-scene FOV override (16/195).
+    pub perspectiveoverridefov: Option<serde_json::Value>,
+    // Transparency sort mode (2/195).
+    pub transparentsorting: Option<serde_json::Value>,
+}
+
+impl General {
+    /// Combined global particle acceleration in particle space (screen y-down):
+    /// `gravitydirection*gravitystrength + winddirection*windstrength`. WE's
+    /// directions are y-up, so y is negated. Returns `[0,0]` when unset.
+    pub fn particle_force(&self) -> [f32; 2] {
+        let term = |dir: &Option<serde_json::Value>, str: &Option<serde_json::Value>| {
+            let d = dir.as_ref().and_then(parse_value_vec3).unwrap_or([0.0; 3]);
+            let s = str.as_ref().and_then(parse_value_f32).unwrap_or(0.0);
+            [d[0] as f32 * s, d[1] as f32 * s]
+        };
+        let wind_on = self
+            .windenabled
+            .as_ref()
+            .and_then(|v| {
+                v.as_bool()
+                    .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+            })
+            .unwrap_or(true);
+        let g = term(&self.gravitydirection, &self.gravitystrength);
+        let w = if wind_on {
+            term(&self.winddirection, &self.windstrength)
+        } else {
+            [0.0, 0.0]
+        };
+        [g[0] + w[0], -(g[1] + w[1])]
+    }
 }
 
 /// A single object/layer in the scene.
@@ -179,6 +240,43 @@ pub struct SceneObject {
     pub parent: Option<serde_json::Value>,
     #[serde(default)]
     pub dependencies: Vec<serde_json::Value>,
+    // Text background box (rendered behind the glyphs when opaquebackground).
+    #[serde(default)]
+    pub opaquebackground: Option<serde_json::Value>,
+    #[serde(default)]
+    pub backgroundcolor: Option<serde_json::Value>,
+    #[serde(default)]
+    pub backgroundbrightness: Option<serde_json::Value>,
+    #[serde(default)]
+    pub padding: Option<serde_json::Value>,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    // Text wrapping / row limits.
+    #[serde(default)]
+    pub maxwidth: Option<serde_json::Value>,
+    #[serde(default)]
+    pub maxrows: Option<serde_json::Value>,
+    #[serde(default)]
+    pub blockalign: Option<String>,
+    // Sound objects (audio playback).
+    #[serde(default)]
+    pub sound: Option<serde_json::Value>,
+    #[serde(default)]
+    pub volume: Option<serde_json::Value>,
+    #[serde(default)]
+    pub playbackmode: Option<String>,
+    #[serde(default)]
+    pub startsilent: Option<serde_json::Value>,
+    // Object-level texture clamp override.
+    #[serde(default)]
+    pub clampuvs: Option<serde_json::Value>,
+    // Light objects (radial glow approximation).
+    #[serde(default)]
+    pub light: Option<serde_json::Value>,
+    #[serde(default)]
+    pub radius: Option<serde_json::Value>,
+    #[serde(default)]
+    pub intensity: Option<serde_json::Value>,
 }
 
 impl SceneObject {

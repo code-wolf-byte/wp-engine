@@ -1416,6 +1416,9 @@ pub struct GpuSceneInstance {
     /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
     /// once per frame into the renderer's `audio_buf`.
     audio_capture: Option<crate::engine::audio::AudioCapture>,
+    /// Live playback streams for `sound` objects; kept alive for the scene's
+    /// lifetime (dropping stops the audio).
+    _sounds: Vec<crate::engine::audio::SoundPlayback>,
     /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
@@ -1472,21 +1475,70 @@ impl GpuSceneInstance {
                 }
             })
             .unwrap_or([0.0, 0.0, 0.0]);
+        // `clearenabled: false` → don't paint the clear color (the surface is
+        // opaque, so this reads as black behind any gaps in the scene).
+        let mut clear_color = if general
+            .and_then(|g| g.clearenabled.as_ref())
+            .and_then(parse_value_bool)
+            == Some(false)
+        {
+            [0.0, 0.0, 0.0]
+        } else {
+            clear_color
+        };
+        // `ambientcolor` tints the scene's ambient/background (a minimal use of
+        // the field — full ambient lighting needs a lit-material pipeline).
+        if let Some(amb) = general
+            .and_then(|g| g.ambientcolor.as_ref())
+            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+        {
+            for i in 0..3 {
+                clear_color[i] *= amb[i];
+            }
+        }
 
+        // HDR wallpapers author a separate `bloomhdr*` set; with a single SDR
+        // bloom chain we pick that set when `hdr` is on, else the SDR one.
+        let hdr = general
+            .and_then(|g| g.hdr.as_ref())
+            .and_then(parse_value_bool)
+            .unwrap_or(false);
         let bloom = BloomSettings {
-            enabled: general
-                .and_then(|g| g.bloom.as_ref())
-                .and_then(parse_value_bool)
-                .unwrap_or(false),
+            enabled: hdr
+                || general
+                    .and_then(|g| g.bloom.as_ref())
+                    .and_then(parse_value_bool)
+                    .unwrap_or(false),
             strength: general
-                .and_then(|g| g.bloom_strength.as_ref())
+                .and_then(|g| {
+                    if hdr {
+                        g.bloom_hdr_strength.as_ref()
+                    } else {
+                        g.bloom_strength.as_ref()
+                    }
+                })
                 .and_then(parse_value_f32)
                 .unwrap_or(1.0),
             threshold: general
-                .and_then(|g| g.bloom_threshold.as_ref())
+                .and_then(|g| {
+                    if hdr {
+                        g.bloom_hdr_threshold.as_ref()
+                    } else {
+                        g.bloom_threshold.as_ref()
+                    }
+                })
                 .and_then(parse_value_f32)
                 .unwrap_or(0.5),
         };
+
+        // `general.zoom` (default 1.0) — a scene-wide scale about the center.
+        let zoom = general
+            .and_then(|g| g.zoom.as_ref())
+            .and_then(parse_value_f32)
+            .filter(|z| *z > 0.0)
+            .unwrap_or(1.0);
+        // Scene-global particle force (gravity + wind).
+        let scene_force = general.map(|g| g.particle_force()).unwrap_or([0.0, 0.0]);
 
         let dynamics = CameraDynamics::from_scene(&resolved.scene);
 
@@ -1574,11 +1626,14 @@ impl GpuSceneInstance {
                         (rect, 0.0, cam.view_depth(center))
                     }
                 } else {
+                    // `general.zoom` scales the whole scene about its center;
+                    // NDC (0,0) is the scene center, so a uniform rect scale
+                    // does it (center and half-extent both × zoom).
                     let rect = [
-                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32,
-                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32,
-                        (size_px[0] / w as f64) as f32,
-                        (size_px[1] / h as f64) as f32,
+                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32 * zoom,
+                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32 * zoom,
+                        (size_px[0] / w as f64) as f32 * zoom,
+                        (size_px[1] / h as f64) as f32 * zoom,
                     ];
                     (rect, l.angle, 0.0)
                 };
@@ -1619,12 +1674,63 @@ impl GpuSceneInstance {
 
         // Start desktop-audio capture only for scenes that actually react to
         // it (avoids opening a capture device for every wallpaper).
-        let uses_audio = effect_runtimes.iter().flatten().any(|r| r.uses_audio);
+        // Start capture for audio shaders OR audio-reactive particle emitters.
+        let particles_use_audio = resolved.particle_layers.iter().any(|pl| {
+            pl.config
+                .emitter
+                .iter()
+                .any(|e| e.audioprocessingmode.is_some() || e.audioprocessingbounds.is_some())
+        });
+        let uses_audio =
+            particles_use_audio || effect_runtimes.iter().flatten().any(|r| r.uses_audio);
         let audio_capture = if uses_audio {
             crate::engine::audio::AudioCapture::start()
         } else {
             None
         };
+
+        // Sound objects: decode + play each file (looped unless startsilent).
+        let mut sounds = Vec::new();
+        for obj in &resolved.scene.objects {
+            let Some(sound) = obj.sound.as_ref() else {
+                continue;
+            };
+            if obj
+                .startsilent
+                .as_ref()
+                .and_then(|v| {
+                    v.as_bool()
+                        .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+                })
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let volume = obj
+                .volume
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_f32)
+                .unwrap_or(1.0);
+            let looping = obj.playbackmode.as_deref() != Some("nointerrupt")
+                && obj.playbackmode.as_deref() != Some("once");
+            // `sound` is an array of file paths; play the first that decodes.
+            let files: Vec<String> = match sound {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                serde_json::Value::String(s) => vec![s.clone()],
+                _ => Vec::new(),
+            };
+            for f in files {
+                if let Some(p) =
+                    crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping)
+                {
+                    sounds.push(p);
+                    break;
+                }
+            }
+        }
 
         // Allocate all persistent render targets up front so the render loop
         // can look them up immutably. Per-layer effect-chain FBOs (ping-pong
@@ -1685,6 +1791,7 @@ impl GpuSceneInstance {
                     spawn_center,
                     pl.overrides.as_ref(),
                 );
+                system.set_scene_force(scene_force);
                 if let Some(sprite) = &pl.sprite_texture {
                     system.set_sprite_frames(sprite.frames.len(), sprite.duration);
                 }
@@ -1803,6 +1910,7 @@ impl GpuSceneInstance {
             mouse_norm: [0.5, 0.5],
             script_ctx: crate::engine::script::ScriptContext::new(),
             audio_capture,
+            _sounds: sounds,
             perspective: camera3d.is_some(),
         })
     }
@@ -1944,12 +2052,19 @@ impl GpuSceneInstance {
             }
         }
 
-        // Refresh the g_AudioSpectrum* UBO from the latest captured window.
+        // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
+        // drive audio-reactive particle emitters from the overall loudness.
         if let Some(cap) = &self.audio_capture {
-            let bytes = cap.spectrum().to_uniform_bytes();
-            self.renderer
-                .queue
-                .write_buffer(&self.renderer.audio_buf, 0, &bytes);
+            let spectrum = cap.spectrum();
+            self.renderer.queue.write_buffer(
+                &self.renderer.audio_buf,
+                0,
+                &spectrum.to_uniform_bytes(),
+            );
+            let level = spectrum.average_level();
+            for system in &mut self.particle_systems {
+                system.set_audio_level(level);
+            }
         }
 
         let target_view = self.target.create_view(&Default::default());

@@ -62,6 +62,13 @@ impl Default for AudioSpectrum {
 pub const UNIFORM_BYTES: usize = (BANDS_16 * 2 + BANDS_32 * 2 + BANDS_64 * 2) * 4;
 
 impl AudioSpectrum {
+    /// Overall loudness in ~[0,1+]: the mean of the 64-band L/R magnitudes.
+    /// Drives audio-reactive particle emitters.
+    pub fn average_level(&self) -> f32 {
+        let sum: f32 = self.s64_left.iter().chain(&self.s64_right).sum();
+        sum / (BANDS_64 as f32 * 2.0)
+    }
+
     /// Serialize into the std430 layout the emitted `WEAudio` block expects:
     /// arrays in canonical order (16L,16R,32L,32R,64L,64R), tightly packed
     /// (`float[N]` has a 4-byte stride in std430 — no vec4 padding).
@@ -249,6 +256,131 @@ fn pick_input_device(host: &cpal::Host) -> Option<cpal::Device> {
         }
     }
     host.default_input_device()
+}
+
+// ── Sound-object playback ─────────────────────────────────────────────────────
+
+/// Plays a WE `sound` object's audio file (decoded via ffmpeg) out the default
+/// output device, optionally looped, at a fixed volume. One stream per sound;
+/// the OS mixer sums them. Dropping it stops playback.
+pub struct SoundPlayback {
+    _stream: cpal::Stream,
+}
+
+impl SoundPlayback {
+    /// Decode `path` and start playback. Returns `None` if there's no output
+    /// device or the file can't be decoded — sound is always best-effort.
+    pub fn start(path: &std::path::Path, volume: f32, looping: bool) -> Option<Self> {
+        let host = cpal::default_host();
+        let device = host.default_output_device()?;
+        let config = device.default_output_config().ok()?;
+        let out_rate = config.sample_rate().0;
+        let out_ch = config.channels() as usize;
+
+        let samples = decode_audio_file(path, out_rate, out_ch)?;
+        if samples.is_empty() {
+            return None;
+        }
+        let vol = volume.clamp(0.0, 4.0);
+        let mut pos = 0usize;
+        let stream = device
+            .build_output_stream(
+                &config.into(),
+                move |out: &mut [f32], _| {
+                    for s in out.iter_mut() {
+                        if pos >= samples.len() {
+                            if looping {
+                                pos = 0;
+                            } else {
+                                *s = 0.0;
+                                continue;
+                            }
+                        }
+                        *s = samples.get(pos).copied().unwrap_or(0.0) * vol;
+                        pos += 1;
+                    }
+                },
+                |e| tracing::warn!(target: "audio", "sound stream error: {e}"),
+                None,
+            )
+            .ok()?;
+        stream.play().ok()?;
+        tracing::info!(target: "audio", "playing '{}' (vol {vol:.2}, loop {looping})", path.display());
+        Some(Self { _stream: stream })
+    }
+}
+
+/// Decode an audio file to interleaved f32 samples at `out_rate`/`out_ch` using
+/// ffmpeg's decoder + software resampler. Returns `None` on any failure.
+fn decode_audio_file(path: &std::path::Path, out_rate: u32, out_ch: usize) -> Option<Vec<f32>> {
+    use ffmpeg_next::util::format::sample::{Sample, Type};
+    ffmpeg_next::init().ok()?;
+    let mut ictx = ffmpeg_next::format::input(&path).ok()?;
+    let stream = ictx.streams().best(ffmpeg_next::media::Type::Audio)?;
+    let stream_index = stream.index();
+    let mut decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+        .ok()?
+        .decoder()
+        .audio()
+        .ok()?;
+
+    let out_layout = if out_ch >= 2 {
+        ffmpeg_next::util::channel_layout::ChannelLayout::STEREO
+    } else {
+        ffmpeg_next::util::channel_layout::ChannelLayout::MONO
+    };
+    let in_layout = {
+        let l = decoder.channel_layout();
+        if l.is_empty() {
+            // Some decoders don't set a layout until the first frame; guess.
+            if decoder.channels() >= 2 {
+                ffmpeg_next::util::channel_layout::ChannelLayout::STEREO
+            } else {
+                ffmpeg_next::util::channel_layout::ChannelLayout::MONO
+            }
+        } else {
+            l
+        }
+    };
+    let mut resampler = ffmpeg_next::software::resampling::Context::get(
+        decoder.format(),
+        in_layout,
+        decoder.rate(),
+        Sample::F32(Type::Packed),
+        out_layout,
+        out_rate,
+    )
+    .ok()?;
+
+    let mut out = Vec::new();
+    let mut drain = |resampler: &mut ffmpeg_next::software::resampling::Context,
+                     frame: &ffmpeg_next::frame::Audio,
+                     out: &mut Vec<f32>| {
+        let mut resampled = ffmpeg_next::frame::Audio::empty();
+        if resampler.run(frame, &mut resampled).is_ok() {
+            let n = resampled.samples() * out_ch;
+            let data: &[f32] = bytemuck::cast_slice(resampled.data(0));
+            out.extend_from_slice(&data[..n.min(data.len())]);
+        }
+    };
+    for (s, packet) in ictx.packets() {
+        if s.index() != stream_index {
+            continue;
+        }
+        if decoder.send_packet(&packet).is_err() {
+            continue;
+        }
+        let mut frame = ffmpeg_next::frame::Audio::empty();
+        while decoder.receive_frame(&mut frame).is_ok() {
+            drain(&mut resampler, &frame, &mut out);
+        }
+    }
+    let _ = decoder.send_eof();
+    let mut frame = ffmpeg_next::frame::Audio::empty();
+    while decoder.receive_frame(&mut frame).is_ok() {
+        drain(&mut resampler, &frame, &mut out);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]

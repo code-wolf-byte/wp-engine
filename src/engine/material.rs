@@ -62,6 +62,15 @@ struct RawModel {
     width: Option<u32>,
     height: Option<u32>,
     puppet: Option<String>,
+    // Parsed for completeness. `cropoffset` shifts the sampled texture origin
+    // (would need per-model UV offset plumbing to apply); `instanced` is a GPU
+    // instancing hint — we draw each object normally, so it's a visual no-op.
+    #[serde(default)]
+    #[allow(dead_code)]
+    cropoffset: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    instanced: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +109,10 @@ pub struct MaterialPass {
     pub depthtest: String,
     #[serde(default = "default_depth_disabled")]
     pub depthwrite: String,
+    // Alpha-channel write mask. Parsed; the 2D compositor writes straight-alpha
+    // already, so it has no separate effect here.
+    #[serde(default)]
+    pub alphawriting: Option<serde_json::Value>,
     pub shader: Option<String>,
     #[serde(default, deserialize_with = "deserialize_texture_map")]
     pub textures: TextureMap,
