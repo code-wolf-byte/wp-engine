@@ -332,6 +332,20 @@ pub struct Operator {
     pub ringpulldistance: Option<f64>,
     #[serde(default)]
     pub ringpullforce: Option<f64>,
+    /// `remapvalue` (CParticle createValueRemapOperator): samples a noise
+    /// function at the particle position and remaps it into `outputrange*`,
+    /// writing the `output` channel (`velocity`/`speed`). `outputrangemin`/
+    /// `max` are `"x y z"` vec3 for velocity, scalar for speed.
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub outputrangemin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub outputrangemax: Option<serde_json::Value>,
+    #[serde(default)]
+    pub transformfunction: Option<String>,
+    #[serde(default)]
+    pub transforminputscale: Option<f64>,
 }
 
 /// Scene.json's per-instance `instanceoverride` on a particle object —
@@ -564,6 +578,8 @@ pub struct ParticleSystem {
     turbulence: Option<TurbulenceParams>,
     /// `vortex` operator parameters.
     vortex: Option<VortexParams>,
+    /// `remapvalue` operator parameters.
+    remap: Option<RemapParams>,
     /// Simulation clock (sum of `step` dts) — drives the time-scrolled
     /// noise fields, the reference's `m_time`/`currentTime`.
     time: f32,
@@ -698,6 +714,19 @@ struct VortexParams {
     ring_width: f32,
     ring_pull_distance: f32,
     ring_pull_force: f32,
+}
+
+/// `remapvalue`: a noise value at `pos*input_scale` (+time) remapped into
+/// `[out_min, out_max]` per axis, written to the `velocity` or `speed` channel.
+#[derive(Clone, Copy)]
+struct RemapParams {
+    /// 0 = write velocity vector, 1 = scale speed along current heading.
+    to_speed: bool,
+    out_min: [f32; 3],
+    out_max: [f32; 3],
+    input_scale: f32,
+    /// `fbmnoise` sums octaves; both approximated with our Perlin noise.
+    fbm: bool,
 }
 
 struct EmitterState {
@@ -1185,6 +1214,26 @@ impl ParticleSystem {
                 }
             });
 
+        let remap = config
+            .operator
+            .iter()
+            .find(|op| op.name == "remapvalue")
+            .map(|op| {
+                let range = |v: &Option<serde_json::Value>, d: f32| {
+                    v.as_ref()
+                        .and_then(value_as_vec3)
+                        .or_else(|| v.as_ref().and_then(value_as_f32).map(|s| [s, s, s]))
+                        .unwrap_or([d, d, d])
+                };
+                RemapParams {
+                    to_speed: op.output.as_deref() == Some("speed"),
+                    out_min: range(&op.outputrangemin, 0.0),
+                    out_max: range(&op.outputrangemax, 0.0),
+                    input_scale: op.transforminputscale.unwrap_or(1.0) as f32,
+                    fbm: op.transformfunction.as_deref() == Some("fbmnoise"),
+                }
+            });
+
         Self {
             particles: Vec::with_capacity(max_count),
             emitters,
@@ -1251,6 +1300,7 @@ impl ParticleSystem {
             turbulent_velocity,
             turbulence,
             vortex,
+            remap,
             time: 0.0,
             start_time: config.starttime.unwrap_or(0.0).max(0.0) as f32,
             scene_force: [0.0, 0.0],
@@ -1399,6 +1449,35 @@ impl ParticleSystem {
                         p.vx -= toward[0] * v.center_force * k;
                         p.vy -= toward[1] * v.center_force * k;
                     }
+                }
+            }
+
+            // `remapvalue`: sample a noise field at the particle position and
+            // remap it into the output range, setting velocity (or rescaling
+            // speed). fbmnoise adds a second octave.
+            if let Some(r) = self.remap {
+                let s = r.input_scale;
+                let noise = |seed: f64| -> f32 {
+                    use crate::engine::noise::perlin_noise;
+                    let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, self.time as f64);
+                    let mut n = perlin_noise(x + seed, y, t);
+                    if r.fbm {
+                        n = (n + 0.5 * perlin_noise(x * 2.0 + seed, y * 2.0, t * 2.0)) / 1.5;
+                    }
+                    ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
+                };
+                let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                if r.to_speed {
+                    let sp = lerp(r.out_min[0], r.out_max[0], noise(0.0));
+                    let mag = (p.vx * p.vx + p.vy * p.vy).sqrt();
+                    if mag > 1e-4 {
+                        let k = sp / mag;
+                        p.vx *= k;
+                        p.vy *= k;
+                    }
+                } else {
+                    p.vx = lerp(r.out_min[0], r.out_max[0], noise(0.0));
+                    p.vy = lerp(r.out_min[1], r.out_max[1], noise(13.7));
                 }
             }
 
@@ -4214,6 +4293,44 @@ mod tests {
         for _ in 0..50 {
             let s = params.sample();
             assert!((0.0..std::f32::consts::TAU).contains(&s.phase));
+        }
+    }
+
+    #[test]
+    fn remapvalue_sets_velocity_within_output_range() {
+        let json = r#"{
+            "maxcount": 20,
+            "emitter": [{"name":"boxrandom","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":100,"max":100},
+                {"id":2,"name":"sizerandom","min":10,"max":10}
+            ],
+            "operator": [
+                {"id":1,"name":"remapvalue","output":"velocity",
+                 "outputrangemin":"-100 -200 0","outputrangemax":"100 -1200 1",
+                 "transformfunction":"simplexnoise","transforminputscale":10}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).unwrap();
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        for _ in 0..10 {
+            sys.step(1.0 / 30.0);
+        }
+        assert!(!sys.particles.is_empty(), "should have spawned particles");
+        for p in &sys.particles {
+            // Velocity is set (then position-integrated) into the remapped
+            // range each frame; check it lands within bounds (+ a small margin
+            // for the integration/other operators).
+            assert!(
+                (-101.0..=101.0).contains(&p.vx),
+                "vx {} out of remapped x-range",
+                p.vx
+            );
+            assert!(
+                (-1201.0..=-199.0).contains(&p.vy),
+                "vy {} out of remapped y-range",
+                p.vy
+            );
         }
     }
 }

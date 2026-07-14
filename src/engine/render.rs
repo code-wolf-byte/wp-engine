@@ -714,9 +714,46 @@ pub(crate) fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -
 /// before calling this, rather than reading `obj.alignment` directly).
 fn layer_from_object(
     obj: &SceneObject,
-    loaded: LoadedImage,
+    mut loaded: LoadedImage,
     alignment_override: Option<&str>,
 ) -> Layer {
+    // Attach puppet `animationlayers` (blended each frame) to the fresh runtime.
+    if let (Some(rt), Some(entries)) = (
+        loaded.puppet.as_mut(),
+        obj.animationlayers.as_ref().and_then(|v| v.as_array()),
+    ) {
+        if let Some(rt) = std::sync::Arc::get_mut(rt) {
+            let n = rt.model.animations.len();
+            if n > 0 {
+                let layers: Vec<crate::engine::puppet::AnimLayer> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
+                    .map(|(i, e)| {
+                        // The `animation` id doesn't map to an MDLA index (no
+                        // ids parsed), so resolve it as an index if in range,
+                        // else by declaration order — clamped to what exists.
+                        let raw = e
+                            .get("animation")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(i as u64);
+                        let anim_idx = if (raw as usize) < n {
+                            raw as usize
+                        } else {
+                            i.min(n - 1)
+                        };
+                        crate::engine::puppet::AnimLayer {
+                            anim_idx,
+                            additive: e.get("additive").and_then(|v| v.as_bool()).unwrap_or(false),
+                            blend: e.get("blend").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                            rate: e.get("rate").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                        }
+                    })
+                    .collect();
+                rt.layers = layers;
+            }
+        }
+    }
     let parallax = obj
         .parallax_depth
         .as_ref()
@@ -1635,7 +1672,11 @@ fn apply_puppet_mesh(
     // With a skeleton + animation, frame 0 of the animation IS the
     // assembled pose (skin = worldAnim * inverse(atlas-space bind)); the
     // raw mesh alone only reproduces the packed atlas layout.
-    let runtime = crate::engine::puppet::PuppetRuntime { model, atlas };
+    let runtime = crate::engine::puppet::PuppetRuntime {
+        model,
+        atlas,
+        layers: Vec::new(),
+    };
     let assembled = if runtime.model.has_animation() {
         runtime.render_at(0.0, runtime.atlas.width(), runtime.atlas.height())
     } else {

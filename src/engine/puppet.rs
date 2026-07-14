@@ -512,6 +512,70 @@ impl PuppetModel {
         Some(PuppetPose { skin })
     }
 
+    /// Pose from blended `animationlayers` (a base override layer plus additive
+    /// deltas), each sampled at its own rate. Falls back to `None` when no
+    /// layer resolves to a real animation.
+    pub fn pose_at_layers(&self, layers: &[AnimLayer], t: f32) -> Option<PuppetPose> {
+        if layers
+            .iter()
+            .all(|l| self.animations.get(l.anim_idx).is_none())
+        {
+            return None;
+        }
+        let bind = self.bind_world_transforms();
+        let mut world: Vec<Affine> = Vec::with_capacity(self.bones.len());
+        for (b, bone) in self.bones.iter().enumerate() {
+            let local = bone_frame_affine(&self.blended_local(layers, b, t));
+            let w = match bone.parent {
+                p if p >= 0 && (p as usize) < world.len() => affine_mul(&world[p as usize], &local),
+                _ => local,
+            };
+            world.push(w);
+        }
+        let skin = bind
+            .iter()
+            .zip(&world)
+            .map(|(b, n)| affine_mul(n, &affine_invert(b)))
+            .collect();
+        Some(PuppetPose { skin })
+    }
+
+    /// Blend one bone's local TRS across the animation layers: the first
+    /// resolvable layer is the base, then each subsequent override lerps and
+    /// each additive adds its delta-from-its-own-frame-0, weighted by `blend`.
+    fn blended_local(&self, layers: &[AnimLayer], bone: usize, t: f32) -> BoneFrame {
+        let mut accum: Option<BoneFrame> = None;
+        for layer in layers {
+            let Some(anim) = self.animations.get(layer.anim_idx) else {
+                continue;
+            };
+            let track = anim.tracks.get(bone).map(Vec::as_slice).unwrap_or(&[]);
+            let frame = (t * layer.rate * anim.fps).rem_euclid(anim.frame_count as f32);
+            let cur = sample_track(track, frame);
+            match &mut accum {
+                None => accum = Some(cur),
+                Some(a) => {
+                    let w = layer.blend.clamp(0.0, 1.0);
+                    if layer.additive {
+                        let rest = sample_track(track, 0.0);
+                        for i in 0..3 {
+                            a.position[i] += (cur.position[i] - rest.position[i]) * w;
+                            a.angles[i] += (cur.angles[i] - rest.angles[i]) * w;
+                            a.scale[i] += (cur.scale[i] - rest.scale[i]) * w;
+                        }
+                    } else {
+                        for i in 0..3 {
+                            a.position[i] += (cur.position[i] - a.position[i]) * w;
+                            a.angles[i] += (cur.angles[i] - a.angles[i]) * w;
+                            a.scale[i] += (cur.scale[i] - a.scale[i]) * w;
+                        }
+                    }
+                }
+            }
+        }
+        accum.unwrap_or(BoneFrame::IDENTITY)
+    }
+
     /// Composed atlas-space bind transforms (see `PuppetBone::bind_local`).
     fn bind_world_transforms(&self) -> Vec<Affine> {
         let mut world: Vec<Affine> = Vec::with_capacity(self.bones.len());
@@ -570,13 +634,34 @@ impl PuppetModel {
 pub struct PuppetRuntime {
     pub model: PuppetModel,
     pub atlas: RgbaImage,
+    /// Scene `animationlayers` blended each frame. Empty = play animation 0.
+    pub layers: Vec<AnimLayer>,
+}
+
+/// One entry of a scene object's `animationlayers`: which model animation to
+/// play, how to blend it, its weight, and its own playback rate.
+#[derive(Clone, Copy)]
+pub struct AnimLayer {
+    pub anim_idx: usize,
+    /// `additive`: add this animation's delta-from-its-rest instead of
+    /// overriding (blinks/expressions layered on a base idle).
+    pub additive: bool,
+    pub blend: f32,
+    pub rate: f32,
 }
 
 impl PuppetRuntime {
     /// Rasterize the puppet at time `t` (seconds into the looped first
     /// animation) at `width` x `height`.
     pub fn render_at(&self, t: f32, width: u32, height: u32) -> RgbaImage {
-        match self.model.pose_at(0, t) {
+        let pose = if self.layers.is_empty() {
+            self.model.pose_at(0, t)
+        } else {
+            self.model
+                .pose_at_layers(&self.layers, t)
+                .or_else(|| self.model.pose_at(0, t))
+        };
+        match pose {
             Some(pose) => {
                 let skinned = self.model.skinned_positions(&pose);
                 rasterize_positions(&self.model.mesh, &skinned, &self.atlas, width, height)
@@ -848,6 +933,58 @@ mod tests {
         let skinned = model.skinned_positions(&pose);
         assert!((skinned[0][0] - 50.0).abs() < 1e-3, "{skinned:?}");
         assert!((skinned[0][1] - 20.0).abs() < 1e-3);
+    }
+
+    /// An override base layer plus an additive layer compose: base motion +
+    /// the additive animation's delta-from-its-frame-0.
+    #[test]
+    fn animation_layers_blend_override_plus_additive() {
+        let mut base = vec![BoneFrame::IDENTITY; 3]; // anim 0: +40 x
+        base[1].position = [40.0, 0.0, 0.0];
+        base[2].position = [40.0, 0.0, 0.0];
+        let mut add = vec![BoneFrame::IDENTITY; 3]; // anim 1: +60 y delta
+        add[1].position = [0.0, 60.0, 0.0];
+        add[2].position = [0.0, 60.0, 0.0];
+        let anim = |name: &str, track: Vec<BoneFrame>| PuppetAnimation {
+            name: name.into(),
+            mode: "loop".into(),
+            fps: 1.0,
+            frame_count: 2,
+            tracks: vec![track],
+        };
+        let model = PuppetModel {
+            mesh: PuppetMesh {
+                positions: vec![[10.0, 20.0]],
+                uvs: vec![[0.0, 0.0]],
+                indices: vec![],
+                bone_indices: vec![[0, 0, 0, 0]],
+                weights: vec![[1.0, 0.0, 0.0, 0.0]],
+            },
+            bones: vec![PuppetBone {
+                parent: -1,
+                bind_local: AFFINE_IDENTITY,
+            }],
+            animations: vec![anim("base", base), anim("add", add)],
+        };
+        let layers = [
+            AnimLayer {
+                anim_idx: 0,
+                additive: false,
+                blend: 1.0,
+                rate: 1.0,
+            },
+            AnimLayer {
+                anim_idx: 1,
+                additive: true,
+                blend: 1.0,
+                rate: 1.0,
+            },
+        ];
+        // t=1s: base local [40,0] + additive delta [0,60] = [40,60].
+        let pose = model.pose_at_layers(&layers, 1.0).unwrap();
+        let skinned = model.skinned_positions(&pose);
+        assert!((skinned[0][0] - 50.0).abs() < 1e-3, "{skinned:?}");
+        assert!((skinned[0][1] - 80.0).abs() < 1e-3, "{skinned:?}");
     }
 
     /// Child bones must inherit their parent's animated transform.

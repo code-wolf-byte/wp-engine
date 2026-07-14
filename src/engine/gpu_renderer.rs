@@ -1711,8 +1711,8 @@ impl GpuSceneInstance {
                 .as_ref()
                 .and_then(crate::engine::scene::parse_value_f32)
                 .unwrap_or(1.0);
-            let looping = obj.playbackmode.as_deref() != Some("nointerrupt")
-                && obj.playbackmode.as_deref() != Some("once");
+            let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
+            let looping = mode != Some("nointerrupt") && mode != Some("once");
             // `sound` is an array of file paths; play the first that decodes.
             let files: Vec<String> = match sound {
                 serde_json::Value::Array(a) => a

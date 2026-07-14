@@ -250,21 +250,21 @@ pub struct SceneObject {
     #[serde(default)]
     pub padding: Option<serde_json::Value>,
     #[serde(default)]
-    pub anchor: Option<String>,
+    pub anchor: Option<serde_json::Value>,
     // Text wrapping / row limits.
     #[serde(default)]
     pub maxwidth: Option<serde_json::Value>,
     #[serde(default)]
     pub maxrows: Option<serde_json::Value>,
     #[serde(default)]
-    pub blockalign: Option<String>,
+    pub blockalign: Option<serde_json::Value>,
     // Sound objects (audio playback).
     #[serde(default)]
     pub sound: Option<serde_json::Value>,
     #[serde(default)]
     pub volume: Option<serde_json::Value>,
     #[serde(default)]
-    pub playbackmode: Option<String>,
+    pub playbackmode: Option<serde_json::Value>,
     #[serde(default)]
     pub startsilent: Option<serde_json::Value>,
     // Object-level texture clamp override.
@@ -277,6 +277,9 @@ pub struct SceneObject {
     pub radius: Option<serde_json::Value>,
     #[serde(default)]
     pub intensity: Option<serde_json::Value>,
+    // Puppet animation layers (blended each frame).
+    #[serde(default)]
+    pub animationlayers: Option<serde_json::Value>,
 }
 
 impl SceneObject {
