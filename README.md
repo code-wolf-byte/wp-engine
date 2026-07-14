@@ -245,6 +245,22 @@ Debugging aids:
 - `WP_ENGINE_SKIP_EFFECTS=name1,name2` — disable specific effects
 - `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
 
+## Building
+
+Two native libraries must be installed first — `cargo` links against them, it
+can't fetch them like a crate:
+
+- **shaderc** — GLSL→SPIR-V for the shader translation layer.
+  - Linux: `apt install libshaderc-dev` (or `pacman -S shaderc`). Found
+    automatically on the default search path.
+  - macOS: `brew install shaderc`. Homebrew's prefix isn't on `shaderc-sys`'s
+    search path, so point the build at it with `export
+    SHADERC_LIB_DIR=/opt/homebrew/lib`, or add it to a local
+    `.cargo/config.toml` `[env]` block. Keep that file out of version control —
+    a committed global path would break Linux builds.
+- **FFmpeg** — video-wallpaper decoding: `apt install ffmpeg` / `brew install
+  ffmpeg`.
+
 ## Development Checks
 
 Useful commands:
