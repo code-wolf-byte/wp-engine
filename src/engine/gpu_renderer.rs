@@ -1486,16 +1486,11 @@ impl GpuSceneInstance {
         } else {
             clear_color
         };
-        // `ambientcolor` tints the scene's ambient/background (a minimal use of
-        // the field — full ambient lighting needs a lit-material pipeline).
-        if let Some(amb) = general
-            .and_then(|g| g.ambientcolor.as_ref())
-            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
-        {
-            for i in 0..3 {
-                clear_color[i] *= amb[i];
-            }
-        }
+        // NOTE: `ambientcolor`/`skylightcolor` are inputs to LIT materials, not
+        // a global tint. The whole corpus is unlit (0 shaders use LightingV1)
+        // and these default to "0.3 0.3 0.3" on 195/197 scenes, so applying
+        // them globally would darken every scene to 30%. They stay unused
+        // (parsed only) — the visible lighting is the light-object glow.
 
         // HDR wallpapers author a separate `bloomhdr*` set; with a single SDR
         // bloom chain we pick that set when `hdr` is on, else the SDR one.
