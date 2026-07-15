@@ -2002,10 +2002,15 @@ impl GpuSceneInstance {
 
         // Static 3D meshes: upload geometry + bake each MVP. Only reachable
         // when the scene has a perspective camera to draw them through.
+        // Draw only meshes whose name contains this — the way to tell "not
+        // drawn" apart from "drawn but occluded" in a scene the camera sits
+        // inside of (same role as WP_DEBUG_DUMP_FRAME).
+        let mesh_filter = std::env::var("WP_MESH_FILTER").ok();
         let mesh3d: Vec<Mesh3dGpu> = match &camera3d {
             Some(cam) => resolved
                 .mesh3d_layers
                 .iter()
+                .filter(|m| mesh_filter.as_ref().is_none_or(|f| m.name.contains(f.as_str())))
                 .map(|m| Self::build_mesh3d(&renderer, cam, m))
                 .collect(),
             None => Vec::new(),
