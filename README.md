@@ -238,6 +238,11 @@ Still pending:
 - audio-reactive uniforms (FFT), sound playback
 - JavaScript scene scripting (current evaluator handles simple `update()` returns)
 - web (CEF) wallpapers, MPRIS media integration, X11 backend
+- **screen-space backdrop capture** for refraction/distortion effects
+  (waterripple/waterflow): their hidden `g_Texture0` is meant to sample the scene
+  behind the layer, but we default it to the layer's own base texture, so water
+  effects distort themselves. Currently softened with a brightness band-aid — see
+  PROGRESS.md "Ripple / water refraction".
 
 Debugging aids:
 

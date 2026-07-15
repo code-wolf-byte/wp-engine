@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use image::RgbaImage;
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::particle;
@@ -314,6 +315,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
         Ok(Self {
             width,
             height,
@@ -388,6 +390,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
         Ok(Self {
             width,
             height,
@@ -459,6 +462,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
         Ok(Self {
             width,
             height,
@@ -502,8 +506,10 @@ impl ResolvedScene {
                 // empty, freshly-spawned system.
                 DrawItem::Particle(i) => {
                     let pl = &self.particle_layers[i];
-                    let spawn_center =
-                        [pl.origin[0] as f32, self.height as f32 - pl.origin[1] as f32];
+                    let spawn_center = [
+                        pl.origin[0] as f32,
+                        self.height as f32 - pl.origin[1] as f32,
+                    ];
                     let mut system = particle::ParticleSystem::from_config(
                         &pl.config,
                         spawn_center,
@@ -593,12 +599,8 @@ impl ResolvedScene {
                 dst[1] as f32 / 255.0,
                 dst[2] as f32 / 255.0,
             ];
-            let out = crate::engine::blend::apply_blending(
-                layer.blend_mode,
-                dest_rgb,
-                src_rgb,
-                src_a,
-            );
+            let out =
+                crate::engine::blend::apply_blending(layer.blend_mode, dest_rgb, src_rgb, src_a);
             dst[0] = (out[0].clamp(0.0, 1.0) * 255.0) as u8;
             dst[1] = (out[1].clamp(0.0, 1.0) * 255.0) as u8;
             dst[2] = (out[2].clamp(0.0, 1.0) * 255.0) as u8;
@@ -618,8 +620,7 @@ impl ResolvedScene {
             // `resized` image (nearest-neighbor).
             let ccx = px as f64 + draw_w as f64 / 2.0;
             let ccy = py as f64 + draw_h as f64 / 2.0;
-            let half_diag =
-                ((draw_w as f64 / 2.0).powi(2) + (draw_h as f64 / 2.0).powi(2)).sqrt();
+            let half_diag = ((draw_w as f64 / 2.0).powi(2) + (draw_h as f64 / 2.0).powi(2)).sqrt();
             let (sin_a, cos_a) = (layer.angle as f64).sin_cos();
             let x0 = ((ccx - half_diag).floor() as i64).max(0);
             let x1 = ((ccx + half_diag).ceil() as i64).min(cw);
@@ -680,6 +681,15 @@ pub(crate) fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -
 /// `alignment_override`, when given, replaces `obj.alignment` (text objects
 /// combine separate `horizontalalign`/`verticalalign` fields into one string
 /// before calling this, rather than reading `obj.alignment` directly).
+/// Brightness multiplier for additive (colorBlendMode 9) image layers — see the
+/// call site. Default 0.55; override live with `WP_ENGINE_ADDITIVE_BRIGHTNESS`.
+fn additive_brightness_scale() -> f32 {
+    std::env::var("WP_ENGINE_ADDITIVE_BRIGHTNESS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.55)
+}
+
 fn layer_from_object(
     obj: &SceneObject,
     loaded: LoadedImage,
@@ -710,7 +720,10 @@ fn layer_from_object(
         None => [1.0, 1.0, 1.0],
     };
 
-    let alpha_animated = obj.alpha.as_ref().map(crate::engine::model::json_to_animated);
+    let alpha_animated = obj
+        .alpha
+        .as_ref()
+        .map(crate::engine::model::json_to_animated);
     let alpha = alpha_animated
         .as_ref()
         .and_then(|v| v.as_float())
@@ -730,6 +743,19 @@ fn layer_from_object(
         .map(crate::engine::model::json_to_animated)
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
+    // ponytail: additive (colorBlendMode 9) image planes with a near-white base
+    // (e.g. LonelyCat's water-ripple layer) blow out to a flat white disc,
+    // because our water effects refract the layer's *own* bright base instead of
+    // the real backdrop (backdrop capture is unimplemented — see PROGRESS.md).
+    // Until that lands, scale additive layers down so the ripple structure stays
+    // visible. Ceiling: this dims *every* additive image layer, not just ripples;
+    // remove once screen-space backdrop capture exists. Tunable live via
+    // WP_ENGINE_ADDITIVE_BRIGHTNESS (default 0.55).
+    let brightness = if obj.color_blend_mode == 9 {
+        brightness * additive_brightness_scale()
+    } else {
+        brightness
+    };
 
     // Alignment shifts the object so its origin becomes an edge rather than
     // its center (CImage.cpp lines 242-256), expressed here as an offset
@@ -820,7 +846,9 @@ fn particle_layer_from_object(
     };
     let json = read_particle_json(dir, pkg, particle_ref)?;
     let mut config: particle::ParticleConfig = serde_json::from_str(&json)
-        .inspect_err(|e| tracing::warn!(target: "particle", "failed to parse '{particle_ref}': {e}"))
+        .inspect_err(
+            |e| tracing::warn!(target: "particle", "failed to parse '{particle_ref}': {e}"),
+        )
         .ok()?;
     let overrides: Option<particle::InstanceOverride> = obj
         .instanceoverride
@@ -856,7 +884,9 @@ fn particle_layer_from_object(
                 continue;
             };
             while config.controlpoint.len() <= n {
-                config.controlpoint.push(particle::ControlPointConfig::default());
+                config
+                    .controlpoint
+                    .push(particle::ControlPointConfig::default());
             }
             config.controlpoint[n].offset = Some(value.clone());
             config.controlpoint[n].flags = Some(config.controlpoint[n].flags.unwrap_or(0) | 2);
@@ -873,7 +903,10 @@ fn particle_layer_from_object(
                 origin[1] as f32 - world[1],
                 world[2],
             ];
-            cp.offset = Some(serde_json::json!(format!("{} {} {}", rel[0], rel[1], rel[2])));
+            cp.offset = Some(serde_json::json!(format!(
+                "{} {} {}",
+                rel[0], rel[1], rel[2]
+            )));
             cp.flags = Some(cp.flags.unwrap_or(0) & !2);
         }
     }
@@ -938,7 +971,12 @@ fn particle_layer_from_object(
                 .as_ref()
                 .is_some_and(|(_, blending)| blending.as_deref() == Some("additive"));
             let sprite = resolved.map(|(sprite, _)| sprite);
-            Some(ResolvedChildParticle { config: child_cfg, sprite, additive, child_ref })
+            Some(ResolvedChildParticle {
+                config: child_cfg,
+                sprite,
+                additive,
+                child_ref,
+            })
         })
         .collect();
 
@@ -1227,7 +1265,9 @@ fn find_model_chain_tex_pkg(
         .get(json_path)
         .map(|d| d.to_vec())
         .or_else(|| read_from_global_assets(json_path))
-        .with_context(|| format!("model/material not found in pkg or global assets: {json_path}"))?;
+        .with_context(|| {
+            format!("model/material not found in pkg or global assets: {json_path}")
+        })?;
     let val: serde_json::Value =
         serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
@@ -1285,14 +1325,16 @@ fn pass_overbright(pass: &serde_json::Value) -> f32 {
 }
 
 /// Follow the model -> material -> texture chain for loose files on disk.
-fn find_model_chain_tex_dir(
-    dir: &Path,
-    json_path: &str,
-) -> Result<(TexFile, Option<String>, f32)> {
+fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>, f32)> {
     let data = std::fs::read(dir.join(json_path))
         .ok()
         .or_else(|| read_from_global_assets(json_path))
-        .with_context(|| format!("model/material not found in {} or global assets: {json_path}", dir.display()))?;
+        .with_context(|| {
+            format!(
+                "model/material not found in {} or global assets: {json_path}",
+                dir.display()
+            )
+        })?;
     let val: serde_json::Value =
         serde_json::from_slice(&data).with_context(|| format!("parsing {json_path}"))?;
 
@@ -1335,7 +1377,9 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage
     }
     let atlas = tex.to_rgba()?;
     Ok(apply_puppet_mesh(atlas, json_path, |rel| {
-        pkg.get(rel).map(|d| d.to_vec()).or_else(|| read_from_global_assets(rel))
+        pkg.get(rel)
+            .map(|d| d.to_vec())
+            .or_else(|| read_from_global_assets(rel))
     }))
 }
 
@@ -1453,6 +1497,226 @@ fn resolve_particle_sprite_dir(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Parent-child transform composition (full TRS)
+//
+// In Wallpaper Engine a scene is a tree: an object's `origin`/`angles`/`scale`
+// are expressed in its PARENT's frame, not screen space. `layer_from_object`
+// bakes only the object's OWN local transform into each Layer, so anything with
+// a parent lands at its local offset instead of its true world position (the
+// clock/particles-in-the-corner bug). This pass walks each object's `parent`
+// chain and pre-multiplies the parent's world transform onto the already-baked
+// local layer.
+//
+// Position is exact TRS (parent scale → parent rotation → parent translation
+// applied to the child point). Orientation and scale compose as Euler-sum and
+// component-wise product respectively: exact for the flat z-rotation these 2D
+// scenes use and for a single parent level, an approximation only under nested,
+// non-coaxial 3D rotation (rare; the perspective path already treats layer
+// angles approximately).
+// ---------------------------------------------------------------------------
+
+/// An affine transform in WE scene space (Y-up), kept as decomposed
+/// translation / Euler-rotation (radians, un-negated) / scale.
+#[derive(Clone, Copy)]
+struct Xform {
+    t: [f64; 3],
+    r: [f64; 3],
+    s: [f64; 3],
+}
+
+impl Xform {
+    const IDENTITY: Xform = Xform {
+        t: [0.0; 3],
+        r: [0.0; 3],
+        s: [1.0, 1.0, 1.0],
+    };
+
+    fn is_identity(&self) -> bool {
+        self.t == [0.0; 3] && self.r == [0.0; 3] && self.s == [1.0, 1.0, 1.0]
+    }
+
+    /// Map a point living in a child frame into the frame this Xform is
+    /// expressed in: `p' = t + R · (s ⊙ p)`.
+    fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
+        let scaled = [p[0] * self.s[0], p[1] * self.s[1], p[2] * self.s[2]];
+        let rot = rotate_euler_f64(scaled, self.r);
+        [rot[0] + self.t[0], rot[1] + self.t[1], rot[2] + self.t[2]]
+    }
+
+    /// `world = self (parent world) ∘ local`.
+    fn compose(&self, local: &Xform) -> Xform {
+        Xform {
+            t: self.apply_point(local.t),
+            r: [
+                self.r[0] + local.r[0],
+                self.r[1] + local.r[1],
+                self.r[2] + local.r[2],
+            ],
+            s: [
+                self.s[0] * local.s[0],
+                self.s[1] * local.s[1],
+                self.s[2] * local.s[2],
+            ],
+        }
+    }
+}
+
+/// f64 mirror of `camera3d::rotate_euler` (Rx then Ry then Rz) — scene coords
+/// reach a few thousand pixels, so we keep the composition in f64.
+fn rotate_euler_f64(v: [f64; 3], a: [f64; 3]) -> [f64; 3] {
+    let (sx, cx) = a[0].sin_cos();
+    let (sy, cy) = a[1].sin_cos();
+    let (sz, cz) = a[2].sin_cos();
+    let v = [v[0], cx * v[1] - sx * v[2], sx * v[1] + cx * v[2]];
+    let v = [cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2]];
+    [cz * v[0] - sz * v[1], sz * v[0] + cz * v[1], v[2]]
+}
+
+/// This object's own local transform, read from the raw scene fields (the same
+/// sources `layer_from_object` uses, minus alignment which is a per-layer draw
+/// concern).
+fn obj_local_xform(obj: &SceneObject) -> Xform {
+    let t = obj.parsed_origin();
+    let r = obj
+        .angles
+        .as_ref()
+        .map(crate::engine::model::json_to_animated)
+        .and_then(|v| v.as_vec3())
+        .map(|a| [a[0] as f64, a[1] as f64, a[2] as f64])
+        .unwrap_or([0.0; 3]);
+    let s = obj
+        .scale
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_vec3)
+        .unwrap_or([1.0, 1.0, 1.0]);
+    Xform { t, r, s }
+}
+
+/// Resolve an object's `parent` reference to an index in `scene.objects`.
+/// WE stores the parent's `id` (a number), occasionally a name string.
+fn parent_index(
+    obj: &SceneObject,
+    id_to_idx: &HashMap<i64, usize>,
+    name_to_idx: &HashMap<&str, usize>,
+) -> Option<usize> {
+    let p = obj.parent.as_ref()?;
+    if let Some(id) = p.as_i64() {
+        return id_to_idx.get(&id).copied();
+    }
+    if let Some(id) = p.as_u64() {
+        return id_to_idx.get(&(id as i64)).copied();
+    }
+    if let Some(name) = p.as_str() {
+        return name_to_idx.get(name).copied();
+    }
+    None
+}
+
+/// World transform of object `idx`, including its own local transform, composed
+/// up the parent chain. Memoized; guards against cycles / dangling parents.
+fn world_xform(
+    idx: usize,
+    objects: &[SceneObject],
+    id_to_idx: &HashMap<i64, usize>,
+    name_to_idx: &HashMap<&str, usize>,
+    memo: &mut [Option<Xform>],
+    depth: u32,
+) -> Xform {
+    if let Some(x) = memo[idx] {
+        return x;
+    }
+    let local = obj_local_xform(&objects[idx]);
+    // depth guard: a malformed scene can loop or nest absurdly deep; fall back
+    // to the local transform rather than blow the stack (tolerant-parsing).
+    let world = match parent_index(&objects[idx], id_to_idx, name_to_idx) {
+        Some(p) if p != idx && depth < 64 => {
+            world_xform(p, objects, id_to_idx, name_to_idx, memo, depth + 1).compose(&local)
+        }
+        _ => local,
+    };
+    memo[idx] = Some(world);
+    world
+}
+
+/// Parent world transform for object `idx` (identity if it has no parent). This
+/// is what gets applied to a layer, whose OWN local transform is already baked
+/// in by `layer_from_object`.
+fn parent_world_xform(
+    idx: usize,
+    objects: &[SceneObject],
+    id_to_idx: &HashMap<i64, usize>,
+    name_to_idx: &HashMap<&str, usize>,
+    memo: &mut [Option<Xform>],
+) -> Xform {
+    match parent_index(&objects[idx], id_to_idx, name_to_idx) {
+        Some(p) if p != idx => world_xform(p, objects, id_to_idx, name_to_idx, memo, 0),
+        _ => Xform::IDENTITY,
+    }
+}
+
+/// Compose each layer's baked-in local transform with its parent chain so
+/// parented objects (clocks, dates, ripples, particle emitters) render at their
+/// true world position/orientation/scale instead of their local offset.
+fn apply_parent_transforms(
+    scene: &Scene,
+    layers: &mut [Layer],
+    particle_layers: &mut [ParticleLayer],
+) {
+    let objects = &scene.objects;
+    if objects.is_empty() {
+        return;
+    }
+    let id_to_idx: HashMap<i64, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.id.map(|id| (id, i)))
+        .collect();
+    let name_to_idx: HashMap<&str, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
+        .collect();
+    let mut memo: Vec<Option<Xform>> = vec![None; objects.len()];
+
+    for layer in layers.iter_mut() {
+        let idx = layer.order_index;
+        if idx >= objects.len() {
+            continue;
+        }
+        let pw = parent_world_xform(idx, objects, &id_to_idx, &name_to_idx, &mut memo);
+        if pw.is_identity() {
+            continue;
+        }
+        layer.origin = pw.apply_point(layer.origin);
+        layer.scale = [
+            layer.scale[0] * pw.s[0],
+            layer.scale[1] * pw.s[1],
+            layer.scale[2] * pw.s[2],
+        ];
+        // `Layer::angle` is the negated z-roll (screen convention); the raw 3D
+        // `angles` are un-negated.
+        layer.angle -= pw.r[2] as f32;
+        layer.angles = [
+            layer.angles[0] + pw.r[0] as f32,
+            layer.angles[1] + pw.r[1] as f32,
+            layer.angles[2] + pw.r[2] as f32,
+        ];
+    }
+
+    for pl in particle_layers.iter_mut() {
+        let idx = pl.order_index;
+        if idx >= objects.len() {
+            continue;
+        }
+        let pw = parent_world_xform(idx, objects, &id_to_idx, &name_to_idx, &mut memo);
+        if pw.is_identity() {
+            continue;
+        }
+        pl.origin = pw.apply_point(pl.origin);
+    }
+}
+
 fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
     // Perspective 3D scenes have no orthogonal projection and their layer
     // sizes are world-space, not pixels — inferring pixel dimensions from
@@ -1497,13 +1761,18 @@ fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
     (1920, 1080)
 }
 
-/// For model/copybackground layers we can't render, create a solid gray placeholder
-/// so any screen-space effects applied to them have a visible base to work with.
+/// For model/copybackground layers we can't render, create a transparent
+/// placeholder so any screen-space effects applied to them have a base to work
+/// with. It must be transparent, not opaque grey: these are usually full-screen
+/// effect-only overlays (e.g. "Light shafts"), so an opaque base paints a giant
+/// grey box over the scene whenever the effect is a SKIP or an additive overlay.
+/// ponytail: transparent base; revisit if an effect needs to sample the real
+/// scene behind it (backdrop capture — not implemented).
 fn placeholder_for(obj: &SceneObject) -> RgbaImage {
     let size = obj.parsed_size();
     let w = if size[0] > 0.0 { size[0] as u32 } else { 1920 };
     let h = if size[1] > 0.0 { size[1] as u32 } else { 1080 };
-    RgbaImage::from_pixel(w, h, image::Rgba([140u8, 140, 140, 255]))
+    RgbaImage::from_pixel(w, h, image::Rgba([0u8, 0, 0, 0]))
 }
 
 fn is_special_layer(image_path: &str) -> bool {
