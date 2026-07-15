@@ -16,6 +16,7 @@ pub mod fbo;
 pub mod gpu_renderer;
 pub mod graph;
 pub mod material;
+pub mod mesh3d;
 pub mod model;
 pub mod noise;
 pub mod particle;
