@@ -100,6 +100,9 @@ pub struct TranslatedShader {
     /// Vertex attributes (glsl type, name) in declaration order when the real
     /// WE vertex shader was translated; empty for the synthetic-VS path.
     pub attributes: Vec<(String, String)>,
+    /// True when the shader reads `g_AudioSpectrum*` — the renderer only
+    /// starts audio capture for scenes that actually react to it.
+    pub uses_audio: bool,
 }
 
 /// Collect non-sampler `uniform` declarations (type, name) in source order.
@@ -804,6 +807,7 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
         uniform_keys,
         texture_count: model.texture_slots.len(),
         attributes,
+        uses_audio: model.frag_glsl.contains("AudioSpectrum"),
     })
 }
 
@@ -911,7 +915,6 @@ fn harmonize_varying_widths(vert: &str, frag: &str) -> String {
     out.join("\n")
 }
 
-
 /// `glsl_to_spirv` with a bounded repair loop for HLSL-style implicit
 /// conversions that strict GLSL rejects but Wallpaper Engine's own (D3D)
 /// compiler accepts silently — e.g. `float p = vec2Expr;` (truncates to .x),
@@ -927,10 +930,18 @@ fn glsl_to_spirv_with_repairs(glsl: &str, stage: naga::ShaderStage) -> Result<Ve
         Ok(spv) => return Ok(spv),
         Err(e) => e,
     };
-    for _ in 0..4 {
+    for _ in 0..5 {
         let current = src.as_deref().unwrap_or(glsl);
-        let Some(patched) = repair_assignment_conversions(current, &format!("{last_err:#}"))
-        else {
+        let err = format!("{last_err:#}");
+        // Apply both repairs against the same error text: `float % int` becomes
+        // `mod()` and HLSL-implicit assignment conversions get their casts.
+        // Either may fix a different error the same round.
+        let mut patched = repair_float_modulo(current, &err);
+        let after_mod = patched.as_deref().unwrap_or(current);
+        if let Some(p) = repair_assignment_conversions(after_mod, &err) {
+            patched = Some(p);
+        }
+        let Some(patched) = patched else {
             return Err(last_err);
         };
         match glsl_to_spirv(&patched, stage) {
@@ -959,6 +970,155 @@ fn parse_shaderc_type(desc: &str) -> Option<(&'static str, u8)> {
         return Some(("int", 1));
     }
     None
+}
+
+/// Rewrite every `a % b` on `line` to `mod(a, b)`. HLSL's `%` accepts float
+/// operands (D3D `fmod` semantics); strict GLSL's `%` is integer-only, so WE
+/// shaders that write `float % N` (e.g. simple_audio_bars' bar bucketing) are
+/// rejected. `mod()` is GLSL's float remainder and int→float promotion makes
+/// the second operand fit. Returns `None` when the line has no modulo.
+fn rewrite_modulo_on_line(line: &str) -> Option<String> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.';
+    let mut out = line.to_string();
+    // Re-scan from the start after each rewrite (indices shift).
+    loop {
+        let bytes = out.as_bytes();
+        // Find a modulo `%` that isn't the compound-assign `%=`.
+        let Some(pct) =
+            (0..bytes.len()).find(|&i| bytes[i] == b'%' && bytes.get(i + 1) != Some(&b'='))
+        else {
+            break;
+        };
+
+        // Left operand: skip whitespace, then take a parenthesized group (plus
+        // any function name in front of it) or a bare identifier/number.
+        let mut le = pct;
+        while le > 0 && bytes[le - 1].is_ascii_whitespace() {
+            le -= 1;
+        }
+        let ls = if le > 0 && (bytes[le - 1] == b')' || bytes[le - 1] == b']') {
+            let (open, close) = if bytes[le - 1] == b')' {
+                (b'(', b')')
+            } else {
+                (b'[', b']')
+            };
+            let mut depth = 0i32;
+            let mut k = le - 1;
+            loop {
+                if bytes[k] == close {
+                    depth += 1;
+                } else if bytes[k] == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
+            }
+            let mut s = k;
+            while s > 0 && is_ident(bytes[s - 1]) {
+                s -= 1;
+            }
+            s
+        } else {
+            let mut s = le;
+            while s > 0 && is_ident(bytes[s - 1]) {
+                s -= 1;
+            }
+            s
+        };
+
+        // Right operand: skip whitespace, then a parenthesized group or a
+        // bare identifier/number optionally followed by a call's parens.
+        let mut rs = pct + 1;
+        while rs < bytes.len() && bytes[rs].is_ascii_whitespace() {
+            rs += 1;
+        }
+        let re = if rs < bytes.len() && (bytes[rs] == b'(' || bytes[rs] == b'[') {
+            let close = if bytes[rs] == b'(' { b')' } else { b']' };
+            let open = bytes[rs];
+            let mut depth = 0i32;
+            let mut k = rs;
+            while k < bytes.len() {
+                if bytes[k] == open {
+                    depth += 1;
+                } else if bytes[k] == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        k += 1;
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            k
+        } else {
+            let mut k = rs;
+            while k < bytes.len() && is_ident(bytes[k]) {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'(' {
+                let mut depth = 0i32;
+                while k < bytes.len() {
+                    if bytes[k] == b'(' {
+                        depth += 1;
+                    } else if bytes[k] == b')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            k += 1;
+                            break;
+                        }
+                    }
+                    k += 1;
+                }
+            }
+            k
+        };
+
+        // Bail if either operand came out empty (malformed `%`) — leave as-is.
+        if ls >= le || rs >= re {
+            break;
+        }
+        let left = out[ls..le].trim().to_string();
+        let right = out[rs..re].trim().to_string();
+        out = format!("{}mod({left}, {right}){}", &out[..ls], &out[re..]);
+    }
+    (out != line).then_some(out)
+}
+
+/// Parse `shader.frag:N: error: '%' : wrong operand types` messages and rewrite
+/// the flagged line's modulo(s) to `mod()`. Returns `None` when nothing matched.
+fn repair_float_modulo(glsl: &str, err_text: &str) -> Option<String> {
+    let mut lines: Vec<String> = glsl.lines().map(str::to_string).collect();
+    let mut repaired = false;
+    for msg in err_text.lines() {
+        if !msg.contains("'%'") || !msg.contains("operand") {
+            continue;
+        }
+        let Some(rest) = msg
+            .split_once("shader.frag:")
+            .or_else(|| msg.split_once("shader.vert:"))
+            .map(|(_, r)| r)
+        else {
+            continue;
+        };
+        let Some((line_str, _)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(line_no) = line_str.trim().parse::<usize>() else {
+            continue;
+        };
+        if let Some(line) = lines.get_mut(line_no.saturating_sub(1)) {
+            if let Some(patched) = rewrite_modulo_on_line(line) {
+                *line = patched;
+                repaired = true;
+            }
+        }
+    }
+    repaired.then(|| lines.join("\n"))
 }
 
 /// Parse `shader.frag:N: error: '=' : cannot convert from ' X' to ' Y'`
@@ -1037,9 +1197,10 @@ fn wrap_assignment_rhs(line: &str, prefix: &str, suffix: &str) -> Option<String>
         }
         let prev = if i > 0 { bytes[i - 1] } else { b' ' };
         let next = bytes.get(i + 1).copied().unwrap_or(b' ');
-        if matches!(prev, b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'&' | b'|')
-            || next == b'='
-        {
+        // Skip comparisons (`==`, `!=`, `<=`, `>=`). Compound assignments
+        // (`+= -= *= /=`) ARE valid targets: `int x *= floatExpr` needs the
+        // RHS wrapped just like a plain `int x = floatExpr` does.
+        if matches!(prev, b'=' | b'!' | b'<' | b'>') || next == b'=' {
             continue;
         }
         eq = Some(i);
@@ -1430,8 +1591,36 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
         }
         out.push_str("};\n");
     }
-    // Float-array uniforms as zero-filled constants (see the scan above).
+    // Audio-spectrum arrays (`g_AudioSpectrum{16,32,64}{Left,Right}`) become a
+    // live read-only STORAGE buffer (std430) at set=1 binding=1 filled from FFT
+    // each frame. The full canonical set is always declared in a fixed order
+    // (so element offsets are deterministic regardless of which arrays this
+    // shader happens to reference); the renderer always binds the buffer, and
+    // shaders that read none of it simply ignore the binding.
+    let uses_audio = zero_arrays
+        .iter()
+        .any(|(name, _)| name.contains("AudioSpectrum"));
+    if uses_audio {
+        // std430 storage: `float[N]` packs at 4-byte stride (naga-valid),
+        // unlike a std140 uniform member's WGSL-illegal 16-byte array stride.
+        out.push_str("layout(set=1, binding=1, std430) readonly buffer WEAudio {\n");
+        for (name, n) in [
+            ("g_AudioSpectrum16Left", 16),
+            ("g_AudioSpectrum16Right", 16),
+            ("g_AudioSpectrum32Left", 32),
+            ("g_AudioSpectrum32Right", 32),
+            ("g_AudioSpectrum64Left", 64),
+            ("g_AudioSpectrum64Right", 64),
+        ] {
+            out.push_str(&format!("    float {name}[{n}];\n"));
+        }
+        out.push_str("};\n");
+    }
+    // Any remaining (non-audio) float-array uniforms stay zero-filled consts.
     for (name, n) in &zero_arrays {
+        if name.contains("AudioSpectrum") {
+            continue;
+        }
         let zeros = vec!["0.0"; *n].join(", ");
         out.push_str(&format!("const float {name}[{n}] = float[{n}]({zeros});\n"));
     }
@@ -2043,8 +2232,14 @@ mod tests {
         let out = harmonize_varying_widths(vert, frag);
         assert!(out.contains("varying vec4 v_TexCoord;"));
         assert!(out.contains("v_TexCoord = vec4(a_TexCoord * 2.0, 0.0, 1.0);"));
-        assert!(out.contains("v_TexCoord.xy = a_TexCoord;"), "swizzled store untouched");
-        assert!(out.contains("varying vec2 v_Other;"), "matching widths untouched");
+        assert!(
+            out.contains("v_TexCoord.xy = a_TexCoord;"),
+            "swizzled store untouched"
+        );
+        assert!(
+            out.contains("varying vec2 v_Other;"),
+            "matching widths untouched"
+        );
         assert!(out.contains("v_Other = a_TexCoord;"));
     }
 
@@ -2065,9 +2260,15 @@ mod tests {
     }
 
     #[test]
-    fn wrap_assignment_rhs_skips_lines_without_plain_assignment() {
+    fn wrap_assignment_rhs_skips_comparisons_but_wraps_compound_assign() {
+        // Comparisons are never assignment targets.
         assert!(wrap_assignment_rhs("if (a == b) return;", "(", ").x").is_none());
-        assert!(wrap_assignment_rhs("x += y;", "(", ").x").is_none());
+        // Compound assignments ARE targets: `int x *= floatExpr` needs the RHS
+        // coerced just like a plain assignment (simple_audio_bars' `bar *= step`).
+        assert_eq!(
+            wrap_assignment_rhs("\tbarLeft *= step(a, b);", "int(", ")").as_deref(),
+            Some("\tbarLeft *= int(step(a, b));")
+        );
     }
 
     #[test]
@@ -2121,5 +2322,87 @@ mod tests {
             crate::engine::model::shader_model::WEBlending::Normal,
         );
         translate(&model).expect("pow(vec3, float) should translate via _wp_pow shims");
+    }
+
+    #[test]
+    fn int_assigned_float_step_repairs() {
+        let glsl = "#version 450\n\
+            layout(location=0) out vec4 fragColor;\n\
+            void main() {\n\
+            \tfloat a = 0.3; float b = 0.7;\n\
+            \tint barLeft = step(a, b);\n\
+            \tfragColor = vec4(float(barLeft));\n\
+            }\n";
+        assert!(glsl_to_spirv(glsl, naga::ShaderStage::Fragment).is_err());
+        glsl_to_spirv_with_repairs(glsl, naga::ShaderStage::Fragment)
+            .expect("int = step(float) should repair via int() wrap");
+    }
+
+    #[test]
+    fn rewrite_modulo_handles_real_audio_bar_patterns() {
+        // simple_audio_bars.frag's two shapes.
+        assert_eq!(
+            rewrite_modulo_on_line("\tuint barFreq1 = frequency % RESOLUTION;").as_deref(),
+            Some("\tuint barFreq1 = mod(frequency, RESOLUTION);")
+        );
+        assert_eq!(
+            rewrite_modulo_on_line("\tuint barFreq2 = (barFreq1 + 1) % RESOLUTION;").as_deref(),
+            Some("\tuint barFreq2 = mod((barFreq1 + 1), RESOLUTION);")
+        );
+    }
+
+    #[test]
+    fn rewrite_modulo_leaves_compound_assign_and_plain_lines() {
+        assert_eq!(rewrite_modulo_on_line("\tx %= 4;"), None);
+        assert_eq!(rewrite_modulo_on_line("\tfloat y = a + b;"), None);
+    }
+
+    /// End-to-end: a `float % int` shader (int-only `%` in strict GLSL) must
+    /// compile through the repair loop, mirroring simple_audio_bars.
+    #[test]
+    fn float_modulo_repairs_through_real_compile() {
+        let glsl = "#version 450\n\
+            layout(location=0) out vec4 fragColor;\n\
+            void main() {\n\
+            \tfloat frequency = 6.5;\n\
+            \tuint bar = frequency % 4;\n\
+            \tfragColor = vec4(float(bar));\n\
+            }\n";
+        assert!(glsl_to_spirv(glsl, naga::ShaderStage::Fragment).is_err());
+        glsl_to_spirv_with_repairs(glsl, naga::ShaderStage::Fragment)
+            .expect("float % int + float->uint assign should repair");
+    }
+
+    /// A shader reading `g_AudioSpectrum64Left` must translate to WGSL with the
+    /// array backed by a live uniform binding (not a zero `const`), and the
+    /// result must flag `uses_audio` so the renderer starts capture.
+    #[test]
+    fn audio_spectrum_becomes_live_uniform() {
+        let src = "uniform sampler2D g_Texture0;\n\
+                   uniform float g_AudioSpectrum64Left[64];\n\
+                   varying vec2 v_TexCoord;\n\
+                   void main() {\n\
+                   \tint i = int(v_TexCoord.x * 64.0);\n\
+                   \tfloat amp = g_AudioSpectrum64Left[i];\n\
+                   \tgl_FragColor = vec4(amp, amp, amp, 1.0);\n\
+                   }\n";
+        let model = ShaderModel::from_resolved_glsl(
+            "audio_test".to_string(),
+            src.to_string(),
+            HashMap::new(),
+            crate::engine::model::shader_model::WEBlending::Normal,
+        );
+        let t = translate(&model).expect("audio spectrum shader should translate");
+        assert!(
+            t.uses_audio,
+            "uses_audio must be set for g_AudioSpectrum reads"
+        );
+        // The array is now a bound uniform member, so the emitted WGSL must not
+        // contain a zero-const fallback for it.
+        assert!(
+            !t.wgsl.contains("array<f32, 64>(0.0"),
+            "audio array must not be a zero const:\n{}",
+            t.wgsl
+        );
     }
 }

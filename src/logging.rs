@@ -50,6 +50,7 @@ pub const TARGETS: &[&str] = &[
     "timing",    // per-frame timing instrumentation (trace)
     "render",    // render loops (GPU/CPU scene)
     "video",     // ffmpeg video decode
+    "audio",     // desktop-audio capture + FFT spectrum
     "wallpaper", // Wayland surface / output management
 ];
 
@@ -61,7 +62,8 @@ pub const TARGETS: &[&str] = &[
 /// overrides the level mapping entirely.
 pub fn init(verbosity: u8) {
     INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter(verbosity)));
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(default_filter(verbosity)));
 
         tracing_subscriber::fmt()
             .with_env_filter(filter)

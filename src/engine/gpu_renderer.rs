@@ -57,6 +57,9 @@ pub struct GpuSceneRenderer {
     samplers: [wgpu::Sampler; 4],
     base_bgl: wgpu::BindGroupLayout,
     effect_bgl: wgpu::BindGroupLayout,
+    /// The g_AudioSpectrum* UBO (effect_bgl binding 1), rewritten each frame
+    /// from the FFT. Zero-filled when no audio is captured.
+    audio_buf: wgpu::Buffer,
     composite_pipelines: Vec<(u32, wgpu::RenderPipeline)>,
     /// Same vs_composite_quad/fs_composite pair as `composite_pipelines[0]`
     /// but with blending disabled (plain overwrite): used for the intra-chain
@@ -85,7 +88,26 @@ pub struct GpuSceneRenderer {
     bloom_combine_pipeline: wgpu::RenderPipeline,
     // Format → blit pipeline (surface presentation, FBO up/down-sampling)
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    // GPU particle pipeline (vs_particles/fs_particles): storage-buffer
+    // vertices, texture-array sprites, hardware blending straight into the
+    // scene target — replaces the budgeted CPU particle rasterizer.
+    particle_bgl: wgpu::BindGroupLayout,
+    particle_pipeline_add: wgpu::RenderPipeline,
+    particle_pipeline_over: wgpu::RenderPipeline,
+    // Static 3D mesh pipeline (vs_mesh3d/fs_mesh3d): real indexed geometry
+    // through the scene camera, and the only pipeline here with a depth
+    // buffer — a sphere self-occludes, which no painter's ordering can fake.
+    mesh3d_bgl: wgpu::BindGroupLayout,
+    /// Indexed by the material's `nocull`: back-face culling is what makes a
+    /// skybox work (its near hemisphere culls away instead of hiding the
+    /// scene inside it), while `"cullmode": "nocull"` materials — hollow
+    /// shells meant to be seen from both sides — must keep every face.
+    mesh3d_pipelines: [wgpu::RenderPipeline; 2],
 }
+
+/// Depth format for the 3D mesh pass. Depth32Float is guaranteed everywhere
+/// wgpu runs, so there's no fallback to pick.
+const MESH3D_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 impl GpuSceneRenderer {
     pub fn new(gpu: GpuDevice) -> Result<Self> {
@@ -170,18 +192,43 @@ impl GpuSceneRenderer {
 
         let effect_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("effect_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                // VERTEX too: real WE vertex shaders read the shared UBO
-                // (g_ModelViewProjectionMatrix, animation params, ...).
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    // VERTEX too: real WE vertex shaders read the shared UBO
+                    // (g_ModelViewProjectionMatrix, animation params, ...).
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // binding 1: the g_AudioSpectrum* storage buffer, updated per
+                // frame from the FFT. Read-only storage (not uniform) because a
+                // `float[N]` needs WGSL-illegal 16-byte uniform array stride;
+                // storage packs tightly. Always present so every effect
+                // pipeline's layout matches; audio shaders read it in the
+                // fragment stage, others ignore the binding.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let audio_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("audio_spectrum"),
+            size: crate::engine::audio::UNIFORM_BYTES as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let composite_pipeline_layout =
@@ -314,6 +361,181 @@ impl GpuSceneRenderer {
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
+        let particle_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("particle_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let particle_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("particle_layout"),
+            bind_group_layouts: &[&particle_bgl],
+            push_constant_ranges: &[],
+        });
+        // Additive: the reference draws particle quads with
+        // glBlendFuncSeparate(SRC_ALPHA, ONE, SRC_ALPHA, ONE) (CPass.cpp).
+        let particle_add_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let particle_over_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let particle_pipeline_add = Self::create_pipeline(
+            &device,
+            &particle_layout,
+            &shader_module,
+            "vs_particles",
+            "fs_particles",
+            "particles_add",
+            Some(particle_add_blend),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        let particle_pipeline_over = Self::create_pipeline(
+            &device,
+            &particle_layout,
+            &shader_module,
+            "vs_particles",
+            "fs_particles",
+            "particles_over",
+            Some(particle_over_blend),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
+        let mesh3d_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh3d_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mesh3d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh3d_layout"),
+            bind_group_layouts: &[&mesh3d_bgl],
+            push_constant_ranges: &[],
+        });
+        let make_mesh3d_pipeline = |cull: Option<wgpu::Face>, label: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh3d_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_mesh3d"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 20,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_mesh3d"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: cull,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: MESH3D_DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let mesh3d_pipelines = [
+            make_mesh3d_pipeline(Some(wgpu::Face::Back), "mesh3d"),
+            make_mesh3d_pipeline(None, "mesh3d_nocull"),
+        ];
+
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
 
         Ok(Self {
@@ -322,6 +544,7 @@ impl GpuSceneRenderer {
             samplers,
             base_bgl,
             effect_bgl,
+            audio_buf,
             composite_pipelines,
             base_pass_pipeline,
             effect_pipelines,
@@ -338,6 +561,11 @@ impl GpuSceneRenderer {
             bloom_blur_pipeline,
             bloom_combine_pipeline,
             blit_pipelines: HashMap::new(),
+            mesh3d_bgl,
+            mesh3d_pipelines,
+            particle_bgl,
+            particle_pipeline_add,
+            particle_pipeline_over,
         })
     }
 
@@ -688,6 +916,64 @@ impl GpuSceneRenderer {
         tex
     }
 
+    /// Uploads sprite-sheet frames as one 2D texture array (layer per frame)
+    /// for the GPU particle pipeline. Frames are padded to the largest
+    /// extent; TEXS sheets are uniform in practice, so padding is a
+    /// theoretical safety net, not an expected path.
+    pub fn upload_texture_array(&self, frames: &[RgbaImage]) -> (wgpu::Texture, u32) {
+        let n = frames.len().max(1) as u32;
+        let w = frames.iter().map(|f| f.width()).max().unwrap_or(1).max(1);
+        let h = frames.iter().map(|f| f.height()).max().unwrap_or(1).max(1);
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("particle_sprite_array"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: n,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (i, frame) in frames.iter().enumerate() {
+            let (fw, fh) = (frame.width(), frame.height());
+            let padded = if fw == w && fh == h {
+                frame.clone()
+            } else {
+                let mut img = RgbaImage::new(w, h);
+                image::imageops::overlay(&mut img, frame, 0, 0);
+                img
+            };
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: i as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                padded.as_raw(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * w),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        (tex, frames.len().max(1) as u32)
+    }
+
     pub fn create_render_target(&self, w: u32, h: u32) -> wgpu::Texture {
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("render_target"),
@@ -811,10 +1097,16 @@ impl GpuSceneRenderer {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.effect_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: param_buf.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: param_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.audio_buf.as_entire_binding(),
+                },
+            ],
         })
     }
 
@@ -1017,6 +1309,8 @@ struct EffectRuntime {
     passes: Vec<EffectPassRuntime>,
     /// (name, downscale divisor) — allocated per instance in the pool.
     fbos: Vec<(String, f32)>,
+    /// True when any pass reads `g_AudioSpectrum*` — drives lazy capture start.
+    uses_audio: bool,
 }
 
 /// Per-frame values for WE's engine-provided uniforms (the counterpart of
@@ -1111,6 +1405,25 @@ struct SceneLayerGpu {
     angle: f32,
     /// Object quad: (center_ndc.x, center_ndc.y, half_extent_ndc.x, half_extent_ndc.y).
     rect: [f32; 4],
+    /// Live visibility for this frame. Starts `true`; only a `visible` script
+    /// can flip it off. `render()` skips the layer entirely when `false`.
+    visible: bool,
+    /// The authored `visible` value — fed to the `visible` script as `value`
+    /// (a script with no `update()`, e.g. a cursor-handler-only hitbox, returns
+    /// it unchanged, so this must not be hardcoded `true`).
+    visible_base: bool,
+    /// Per-frame transform scripts (visible/scale/origin/angles). When
+    /// scale/origin are present, `rect` is recomputed each frame from the
+    /// base values below; angles rebuilds `angle`. Only honored in the 2D
+    /// (orthographic) path — perspective layers keep their projected rect.
+    transform_scripts: crate::engine::render::TransformScripts,
+    /// Base values fed to the transform scripts as `value` and used to rebuild
+    /// `rect`: object size in px (pre-scale), authored origin (scene coords,
+    /// alignment folded in), scale multiplier, and full angles (radians).
+    effective_size: [f64; 2],
+    origin_base: [f64; 3],
+    scale_base: [f32; 3],
+    angles_base: [f32; 3],
     no_interpolation: bool,
     clamp_uvs: bool,
     /// Unscaled object size in pixels — matches the reference's `CImage::m_size`
@@ -1135,6 +1448,23 @@ struct SceneLayerGpu {
 /// pool, and per-frame camera dynamics. Render either to RGBA (readback
 /// paths: preview/testing/SHM fallback) or straight into an external texture
 /// view (Wayland surface presentation — no readback).
+/// One sprite texture array for a GPU particle draw unit.
+struct ParticleGpuTex {
+    view: wgpu::TextureView,
+    frames: u32,
+    overbright: f32,
+    /// Ropes tile V past 1.0 (`uvscale`/scrolling) — sample with the repeat
+    /// sampler; sprite quads clamp.
+    repeat: bool,
+}
+
+/// Per-layer GPU particle textures: the parent system's sprite plus one per
+/// child preset (child *instances* spawn at runtime; textures are per child).
+struct ParticleGpuAssets {
+    parent: ParticleGpuTex,
+    children: Vec<ParticleGpuTex>,
+}
+
 pub struct GpuSceneInstance {
     renderer: GpuSceneRenderer,
     layers: Vec<SceneLayerGpu>,
@@ -1173,6 +1503,9 @@ pub struct GpuSceneInstance {
     /// instead of the default alpha-over, which otherwise makes a sprite's
     /// near-black background visibly darken/box the scene behind it.
     particle_additive: Vec<bool>,
+    /// Parallel to `particle_systems`: GPU sprite texture arrays (parent +
+    /// per-child), built once at load for the GPU particle pipeline.
+    particle_gpu_assets: Vec<ParticleGpuAssets>,
     start: Instant,
     last_time: f32,
     mouse_norm: [f32; 2],
@@ -1180,10 +1513,33 @@ pub struct GpuSceneInstance {
     /// frame. Lives here (on the render thread) because boa's `Context` is
     /// `!Send`; created and used entirely within this instance.
     script_ctx: crate::engine::script::ScriptContext,
+    /// Desktop-audio capture, started only when an effect reads
+    /// `g_AudioSpectrum*` (else `None` and the spectrum stays silent). Polled
+    /// once per frame into the renderer's `audio_buf`.
+    audio_capture: Option<crate::engine::audio::AudioCapture>,
+    /// Live playback streams for `sound` objects; kept alive for the scene's
+    /// lifetime (dropping stops the audio).
+    _sounds: Vec<crate::engine::audio::SoundPlayback>,
     /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
     perspective: bool,
+    /// Static 3D meshes (`model` -> .mdl), drawn as real geometry before the
+    /// 2D layers composite over them. Empty for every scene that has none.
+    mesh3d: Vec<Mesh3dGpu>,
+    /// Depth buffer for `mesh3d`; `None` when there are no meshes. The 2D
+    /// layers never touch it — they keep their painter's ordering.
+    mesh3d_depth: Option<wgpu::TextureView>,
+}
+
+/// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
+/// baked at load because these objects don't animate in real content.
+struct Mesh3dGpu {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    index_count: u32,
+    bind_group: wgpu::BindGroup,
+    nocull: bool,
 }
 
 impl GpuSceneInstance {
@@ -1236,21 +1592,65 @@ impl GpuSceneInstance {
                 }
             })
             .unwrap_or([0.0, 0.0, 0.0]);
+        // `clearenabled: false` → don't paint the clear color (the surface is
+        // opaque, so this reads as black behind any gaps in the scene).
+        let mut clear_color = if general
+            .and_then(|g| g.clearenabled.as_ref())
+            .and_then(parse_value_bool)
+            == Some(false)
+        {
+            [0.0, 0.0, 0.0]
+        } else {
+            clear_color
+        };
+        // NOTE: `ambientcolor`/`skylightcolor` are inputs to LIT materials, not
+        // a global tint. The whole corpus is unlit (0 shaders use LightingV1)
+        // and these default to "0.3 0.3 0.3" on 195/197 scenes, so applying
+        // them globally would darken every scene to 30%. They stay unused
+        // (parsed only) — the visible lighting is the light-object glow.
 
+        // HDR wallpapers author a separate `bloomhdr*` set; with a single SDR
+        // bloom chain we pick that set when `hdr` is on, else the SDR one.
+        let hdr = general
+            .and_then(|g| g.hdr.as_ref())
+            .and_then(parse_value_bool)
+            .unwrap_or(false);
         let bloom = BloomSettings {
-            enabled: general
-                .and_then(|g| g.bloom.as_ref())
-                .and_then(parse_value_bool)
-                .unwrap_or(false),
+            enabled: hdr
+                || general
+                    .and_then(|g| g.bloom.as_ref())
+                    .and_then(parse_value_bool)
+                    .unwrap_or(false),
             strength: general
-                .and_then(|g| g.bloom_strength.as_ref())
+                .and_then(|g| {
+                    if hdr {
+                        g.bloom_hdr_strength.as_ref()
+                    } else {
+                        g.bloom_strength.as_ref()
+                    }
+                })
                 .and_then(parse_value_f32)
                 .unwrap_or(1.0),
             threshold: general
-                .and_then(|g| g.bloom_threshold.as_ref())
+                .and_then(|g| {
+                    if hdr {
+                        g.bloom_hdr_threshold.as_ref()
+                    } else {
+                        g.bloom_threshold.as_ref()
+                    }
+                })
                 .and_then(parse_value_f32)
                 .unwrap_or(0.5),
         };
+
+        // `general.zoom` (default 1.0) — a scene-wide scale about the center.
+        let zoom = general
+            .and_then(|g| g.zoom.as_ref())
+            .and_then(parse_value_f32)
+            .filter(|z| *z > 0.0)
+            .unwrap_or(1.0);
+        // Scene-global particle force (gravity + wind).
+        let scene_force = general.map(|g| g.particle_force()).unwrap_or([0.0, 0.0]);
 
         let dynamics = CameraDynamics::from_scene(&resolved.scene);
 
@@ -1338,11 +1738,14 @@ impl GpuSceneInstance {
                         (rect, 0.0, cam.view_depth(center))
                     }
                 } else {
+                    // `general.zoom` scales the whole scene about its center;
+                    // NDC (0,0) is the scene center, so a uniform rect scale
+                    // does it (center and half-extent both × zoom).
                     let rect = [
-                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32,
-                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32,
-                        (size_px[0] / w as f64) as f32,
-                        (size_px[1] / h as f64) as f32,
+                        (2.0 * l.origin[0] / w as f64 - 1.0) as f32 * zoom,
+                        (2.0 * l.origin[1] / h as f64 - 1.0) as f32 * zoom,
+                        (size_px[0] / w as f64) as f32 * zoom,
+                        (size_px[1] / h as f64) as f32 * zoom,
                     ];
                     (rect, l.angle, 0.0)
                 };
@@ -1368,12 +1771,79 @@ impl GpuSceneInstance {
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
                     order_index: l.order_index,
+                    visible: l.visible_base,
+                    visible_base: l.visible_base,
+                    transform_scripts: l.transform_scripts.clone(),
+                    effective_size,
+                    origin_base: l.origin,
+                    scale_base: [l.scale[0] as f32, l.scale[1] as f32, l.scale[2] as f32],
+                    angles_base: l.angles,
                 }
             })
             .collect();
 
         let scene_effects = collect_effects(&scene_model);
         let effect_runtimes = load_effect_runtimes(&mut renderer, dir, &scene_effects);
+
+        // Start desktop-audio capture only for scenes that actually react to
+        // it (avoids opening a capture device for every wallpaper).
+        // Start capture for audio shaders OR audio-reactive particle emitters.
+        let particles_use_audio = resolved.particle_layers.iter().any(|pl| {
+            pl.config
+                .emitter
+                .iter()
+                .any(|e| e.audioprocessingmode.is_some() || e.audioprocessingbounds.is_some())
+        });
+        let uses_audio =
+            particles_use_audio || effect_runtimes.iter().flatten().any(|r| r.uses_audio);
+        let audio_capture = if uses_audio {
+            crate::engine::audio::AudioCapture::start()
+        } else {
+            None
+        };
+
+        // Sound objects: decode + play each file (looped unless startsilent).
+        let mut sounds = Vec::new();
+        for obj in &resolved.scene.objects {
+            let Some(sound) = obj.sound.as_ref() else {
+                continue;
+            };
+            if obj
+                .startsilent
+                .as_ref()
+                .and_then(|v| {
+                    v.as_bool()
+                        .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+                })
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let volume = obj
+                .volume
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_f32)
+                .unwrap_or(1.0);
+            let mode = obj.playbackmode.as_ref().and_then(|v| v.as_str());
+            let looping = mode != Some("nointerrupt") && mode != Some("once");
+            // `sound` is an array of file paths; play the first that decodes.
+            let files: Vec<String> = match sound {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                serde_json::Value::String(s) => vec![s.clone()],
+                _ => Vec::new(),
+            };
+            for f in files {
+                if let Some(p) =
+                    crate::engine::audio::SoundPlayback::start(&dir.join(&f), volume, looping)
+                {
+                    sounds.push(p);
+                    break;
+                }
+            }
+        }
 
         // Allocate all persistent render targets up front so the render loop
         // can look them up immutably. Per-layer effect-chain FBOs (ping-pong
@@ -1434,6 +1904,7 @@ impl GpuSceneInstance {
                     spawn_center,
                     pl.overrides.as_ref(),
                 );
+                system.set_scene_force(scene_force);
                 if let Some(sprite) = &pl.sprite_texture {
                     system.set_sprite_frames(sprite.frames.len(), sprite.duration);
                 }
@@ -1465,6 +1936,100 @@ impl GpuSceneInstance {
             .map(|pl| pl.additive_blend)
             .collect();
 
+        // GPU particle sprite arrays. Sprite-less systems draw the CPU
+        // path's soft radial-falloff disc (alpha = (1-d)^2), baked once;
+        // texture-less ropes fall back to a solid white strip, matching the
+        // CPU flat fill.
+        let soft_disc = {
+            let mut img = RgbaImage::new(64, 64);
+            for y in 0..64u32 {
+                for x in 0..64u32 {
+                    let dx = (x as f32 + 0.5) / 32.0 - 1.0;
+                    let dy = (y as f32 + 0.5) / 32.0 - 1.0;
+                    let d = (dx * dx + dy * dy).sqrt().min(1.0);
+                    let t = 1.0 - d;
+                    let a = (t * t * 255.0) as u8;
+                    img.put_pixel(x, y, image::Rgba([255, 255, 255, a]));
+                }
+            }
+            img
+        };
+        let white = RgbaImage::from_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
+        let array_view = |tex: &wgpu::Texture| {
+            tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        };
+        let make_gpu_tex = |sprite: Option<&particle::ParticleSprite>,
+                            rope: bool|
+         -> ParticleGpuTex {
+            match sprite {
+                Some(sp) if !sp.frames.is_empty() => {
+                    let (tex, frames) = renderer.upload_texture_array(&sp.frames);
+                    ParticleGpuTex {
+                        view: array_view(&tex),
+                        frames,
+                        overbright: sp.overbright,
+                        repeat: rope,
+                    }
+                }
+                _ => {
+                    let img = if rope { &white } else { &soft_disc };
+                    let (tex, frames) = renderer.upload_texture_array(std::slice::from_ref(img));
+                    ParticleGpuTex {
+                        view: array_view(&tex),
+                        frames,
+                        overbright: 1.0,
+                        repeat: rope,
+                    }
+                }
+            }
+        };
+        let particle_gpu_assets: Vec<ParticleGpuAssets> = resolved
+            .particle_layers
+            .iter()
+            .zip(particle_systems.iter())
+            .map(|(pl, system)| ParticleGpuAssets {
+                parent: make_gpu_tex(pl.sprite_texture.as_ref(), system.is_rope()),
+                children: system
+                    .child_sprite_info()
+                    .into_iter()
+                    .map(|(sprite, rope)| make_gpu_tex(sprite, rope))
+                    .collect(),
+            })
+            .collect();
+
+        // Static 3D meshes: upload geometry + bake each MVP. Only reachable
+        // when the scene has a perspective camera to draw them through.
+        let mesh3d: Vec<Mesh3dGpu> = match &camera3d {
+            Some(cam) => resolved
+                .mesh3d_layers
+                .iter()
+                .map(|m| Self::build_mesh3d(&renderer, cam, m))
+                .collect(),
+            None => Vec::new(),
+        };
+        let mesh3d_depth = (!mesh3d.is_empty()).then(|| {
+            renderer
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("mesh3d_depth"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: MESH3D_DEPTH_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
+
         Ok(Self {
             renderer,
             layers,
@@ -1482,12 +2047,142 @@ impl GpuSceneInstance {
             particle_sprites,
             particle_order,
             particle_additive,
+            particle_gpu_assets,
             start: Instant::now(),
             last_time: 0.0,
             mouse_norm: [0.5, 0.5],
             script_ctx: crate::engine::script::ScriptContext::new(),
+            audio_capture,
+            _sounds: sounds,
             perspective: camera3d.is_some(),
+            mesh3d,
+            mesh3d_depth,
         })
+    }
+
+    /// Upload one mesh's geometry and bake its MVP. Geometry and transform are
+    /// both static in real content, so this runs once at load.
+    fn build_mesh3d(
+        renderer: &GpuSceneRenderer,
+        cam: &crate::engine::camera3d::PerspectiveCamera,
+        layer: &crate::engine::render::Mesh3dLayer,
+    ) -> Mesh3dGpu {
+        // Interleave position+uv into the vs_mesh3d vertex layout (stride 20).
+        let mut verts: Vec<u8> = Vec::with_capacity(layer.mesh.positions.len() * 20);
+        for (p, uv) in layer.mesh.positions.iter().zip(&layer.mesh.uvs) {
+            for f in [p[0], p[1], p[2], uv[0], uv[1]] {
+                verts.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let vbuf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_verts"),
+            size: verts.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer.queue.write_buffer(&vbuf, 0, &verts);
+
+        let idx: Vec<u8> = layer
+            .mesh
+            .indices
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let ibuf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_indices"),
+            size: idx.len() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer.queue.write_buffer(&ibuf, 0, &idx);
+
+        let mvp = cam.mvp(layer.origin, layer.angles, layer.scale);
+        let mut params: Vec<u8> = Vec::with_capacity(64);
+        for col in mvp.iter() {
+            for f in col {
+                params.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let ubo = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_mvp"),
+            size: params.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer.queue.write_buffer(&ubo, 0, &params);
+
+        let tex = renderer.upload_texture(&layer.texture);
+        let view = tex.create_view(&Default::default());
+        let bind_group = renderer
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh3d_bg"),
+                layout: &renderer.mesh3d_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        // Meshes wrap their UVs (skyboxes/spheres tile).
+                        resource: wgpu::BindingResource::Sampler(&renderer.samplers[0]),
+                    },
+                ],
+            });
+
+        Mesh3dGpu {
+            vbuf,
+            ibuf,
+            index_count: layer.mesh.indices.len() as u32,
+            bind_group,
+            nocull: layer.nocull,
+        }
+    }
+
+    /// Draw every static mesh in one depth-tested pass, over the cleared scene
+    /// target and under the 2D layers.
+    ///
+    /// ponytail: meshes always draw before all 2D layers rather than
+    /// interleaving by `order_index` — real mesh scenes put their 2D content on
+    /// top (overlays/UI) so it hasn't mattered. Interleaving needs the depth
+    /// buffer shared with the composite pipeline.
+    fn draw_mesh3d(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
+        let Some(depth) = &self.mesh3d_depth else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mesh3d_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        for m in &self.mesh3d {
+            pass.set_pipeline(&self.renderer.mesh3d_pipelines[m.nocull as usize]);
+            pass.set_bind_group(0, &m.bind_group, &[]);
+            pass.set_vertex_buffer(0, m.vbuf.slice(..));
+            pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..m.index_count, 0, 0..1);
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -1523,11 +2218,67 @@ impl GpuSceneInstance {
                 .map(|d| d.as_secs() % 86_400)
                 .unwrap_or(0);
             let time_of_day = secs_into_day as f32 / 3600.0;
+            let (w, h, persp) = (self.width, self.height, self.perspective);
             let ctx = &mut self.script_ctx;
-            ctx.set_time(time, time_of_day);
+            ctx.set_time(time, time_of_day, (time - self.last_time).max(0.0));
             for layer in &mut self.layers {
                 if let Some(script) = &layer.alpha_script {
-                    layer.alpha = ctx.eval_update(script, layer.alpha_base).unwrap_or(layer.alpha_base);
+                    layer.alpha = ctx
+                        .eval_update(script, layer.alpha_base)
+                        .unwrap_or(layer.alpha_base);
+                }
+                // Transform scripts. `visible` gates the draw; scale/origin
+                // rebuild `rect`; angles rebuilds `angle`. The rect rebuild is
+                // 2D-only (perspective layers keep their camera-projected rect).
+                // Each script borrow is scoped to its eval so the `rect`/`angle`
+                // writes below don't overlap it.
+                if let Some(v) = layer
+                    .transform_scripts
+                    .visible
+                    .as_ref()
+                    .and_then(|s| ctx.eval_update_bool(s, layer.visible_base))
+                {
+                    layer.visible = v;
+                }
+                if !persp
+                    && (layer.transform_scripts.scale.is_some()
+                        || layer.transform_scripts.origin.is_some())
+                {
+                    let scale = match &layer.transform_scripts.scale {
+                        Some(s) => ctx
+                            .eval_update_vec3(s, layer.scale_base)
+                            .unwrap_or(layer.scale_base),
+                        None => layer.scale_base,
+                    };
+                    let origin_base = [
+                        layer.origin_base[0] as f32,
+                        layer.origin_base[1] as f32,
+                        layer.origin_base[2] as f32,
+                    ];
+                    let origin = match &layer.transform_scripts.origin {
+                        Some(s) => ctx.eval_update_vec3(s, origin_base).unwrap_or(origin_base),
+                        None => origin_base,
+                    };
+                    let size_px = [
+                        layer.effective_size[0] * scale[0] as f64,
+                        layer.effective_size[1] * scale[1] as f64,
+                    ];
+                    layer.rect = [
+                        (2.0 * origin[0] as f64 / w as f64 - 1.0) as f32,
+                        (2.0 * origin[1] as f64 / h as f64 - 1.0) as f32,
+                        (size_px[0] / w as f64) as f32,
+                        (size_px[1] / h as f64) as f32,
+                    ];
+                }
+                if !persp {
+                    if let Some(a) = layer
+                        .transform_scripts
+                        .angles
+                        .as_ref()
+                        .and_then(|s| ctx.eval_update_vec3(s, layer.angles_base))
+                    {
+                        layer.angle = -a[2];
+                    }
                 }
                 // Script-driven text: re-evaluate; only a CHANGED string pays
                 // for rasterization + upload (a clock re-rasterizes once per
@@ -1555,10 +2306,7 @@ impl GpuSceneInstance {
                                     Some(&td.alignment),
                                     scaled,
                                 );
-                                let origin = [
-                                    td.raw_origin[0] + off[0],
-                                    td.raw_origin[1] + off[1],
-                                ];
+                                let origin = [td.raw_origin[0] + off[0], td.raw_origin[1] + off[1]];
                                 layer.rect = [
                                     (2.0 * origin[0] / self.width as f64 - 1.0) as f32,
                                     (2.0 * origin[1] / self.height as f64 - 1.0) as f32,
@@ -1571,6 +2319,21 @@ impl GpuSceneInstance {
                         }
                     }
                 }
+            }
+        }
+
+        // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
+        // drive audio-reactive particle emitters from the overall loudness.
+        if let Some(cap) = &self.audio_capture {
+            let spectrum = cap.spectrum();
+            self.renderer.queue.write_buffer(
+                &self.renderer.audio_buf,
+                0,
+                &spectrum.to_uniform_bytes(),
+            );
+            let level = spectrum.average_level();
+            for system in &mut self.particle_systems {
+                system.set_audio_level(level);
             }
         }
 
@@ -1603,6 +2366,9 @@ impl GpuSceneInstance {
                 ..Default::default()
             });
         }
+
+        // 1b. Static 3D meshes, depth-tested, under everything 2D.
+        self.draw_mesh3d(&mut encoder, &target_view);
 
         // Re-pose animated puppet layers at a capped rate: skin the mesh at
         // the current animation time and re-upload frames[0]. CPU skinning +
@@ -1651,6 +2417,8 @@ impl GpuSceneInstance {
             .layers
             .iter()
             .enumerate()
+            // A `visible` script can hide a layer this frame — drop it here.
+            .filter(|(_, l)| l.visible)
             .map(|(i, l)| (l.order_index, DrawItem::Image(i)))
             .chain(
                 self.particle_systems
@@ -1684,7 +2452,13 @@ impl GpuSceneInstance {
         for (_, item) in items {
             match item {
                 DrawItem::Image(layer_idx) => {
-                    self.draw_image_layer_gpu(&mut encoder, &target_view, layer_idx, time, dynamics);
+                    self.draw_image_layer_gpu(
+                        &mut encoder,
+                        &target_view,
+                        layer_idx,
+                        time,
+                        dynamics,
+                    );
                 }
                 DrawItem::Particle(idx) => {
                     self.draw_particle_layer_gpu(&mut encoder, &target_view, idx, delta);
@@ -2043,6 +2817,119 @@ impl GpuSceneInstance {
     /// the bbox size changes frame-to-frame needs UV-subregion plumbing the
     /// composite shader doesn't have today.
     fn draw_particle_layer_gpu(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        idx: usize,
+        delta: f32,
+    ) {
+        // Escape hatch for A/B comparison against the old budgeted CPU
+        // rasterizer during the GPU-pipeline transition.
+        if std::env::var("WP_PARTICLE_CPU").is_ok() {
+            self.draw_particle_layer_cpu_raster(encoder, target_view, idx, delta);
+            return;
+        }
+        self.particle_systems[idx].step(delta);
+
+        // Draw units: the parent system, then every live child instance
+        // (each child preset has its own sprite/blending).
+        let system = &self.particle_systems[idx];
+        let assets = &self.particle_gpu_assets[idx];
+        let mut units: Vec<(Vec<particle::GpuVertex>, &ParticleGpuTex, bool)> = Vec::new();
+        let mut verts = Vec::new();
+        system.emit_gpu_vertices(&mut verts, assets.parent.frames as usize);
+        if !verts.is_empty() {
+            units.push((verts, &assets.parent, self.particle_additive[idx]));
+        }
+        system.visit_gpu_children(&mut |inst, child_idx, child_additive| {
+            let tex = assets.children.get(child_idx).unwrap_or(&assets.parent);
+            let mut v = Vec::new();
+            inst.emit_gpu_vertices(&mut v, tex.frames as usize);
+            if !v.is_empty() {
+                units.push((v, tex, child_additive));
+            }
+        });
+
+        for (verts, tex, additive) in units {
+            let bytes = particle::GpuVertex::as_bytes(&verts);
+            let vbuf = self.renderer.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("particle_verts"),
+                size: bytes.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.renderer.queue.write_buffer(&vbuf, 0, &bytes);
+
+            let mut params = Vec::with_capacity(16);
+            for f in [
+                self.width as f32,
+                self.height as f32,
+                tex.overbright,
+                tex.frames as f32,
+            ] {
+                params.extend_from_slice(&f.to_le_bytes());
+            }
+            let pbuf = self.renderer.make_uniform_buffer(&params, 16);
+            // Linear-repeat for ropes (V tiles past 1.0), linear-clamp for
+            // sprite quads (padding-safe at the edges).
+            let sampler = &self.renderer.samplers[if tex.repeat { 0 } else { 1 }];
+            let bg = self
+                .renderer
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("particle_bg"),
+                    layout: &self.renderer.particle_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: vbuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: pbuf.as_entire_binding(),
+                        },
+                    ],
+                });
+
+            let pipeline = if additive {
+                &self.renderer.particle_pipeline_add
+            } else {
+                &self.renderer.particle_pipeline_over
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("particle_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..verts.len() as u32, 0..1);
+        }
+    }
+
+    /// The pre-GPU-pipeline particle path: budgeted CPU rasterization into a
+    /// bbox buffer, uploaded and composited as a stretched quad. Kept behind
+    /// WP_PARTICLE_CPU=1 for A/B comparison; the CPU compositor paths
+    /// (render.rs/animated.rs) share the same underlying rasterizer.
+    fn draw_particle_layer_cpu_raster(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         target_view: &wgpu::TextureView,
@@ -2483,21 +3370,38 @@ fn load_effect_instance(
                         let candidates = [format!("materials/{n}.tex"), format!("{n}.tex")];
                         candidates.iter().find_map(|rel| {
                             let bytes = resolver.read(rel)?;
-                            crate::engine::tex::TexFile::parse(&bytes).ok()?.to_rgba().ok()
+                            crate::engine::tex::TexFile::parse(&bytes)
+                                .ok()?
+                                .to_rgba()
+                                .ok()
                         })
                     });
-                // Missing-slot fallback is normally white (= unmasked), but
+                // Missing-slot fallbacks: normally white (= unmasked), but
                 // shake's slot 1 is a FLOW map whose authored default is
-                // util/noflow — rg 0.498 gray, "no pixel moves". A white
-                // fallback there would shear the whole layer diagonally.
+                // util/noflow — rg 0.498 gray, "no pixel moves" (white would
+                // shear the whole layer diagonally), and pulse's slot 1 is
+                // its noise source, authored default util/noise.
+                let img = img.or_else(|| {
+                    if effect_name == "pulse" && slot_i == 0 {
+                        let bytes = resolver.read("materials/util/noise.tex")?;
+                        crate::engine::tex::TexFile::parse(&bytes)
+                            .ok()?
+                            .to_rgba()
+                            .ok()
+                    } else {
+                        None
+                    }
+                });
                 let fallback = if effect_name == "shake" && slot_i == 0 {
                     image::Rgba([127, 127, 127, 255])
                 } else {
                     image::Rgba([255, 255, 255, 255])
                 };
-                textures.push(renderer.upload_texture(
-                    &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
-                ));
+                textures.push(
+                    renderer.upload_texture(
+                        &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
+                    ),
+                );
             }
         }
         // A shake with no texture overrides at all authors no flow map either
@@ -2537,6 +3441,7 @@ fn load_effect_instance(
                 vertex_buffers: Vec::new(),
             }],
             fbos: Vec::new(),
+            uses_audio: false,
         });
     }
     let Ok(eff_def) = effect_def::load_effect_by_file(resolver, &inst.file) else {
@@ -2568,6 +3473,7 @@ fn load_effect_instance(
 
     let default_override = PassOverride::default();
     let mut passes: Vec<EffectPassRuntime> = Vec::new();
+    let mut uses_audio = false;
     for (pass_idx, pass) in eff_def.passes.iter().enumerate() {
         let Some(mat_path) = pass.material.as_deref() else {
             continue;
@@ -2698,6 +3604,7 @@ fn load_effect_instance(
                 continue;
             }
         };
+        uses_audio |= translated.uses_audio;
         let key = format!("fx{instance_idx}:{effect_name}#{pass_idx}");
         // Temporary debug hook: dump translated WGSL per pass.
         if std::env::var("WP_DEBUG_DUMP_WGSL").is_ok() {
@@ -2835,7 +3742,11 @@ fn load_effect_instance(
         return None;
     }
     tracing::debug!(target: "effect", "LOADED '{effect_name}' ({} passes)", passes.len());
-    Some(EffectRuntime { passes, fbos })
+    Some(EffectRuntime {
+        passes,
+        fbos,
+        uses_audio,
+    })
 }
 
 /// Continuously render scene frames into a channel (preview window, headless
@@ -3116,15 +4027,19 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "phase", 0.0),
             get(vals, "bounds_r", 0.0),
             get(vals, "bounds_g", 1.0),
-            0.0,
+            get(vals, "combo_BLENDMODE", 9.0),
             get(vals, "tintlow_r", 1.0),
             get(vals, "tintlow_g", 1.0),
             get(vals, "tintlow_b", 1.0),
-            0.0, // pad
+            get(vals, "combo_PULSECOLOR", 1.0),
             get(vals, "tinthigh_r", 1.0),
             get(vals, "tinthigh_g", 1.0),
             get(vals, "tinthigh_b", 1.0),
-            0.0, // pad
+            get(vals, "combo_PULSEALPHA", 0.0),
+            get(vals, "noisespeed", 0.5),
+            get(vals, "noiseamount", 0.0),
+            0.0,
+            0.0,
         ]),
         "scroll" => pack(&[
             time,
@@ -3160,7 +4075,16 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             let g = get(vals, "color_g", 0.0);
             let b = get(vals, "color_b", 0.0);
             let a = get(vals, "alpha", 1.0);
-            pack(&[r, g, b, a])
+            pack(&[
+                r,
+                g,
+                b,
+                a,
+                get(vals, "combo_BLENDMODE", 30.0),
+                0.0,
+                0.0,
+                0.0,
+            ])
         }
         "opacity" => pack(&[get(vals, "alpha", 1.0), 0.0, 0.0, 0.0]),
         "waterripple" => pack(&[
@@ -3191,7 +4115,7 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "center_g", 0.5),
             get(vals, "size", 0.1),
             get(vals, "feather", 0.002),
-            0.0,
+            get(vals, "combo_REPEAT", 1.0),
             0.0,
         ]),
         _ => vec![0u8; 32],

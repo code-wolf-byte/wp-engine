@@ -136,6 +136,54 @@ impl PerspectiveCamera {
         let m = &self.view;
         -(m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2])
     }
+
+    /// `view_proj` with GL's clip-space z ([-1,1]) remapped to wgpu's ([0,1]),
+    /// column-major and ready to upload. [`project`](Self::project) reads only
+    /// x/y so it never needed this; a depth buffer does.
+    pub fn view_proj_gpu(&self) -> Mat4 {
+        let mut fix = identity();
+        fix[2][2] = 0.5;
+        fix[3][2] = 0.5;
+        mat4_mul(&fix, &self.view_proj)
+    }
+
+    /// Full model-view-projection for an object, column-major and ready to
+    /// upload as a `mat4x4<f32>` uniform.
+    pub fn mvp(&self, origin: [f32; 3], angles: [f32; 3], scale: [f32; 3]) -> Mat4 {
+        mat4_mul(&self.view_proj_gpu(), &model_matrix(origin, angles, scale))
+    }
+}
+
+fn identity() -> Mat4 {
+    let mut m = [[0.0f32; 4]; 4];
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    m
+}
+
+/// Model matrix for a scene object: translate(origin) · Rz·Ry·Rx · scale —
+/// the same convention as [`rotate_euler`].
+pub fn model_matrix(origin: [f32; 3], angles: [f32; 3], scale: [f32; 3]) -> Mat4 {
+    let (sx, cx) = angles[0].sin_cos();
+    let (sy, cy) = angles[1].sin_cos();
+    let (sz, cz) = angles[2].sin_cos();
+    // Rz·Ry·Rx, expanded, with each column pre-scaled.
+    let r = [
+        [cz * cy, sz * cy, -sy],
+        [cz * sy * sx - sz * cx, sz * sy * sx + cz * cx, cy * sx],
+        [cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx],
+    ];
+    let mut m = identity();
+    for c in 0..3 {
+        for row in 0..3 {
+            m[c][row] = r[c][row] * scale[c];
+        }
+    }
+    m[3][0] = origin[0];
+    m[3][1] = origin[1];
+    m[3][2] = origin[2];
+    m
 }
 
 /// Rotate `v` by intrinsic Euler angles in radians (WE `angles`, stored as
@@ -155,6 +203,28 @@ pub fn rotate_euler(v: [f32; 3], angles: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `model_matrix` expands the same Rz·Ry·Rx that `rotate_euler` applies
+    /// step by step — they must not drift apart.
+    #[test]
+    fn model_matrix_rotation_matches_rotate_euler() {
+        let angles = [0.3, -1.1, 2.4];
+        let scale = [2.0, 0.5, 3.0];
+        let origin = [10.0, -4.0, 7.0];
+        let m = model_matrix(origin, angles, scale);
+        for v in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.3, -0.7, 0.5]] {
+            let want = rotate_euler([v[0] * scale[0], v[1] * scale[1], v[2] * scale[2]], angles);
+            let got: Vec<f32> = (0..3)
+                .map(|r| m[0][r] * v[0] + m[1][r] * v[1] + m[2][r] * v[2] + m[3][r])
+                .collect();
+            for i in 0..3 {
+                assert!(
+                    (got[i] - (want[i] + origin[i])).abs() < 1e-5,
+                    "axis {i}: got {got:?} want {want:?} + {origin:?}"
+                );
+            }
+        }
+    }
 
     fn scene_json(json: &str) -> Scene {
         serde_json::from_str(json).unwrap()

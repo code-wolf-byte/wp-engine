@@ -14,9 +14,54 @@
 
 use image::RgbaImage;
 
+/// Rasterize `text` (one or more `\n`-separated lines) at `point_size` pixels.
+/// Returns `None` for empty text. Multi-line strings (scripted clocks/dates
+/// like `"7/13/2026\n8:35 AM"`) stack their lines vertically, centered.
+pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaImage> {
+    if text.is_empty() {
+        return None;
+    }
+    if !text.contains('\n') {
+        return rasterize_line(font_data, text, point_size);
+    }
+    // Multi-line: rasterize each line, then stack. Blank lines reserve a gap.
+    let font = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).ok()?;
+    let line_h = font
+        .horizontal_line_metrics(point_size)
+        .map(|m| (m.ascent - m.descent + m.line_gap).ceil() as u32)
+        .unwrap_or((point_size * 1.2).ceil() as u32)
+        .max(1);
+    let lines: Vec<Option<RgbaImage>> = text
+        .split('\n')
+        .map(|l| rasterize_line(font_data, l, point_size))
+        .collect();
+    let width = lines
+        .iter()
+        .filter_map(|l| l.as_ref().map(|i| i.width()))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let height = (line_h * lines.len() as u32).max(1);
+    let mut img = RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 0]));
+    for (i, line) in lines.iter().enumerate() {
+        let Some(line) = line else { continue };
+        // Center each line horizontally within the block, top-align in its row.
+        let ox = (width - line.width()) / 2;
+        let oy = i as u32 * line_h;
+        for (x, y, px) in line.enumerate_pixels() {
+            if px[3] > 0 {
+                if let Some(dst) = img.get_pixel_mut_checked(ox + x, oy + y) {
+                    *dst = *px;
+                }
+            }
+        }
+    }
+    Some(img)
+}
+
 /// Rasterize a single line of `text` at `point_size` pixels using `font_data`.
 /// Returns `None` for empty text (nothing to draw).
-pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaImage> {
+fn rasterize_line(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaImage> {
     if text.is_empty() {
         return None;
     }
@@ -46,7 +91,11 @@ pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaIm
 
     let width = (pen_x.ceil() as u32).max(1);
     let height = ((max_ascent + max_descent).max(1)) as u32;
-    let mut img = RgbaImage::new(width, height);
+    // Fill RGB white with alpha 0 (not the default all-zero = black/transparent).
+    // Glyphs are white with coverage-as-alpha, so linear filtering / downscaling
+    // interpolates white↔white at edges instead of white↔black — the latter
+    // leaves a dark halo/outline around every glyph.
+    let mut img = RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 0]));
 
     for g in &glyphs {
         let dst_x0 = g.pen_x as i32 + g.metrics.xmin;
@@ -74,6 +123,83 @@ pub fn rasterize(font_data: &[u8], text: &str, point_size: f32) -> Option<RgbaIm
         }
     }
     Some(img)
+}
+
+/// Word-wrap `text` so each line's rendered width stays under `max_width` px
+/// at `point_size`, inserting `\n`. Existing `\n` are preserved. `max_rows`,
+/// when >0, truncates to that many lines. Used for text objects that set
+/// `maxwidth`/`maxrows`.
+pub fn wrap_text(
+    font_data: &[u8],
+    text: &str,
+    point_size: f32,
+    max_width: f32,
+    max_rows: usize,
+) -> String {
+    let Some(font) = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).ok()
+    else {
+        return text.to_string();
+    };
+    let width_of = |s: &str| -> f32 {
+        s.chars()
+            .map(|c| font.metrics(c, point_size).advance_width)
+            .sum()
+    };
+    let mut out: Vec<String> = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split(' ') {
+            let candidate = if line.is_empty() {
+                word.to_string()
+            } else {
+                format!("{line} {word}")
+            };
+            if !line.is_empty() && width_of(&candidate) > max_width {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            } else {
+                line = candidate;
+            }
+        }
+        out.push(line);
+    }
+    if max_rows > 0 && out.len() > max_rows {
+        out.truncate(max_rows);
+    }
+    out.join("\n")
+}
+
+/// Composite white-coverage `glyphs` (tinted `text_color`, 0-1) onto an opaque
+/// `bg` box (0-1) expanded by `pad` px on every side. Colors are baked in, so
+/// the caller draws the result with no further tint. `opaquebackground`.
+pub fn with_background(
+    glyphs: &RgbaImage,
+    text_color: [f32; 3],
+    bg: [f32; 3],
+    pad: u32,
+) -> RgbaImage {
+    let w = glyphs.width() + pad * 2;
+    let h = glyphs.height() + pad * 2;
+    let bgp = image::Rgba([
+        (bg[0] * 255.0) as u8,
+        (bg[1] * 255.0) as u8,
+        (bg[2] * 255.0) as u8,
+        255,
+    ]);
+    let mut out = RgbaImage::from_pixel(w, h, bgp);
+    for (x, y, px) in glyphs.enumerate_pixels() {
+        let a = px[3] as f32 / 255.0;
+        if a <= 0.0 {
+            continue;
+        }
+        // Glyph is white-with-coverage; tint by text_color, then over bg.
+        let dst = out.get_pixel_mut(x + pad, y + pad);
+        for i in 0..3 {
+            let fg = text_color[i] * 255.0;
+            dst[i] = (fg * a + dst[i] as f32 * (1.0 - a)) as u8;
+        }
+    }
+    out
 }
 
 /// Resolve font bytes for a text object's `font` field: a wallpaper-bundled

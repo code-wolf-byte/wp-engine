@@ -249,7 +249,11 @@ fn resolve_particle_sprite_asset(assets: &AssetStore, tex_name: &str) -> Option<
             let duration: f32 = tex.frames().iter().map(|f| f.frametime).sum();
             tex.to_particle_rgba_frames()
                 .ok()
-                .map(|frames| ParticleSprite { frames, duration, overbright: 1.0 })
+                .map(|frames| ParticleSprite {
+                    frames,
+                    duration,
+                    overbright: 1.0,
+                })
         }
         Err(_) => image::load_from_memory(&asset.bytes)
             .ok()
