@@ -746,3 +746,30 @@ fn fs_particles(in: ParticleVsOut) -> @location(0) vec4<f32> {
     // genericparticle.frag: albedo * vertex color, rgb *= g_Overbright.
     return vec4(s.rgb * in.color.rgb * pdraw.overbright, s.a * in.color.a);
 }
+
+// ── Static 3D meshes ──────────────────────────────────────────────────────────
+// Real geometry (spheres, skyboxes, cylinders) from a scene object's `model`
+// .mdl, drawn through the scene camera with a depth buffer — unlike every other
+// pipeline here, which composites flat quads. See `engine::mesh3d`.
+
+@group(0) @binding(0) var<uniform> mesh3d_mvp: mat4x4<f32>;
+@group(0) @binding(1) var mesh3d_tex: texture_2d<f32>;
+@group(0) @binding(2) var mesh3d_sampler: sampler;
+
+struct Mesh3dVsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_mesh3d(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>) -> Mesh3dVsOut {
+    var out: Mesh3dVsOut;
+    out.position = mesh3d_mvp * vec4(pos, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
+    return textureSample(mesh3d_tex, mesh3d_sampler, in.uv);
+}

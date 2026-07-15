@@ -50,6 +50,10 @@ pub struct Mesh3dLayer {
     pub origin: [f32; 3],
     pub scale: [f32; 3],
     pub angles: [f32; 3],
+    /// The material's `"cullmode": "nocull"` — draw both faces. Everything
+    /// else culls back faces, which is what lets a skybox's near hemisphere
+    /// drop out instead of hiding the whole scene inside it.
+    pub nocull: bool,
     pub order_index: usize,
 }
 
@@ -1331,15 +1335,23 @@ fn mesh3d_layer_from_object(
             .or_else(|| pkg.and_then(|p2| load_texture_from_pkg(p2, p).ok()))
             .map(|l| l.image)
     };
+    let pass = material_first_pass(dir, pkg, &mesh.material);
     let texture = resolve_tex(&mesh.material)
         .or_else(|| resolve_tex(&mesh.material.to_lowercase()))
         // Untextured materials are normal here (`"textures": [null,null,null]`
         // with a flat `color` constant): draw them as that color. An
         // unresolvable material falls through to white rather than vanishing.
         .unwrap_or_else(|| {
-            let [r, g, b] = material_constant_color(dir, pkg, &mesh.material).unwrap_or([255; 3]);
+            let [r, g, b] = pass
+                .as_ref()
+                .and_then(pass_constant_color)
+                .unwrap_or([255; 3]);
             RgbaImage::from_pixel(1, 1, image::Rgba([r, g, b, 255]))
         });
+    let nocull = pass
+        .as_ref()
+        .and_then(|p| p.get("cullmode")?.as_str())
+        .is_some_and(|m| m == "nocull");
 
     let scale = obj
         .scale
@@ -1367,6 +1379,7 @@ fn mesh3d_layer_from_object(
         origin: [o[0] as f32, o[1] as f32, o[2] as f32],
         scale,
         angles,
+        nocull,
         order_index: 0,
     })
 }
@@ -1670,25 +1683,23 @@ fn pass_overbright(pass: &serde_json::Value) -> f32 {
         .unwrap_or(1.0)
 }
 
-/// A material's flat `color` constant, as 8-bit RGB. Only meaningful for
-/// materials with no texture at all — see `mesh3d_layer_from_object`.
-fn material_constant_color(
+/// A mesh material's first pass. Meshes need two things out of it that the
+/// texture chain doesn't carry: the flat `color` constant and `cullmode`.
+fn material_first_pass(
     dir: Option<&Path>,
     pkg: Option<&Package>,
     json_path: &str,
-) -> Option<[u8; 3]> {
+) -> Option<serde_json::Value> {
     let data = read_asset_bytes(dir, pkg, json_path)
         .or_else(|| read_asset_bytes(dir, pkg, &json_path.to_lowercase()))?;
-    parse_material_constant_color(&data)
+    let val: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    val.get("passes")?.as_array()?.first().cloned()
 }
 
-fn parse_material_constant_color(data: &[u8]) -> Option<[u8; 3]> {
-    let val: serde_json::Value = serde_json::from_slice(data).ok()?;
-    let consts = val
-        .get("passes")?
-        .as_array()?
-        .first()?
-        .get("constantshadervalues")?;
+/// A material's flat `color` constant, as 8-bit RGB. Only meaningful for
+/// materials with no texture at all — see `mesh3d_layer_from_object`.
+fn pass_constant_color(pass: &serde_json::Value) -> Option<[u8; 3]> {
+    let consts = pass.get("constantshadervalues")?;
     // WE keys this as `color`; `Color` is a separate (usually white) tint.
     let s = consts.get("color").or_else(|| consts.get("Color"))?.as_str()?;
     let c = crate::engine::effect::parse_color(s);
@@ -1968,10 +1979,13 @@ mod tests {
     #[test]
     fn material_constant_color_reads_flat_color() {
         // `color` wins over the separate (usually white) `Color` tint.
-        let m = br#"{"passes":[{"textures":[null],"constantshadervalues":
-                    {"Color":"1.0 1.0 1.0","color":"0.6 0.0 0.2"}}]}"#;
-        assert_eq!(parse_material_constant_color(m), Some([153, 0, 51]));
-        assert_eq!(parse_material_constant_color(br#"{"passes":[{}]}"#), None);
+        let m: serde_json::Value = serde_json::from_str(
+            r#"{"textures":[null],"constantshadervalues":
+               {"Color":"1.0 1.0 1.0","color":"0.6 0.0 0.2"}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(pass_constant_color(&m), Some([153, 0, 51]));
+        assert_eq!(pass_constant_color(&serde_json::json!({})), None);
     }
 
     fn solid_particle_config(color: &str) -> particle::ParticleConfig {

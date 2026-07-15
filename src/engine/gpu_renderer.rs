@@ -94,7 +94,20 @@ pub struct GpuSceneRenderer {
     particle_bgl: wgpu::BindGroupLayout,
     particle_pipeline_add: wgpu::RenderPipeline,
     particle_pipeline_over: wgpu::RenderPipeline,
+    // Static 3D mesh pipeline (vs_mesh3d/fs_mesh3d): real indexed geometry
+    // through the scene camera, and the only pipeline here with a depth
+    // buffer — a sphere self-occludes, which no painter's ordering can fake.
+    mesh3d_bgl: wgpu::BindGroupLayout,
+    /// Indexed by the material's `nocull`: back-face culling is what makes a
+    /// skybox work (its near hemisphere culls away instead of hiding the
+    /// scene inside it), while `"cullmode": "nocull"` materials — hollow
+    /// shells meant to be seen from both sides — must keep every face.
+    mesh3d_pipelines: [wgpu::RenderPipeline; 2],
 }
+
+/// Depth format for the 3D mesh pass. Depth32Float is guaranteed everywhere
+/// wgpu runs, so there's no fallback to pick.
+const MESH3D_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 impl GpuSceneRenderer {
     pub fn new(gpu: GpuDevice) -> Result<Self> {
@@ -441,6 +454,88 @@ impl GpuSceneRenderer {
             wgpu::TextureFormat::Rgba8Unorm,
         );
 
+        let mesh3d_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh3d_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let mesh3d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh3d_layout"),
+            bind_group_layouts: &[&mesh3d_bgl],
+            push_constant_ranges: &[],
+        });
+        let make_mesh3d_pipeline = |cull: Option<wgpu::Face>, label: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh3d_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_mesh3d"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 20,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_mesh3d"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: cull,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: MESH3D_DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let mesh3d_pipelines = [
+            make_mesh3d_pipeline(Some(wgpu::Face::Back), "mesh3d"),
+            make_mesh3d_pipeline(None, "mesh3d_nocull"),
+        ];
+
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
 
         Ok(Self {
@@ -466,6 +561,8 @@ impl GpuSceneRenderer {
             bloom_blur_pipeline,
             bloom_combine_pipeline,
             blit_pipelines: HashMap::new(),
+            mesh3d_bgl,
+            mesh3d_pipelines,
             particle_bgl,
             particle_pipeline_add,
             particle_pipeline_over,
@@ -1427,6 +1524,22 @@ pub struct GpuSceneInstance {
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
     perspective: bool,
+    /// Static 3D meshes (`model` -> .mdl), drawn as real geometry before the
+    /// 2D layers composite over them. Empty for every scene that has none.
+    mesh3d: Vec<Mesh3dGpu>,
+    /// Depth buffer for `mesh3d`; `None` when there are no meshes. The 2D
+    /// layers never touch it — they keep their painter's ordering.
+    mesh3d_depth: Option<wgpu::TextureView>,
+}
+
+/// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
+/// baked at load because these objects don't animate in real content.
+struct Mesh3dGpu {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    index_count: u32,
+    bind_group: wgpu::BindGroup,
+    nocull: bool,
 }
 
 impl GpuSceneInstance {
@@ -1887,6 +2000,36 @@ impl GpuSceneInstance {
             })
             .collect();
 
+        // Static 3D meshes: upload geometry + bake each MVP. Only reachable
+        // when the scene has a perspective camera to draw them through.
+        let mesh3d: Vec<Mesh3dGpu> = match &camera3d {
+            Some(cam) => resolved
+                .mesh3d_layers
+                .iter()
+                .map(|m| Self::build_mesh3d(&renderer, cam, m))
+                .collect(),
+            None => Vec::new(),
+        };
+        let mesh3d_depth = (!mesh3d.is_empty()).then(|| {
+            renderer
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("mesh3d_depth"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: MESH3D_DEPTH_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        });
+
         Ok(Self {
             renderer,
             layers,
@@ -1912,7 +2055,134 @@ impl GpuSceneInstance {
             audio_capture,
             _sounds: sounds,
             perspective: camera3d.is_some(),
+            mesh3d,
+            mesh3d_depth,
         })
+    }
+
+    /// Upload one mesh's geometry and bake its MVP. Geometry and transform are
+    /// both static in real content, so this runs once at load.
+    fn build_mesh3d(
+        renderer: &GpuSceneRenderer,
+        cam: &crate::engine::camera3d::PerspectiveCamera,
+        layer: &crate::engine::render::Mesh3dLayer,
+    ) -> Mesh3dGpu {
+        // Interleave position+uv into the vs_mesh3d vertex layout (stride 20).
+        let mut verts: Vec<u8> = Vec::with_capacity(layer.mesh.positions.len() * 20);
+        for (p, uv) in layer.mesh.positions.iter().zip(&layer.mesh.uvs) {
+            for f in [p[0], p[1], p[2], uv[0], uv[1]] {
+                verts.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let vbuf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_verts"),
+            size: verts.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer.queue.write_buffer(&vbuf, 0, &verts);
+
+        let idx: Vec<u8> = layer
+            .mesh
+            .indices
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let ibuf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_indices"),
+            size: idx.len() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer.queue.write_buffer(&ibuf, 0, &idx);
+
+        let mvp = cam.mvp(layer.origin, layer.angles, layer.scale);
+        let mut params: Vec<u8> = Vec::with_capacity(64);
+        for col in mvp.iter() {
+            for f in col {
+                params.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let ubo = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_mvp"),
+            size: params.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer.queue.write_buffer(&ubo, 0, &params);
+
+        let tex = renderer.upload_texture(&layer.texture);
+        let view = tex.create_view(&Default::default());
+        let bind_group = renderer
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mesh3d_bg"),
+                layout: &renderer.mesh3d_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        // Meshes wrap their UVs (skyboxes/spheres tile).
+                        resource: wgpu::BindingResource::Sampler(&renderer.samplers[0]),
+                    },
+                ],
+            });
+
+        Mesh3dGpu {
+            vbuf,
+            ibuf,
+            index_count: layer.mesh.indices.len() as u32,
+            bind_group,
+            nocull: layer.nocull,
+        }
+    }
+
+    /// Draw every static mesh in one depth-tested pass, over the cleared scene
+    /// target and under the 2D layers.
+    ///
+    /// ponytail: meshes always draw before all 2D layers rather than
+    /// interleaving by `order_index` — real mesh scenes put their 2D content on
+    /// top (overlays/UI) so it hasn't mattered. Interleaving needs the depth
+    /// buffer shared with the composite pipeline.
+    fn draw_mesh3d(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
+        let Some(depth) = &self.mesh3d_depth else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mesh3d_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        for m in &self.mesh3d {
+            pass.set_pipeline(&self.renderer.mesh3d_pipelines[m.nocull as usize]);
+            pass.set_bind_group(0, &m.bind_group, &[]);
+            pass.set_vertex_buffer(0, m.vbuf.slice(..));
+            pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..m.index_count, 0, 0..1);
+        }
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -2096,6 +2366,9 @@ impl GpuSceneInstance {
                 ..Default::default()
             });
         }
+
+        // 1b. Static 3D meshes, depth-tested, under everything 2D.
+        self.draw_mesh3d(&mut encoder, &target_view);
 
         // Re-pose animated puppet layers at a capped rate: skin the mesh at
         // the current animation time and re-upload frames[0]. CPU skinning +
