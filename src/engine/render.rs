@@ -32,7 +32,25 @@ pub struct ResolvedScene {
     pub height: u32,
     pub layers: Vec<Layer>,
     pub particle_layers: Vec<ParticleLayer>,
+    /// Static 3D mesh objects (`model` → `.mdl`) — only genuine perspective
+    /// scenes have these; the 2D compositor ignores them.
+    pub mesh3d_layers: Vec<Mesh3dLayer>,
     pub scene: Scene,
+}
+
+/// A scene object whose `model` field references a static 3D mesh. Rendered as
+/// real geometry through the perspective camera (see `engine::mesh3d`), not as
+/// a flat quad — spheres, skyboxes and cylinders can't be billboarded.
+pub struct Mesh3dLayer {
+    pub name: String,
+    pub mesh: crate::engine::mesh3d::Mesh3d,
+    /// Resolved from the material path embedded in the `.mdl` header.
+    pub texture: RgbaImage,
+    /// World-space transform (WE scene units; the mesh's own space is ≈ unit).
+    pub origin: [f32; 3],
+    pub scale: [f32; 3],
+    pub angles: [f32; 3],
+    pub order_index: usize,
 }
 
 /// A scene object whose `particle` field references a particle preset JSON
@@ -277,6 +295,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        let mut mesh3d_layers = Vec::new();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
@@ -288,6 +307,13 @@ impl ResolvedScene {
                 if let Some(mut layer) = light_layer_from_object(obj) {
                     layer.order_index = obj_index;
                     layers.push(layer);
+                }
+                continue;
+            }
+            if obj.mesh3d_path().is_some() {
+                if let Some(mut ml) = mesh3d_layer_from_object(obj, Some(dir), None) {
+                    ml.order_index = obj_index;
+                    mesh3d_layers.push(ml);
                 }
                 continue;
             }
@@ -346,6 +372,7 @@ impl ResolvedScene {
             height,
             layers,
             particle_layers,
+            mesh3d_layers,
             scene,
         })
     }
@@ -357,6 +384,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        let mut mesh3d_layers = Vec::new();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
@@ -368,6 +396,13 @@ impl ResolvedScene {
                 if let Some(mut layer) = light_layer_from_object(obj) {
                     layer.order_index = obj_index;
                     layers.push(layer);
+                }
+                continue;
+            }
+            if obj.mesh3d_path().is_some() {
+                if let Some(mut ml) = mesh3d_layer_from_object(obj, Some(dir), Some(pkg)) {
+                    ml.order_index = obj_index;
+                    mesh3d_layers.push(ml);
                 }
                 continue;
             }
@@ -427,6 +462,7 @@ impl ResolvedScene {
             height,
             layers,
             particle_layers,
+            mesh3d_layers,
             scene,
         })
     }
@@ -439,6 +475,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        let mut mesh3d_layers = Vec::new();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
@@ -450,6 +487,13 @@ impl ResolvedScene {
                 if let Some(mut layer) = light_layer_from_object(obj) {
                     layer.order_index = obj_index;
                     layers.push(layer);
+                }
+                continue;
+            }
+            if obj.mesh3d_path().is_some() {
+                if let Some(mut ml) = mesh3d_layer_from_object(obj, None, Some(pkg)) {
+                    ml.order_index = obj_index;
+                    mesh3d_layers.push(ml);
                 }
                 continue;
             }
@@ -505,6 +549,7 @@ impl ResolvedScene {
             height,
             layers,
             particle_layers,
+            mesh3d_layers,
             scene,
         })
     }
@@ -902,25 +947,24 @@ fn is_video_path(p: &str) -> bool {
 /// directory, then its `scene.pkg` (if given), then the global Steam assets
 /// dir — mirroring the same wallpaper-first priority used for shaders/effects
 /// (`shaders::resolver::AssetResolver`).
-fn read_particle_json(dir: Option<&Path>, pkg: Option<&Package>, rel_path: &str) -> Option<String> {
+/// Read a scene asset from wherever it lives: loose files, the pkg archive,
+/// then the shared WE assets dir.
+fn read_asset_bytes(dir: Option<&Path>, pkg: Option<&Package>, rel_path: &str) -> Option<Vec<u8>> {
     if let Some(dir) = dir {
-        if let Ok(s) = std::fs::read_to_string(dir.join(rel_path)) {
-            return Some(s);
+        if let Ok(data) = std::fs::read(dir.join(rel_path)) {
+            return Some(data);
         }
     }
     if let Some(pkg) = pkg {
         if let Some(data) = pkg.get(rel_path) {
-            if let Ok(s) = String::from_utf8(data.to_vec()) {
-                return Some(s);
-            }
+            return Some(data.to_vec());
         }
     }
-    if let Some(assets_dir) = super::shaders::loader::find_we_assets_dir() {
-        if let Ok(s) = std::fs::read_to_string(assets_dir.join(rel_path)) {
-            return Some(s);
-        }
-    }
-    None
+    read_from_global_assets(rel_path)
+}
+
+fn read_particle_json(dir: Option<&Path>, pkg: Option<&Package>, rel_path: &str) -> Option<String> {
+    String::from_utf8(read_asset_bytes(dir, pkg, rel_path)?).ok()
 }
 
 /// Build a `ParticleLayer` from a scene object whose `particle` field is a
@@ -1267,6 +1311,66 @@ fn text_layer_from_object(
     Some(layer)
 }
 
+/// Build a static-3D-mesh layer for an object whose `model` names a `.mdl`.
+/// `read` fetches an asset by relative path (dir- or pkg-backed), and
+/// `resolve_tex` turns the mesh's embedded material path into its texture.
+fn mesh3d_layer_from_object(
+    obj: &SceneObject,
+    dir: Option<&Path>,
+    pkg: Option<&Package>,
+) -> Option<Mesh3dLayer> {
+    let path = obj.mesh3d_path()?;
+    // The pkg stores every path lowercased, while scene.json and the `.mdl`
+    // header keep the author's casing (`models/LP/LP.mdl`, and real content
+    // has non-ASCII names too) — so retry lowercased on any miss.
+    let bytes = read_asset_bytes(dir, pkg, path)
+        .or_else(|| read_asset_bytes(dir, pkg, &path.to_lowercase()))?;
+    let mesh = crate::engine::mesh3d::parse(&bytes)?;
+    let resolve_tex = |p: &str| {
+        dir.and_then(|d| load_texture_from_dir(d, p).ok())
+            .or_else(|| pkg.and_then(|p2| load_texture_from_pkg(p2, p).ok()))
+            .map(|l| l.image)
+    };
+    let texture = resolve_tex(&mesh.material)
+        .or_else(|| resolve_tex(&mesh.material.to_lowercase()))
+        // Untextured materials are normal here (`"textures": [null,null,null]`
+        // with a flat `color` constant): draw them as that color. An
+        // unresolvable material falls through to white rather than vanishing.
+        .unwrap_or_else(|| {
+            let [r, g, b] = material_constant_color(dir, pkg, &mesh.material).unwrap_or([255; 3]);
+            RgbaImage::from_pixel(1, 1, image::Rgba([r, g, b, 255]))
+        });
+
+    let scale = obj
+        .scale
+        .as_ref()
+        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .unwrap_or([1.0, 1.0, 1.0]);
+    let angles = obj
+        .angles
+        .as_ref()
+        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let o = obj.parsed_origin();
+
+    tracing::debug!(
+        target: "scene",
+        "mesh3d '{path}': {} verts, {} tris, material '{}'",
+        mesh.positions.len(),
+        mesh.indices.len() / 3,
+        mesh.material
+    );
+    Some(Mesh3dLayer {
+        name: obj.name.clone().unwrap_or_default(),
+        mesh,
+        texture,
+        origin: [o[0] as f32, o[1] as f32, o[2] as f32],
+        scale,
+        angles,
+        order_index: 0,
+    })
+}
+
 /// A WE light object rendered as an additive radial glow — a minimal stand-in
 /// for the full lighting model. Colored by `color`, sized by `radius`, with a
 /// smooth quadratic falloff scaled by `intensity`. Additively blended so it
@@ -1566,6 +1670,35 @@ fn pass_overbright(pass: &serde_json::Value) -> f32 {
         .unwrap_or(1.0)
 }
 
+/// A material's flat `color` constant, as 8-bit RGB. Only meaningful for
+/// materials with no texture at all — see `mesh3d_layer_from_object`.
+fn material_constant_color(
+    dir: Option<&Path>,
+    pkg: Option<&Package>,
+    json_path: &str,
+) -> Option<[u8; 3]> {
+    let data = read_asset_bytes(dir, pkg, json_path)
+        .or_else(|| read_asset_bytes(dir, pkg, &json_path.to_lowercase()))?;
+    parse_material_constant_color(&data)
+}
+
+fn parse_material_constant_color(data: &[u8]) -> Option<[u8; 3]> {
+    let val: serde_json::Value = serde_json::from_slice(data).ok()?;
+    let consts = val
+        .get("passes")?
+        .as_array()?
+        .first()?
+        .get("constantshadervalues")?;
+    // WE keys this as `color`; `Color` is a separate (usually white) tint.
+    let s = consts.get("color").or_else(|| consts.get("Color"))?.as_str()?;
+    let c = crate::engine::effect::parse_color(s);
+    Some([
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+    ])
+}
+
 /// Follow the model -> material -> texture chain for loose files on disk.
 fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>, f32)> {
     let data = std::fs::read(dir.join(json_path))
@@ -1829,6 +1962,18 @@ fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: 
 mod tests {
     use super::*;
 
+    /// Untextured mesh materials are common in real content
+    /// (`"textures": [null,null,null]`), and their flat `color` is the only
+    /// thing that keeps the mesh from drawing plain white.
+    #[test]
+    fn material_constant_color_reads_flat_color() {
+        // `color` wins over the separate (usually white) `Color` tint.
+        let m = br#"{"passes":[{"textures":[null],"constantshadervalues":
+                    {"Color":"1.0 1.0 1.0","color":"0.6 0.0 0.2"}}]}"#;
+        assert_eq!(parse_material_constant_color(m), Some([153, 0, 51]));
+        assert_eq!(parse_material_constant_color(br#"{"passes":[{}]}"#), None);
+    }
+
     fn solid_particle_config(color: &str) -> particle::ParticleConfig {
         let json = format!(
             r#"{{
@@ -1914,6 +2059,7 @@ mod tests {
             height: 100,
             layers,
             particle_layers,
+            mesh3d_layers: Vec::new(),
             scene,
         };
 

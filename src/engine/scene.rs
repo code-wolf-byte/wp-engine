@@ -280,6 +280,24 @@ pub struct SceneObject {
     // Puppet animation layers (blended each frame).
     #[serde(default)]
     pub animationlayers: Option<serde_json::Value>,
+    /// A static 3D mesh reference (`models/x/x.mdl`) — an alternative to
+    /// `image` used by genuine 3D scenes for spheres/skyboxes/cylinders. NOT
+    /// redundant with `image`: these objects carry no `image` at all, so
+    /// without this they're skipped entirely. See `engine::mesh3d`.
+    #[serde(default)]
+    pub model: Option<serde_json::Value>,
+}
+
+impl SceneObject {
+    /// The `model` field as a `.mdl` path, when this object is a static 3D
+    /// mesh (`model` set, no `image`).
+    pub fn mesh3d_path(&self) -> Option<&str> {
+        if self.image.is_some() {
+            return None;
+        }
+        let p = self.model.as_ref()?.as_str()?;
+        p.to_lowercase().ends_with(".mdl").then_some(p)
+    }
 }
 
 impl SceneObject {
