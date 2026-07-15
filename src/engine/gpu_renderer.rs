@@ -1311,6 +1311,10 @@ struct SceneLayerGpu {
     /// Live visibility for this frame. Starts `true`; only a `visible` script
     /// can flip it off. `render()` skips the layer entirely when `false`.
     visible: bool,
+    /// The authored `visible` value — fed to the `visible` script as `value`
+    /// (a script with no `update()`, e.g. a cursor-handler-only hitbox, returns
+    /// it unchanged, so this must not be hardcoded `true`).
+    visible_base: bool,
     /// Per-frame transform scripts (visible/scale/origin/angles). When
     /// scale/origin are present, `rect` is recomputed each frame from the
     /// base values below; angles rebuilds `angle`. Only honored in the 2D
@@ -1654,7 +1658,8 @@ impl GpuSceneInstance {
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
                     order_index: l.order_index,
-                    visible: true,
+                    visible: l.visible_base,
+                    visible_base: l.visible_base,
                     transform_scripts: l.transform_scripts.clone(),
                     effective_size,
                     origin_base: l.origin,
@@ -1961,7 +1966,7 @@ impl GpuSceneInstance {
                     .transform_scripts
                     .visible
                     .as_ref()
-                    .and_then(|s| ctx.eval_update_bool(s, true))
+                    .and_then(|s| ctx.eval_update_bool(s, layer.visible_base))
                 {
                     layer.visible = v;
                 }

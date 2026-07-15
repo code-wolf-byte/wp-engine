@@ -286,6 +286,12 @@ impl ScriptContext {
             body = iife_body(script, authored_props)
         );
         let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
+        // A script that returns `undefined`/`null` (e.g. reads an unstubbed
+        // scene API) stringifies to the literal "undefined"/"null" — keep the
+        // caller's current text instead of rendering that.
+        if result.is_undefined() || result.is_null() {
+            return None;
+        }
         let js_str = result.to_string(&mut self.context).ok()?;
         Some(js_str.to_std_string_escaped())
     }
@@ -491,6 +497,40 @@ export function update(value) {
         assert_eq!(
             ctx.eval_update_bool("export function update(value) { return value > 0; }", true),
             Some(true)
+        );
+    }
+
+    /// Real content has invisible click/hover hitboxes: `visible` is authored
+    /// `false` and the script defines ONLY cursor handlers — no `update()`. The
+    /// script must then return the authored value unchanged, or the hitbox
+    /// renders as an opaque box (3509243656's white box).
+    #[test]
+    fn bool_script_without_update_keeps_authored_value() {
+        let mut ctx = ScriptContext::new();
+        let hitbox = "'use strict';\n\
+            export function cursorClick(event) { shared.yp = 1; }\n\
+            export function cursorEnter(event) { shared.cret1 = 1; }";
+        assert_eq!(ctx.eval_update_bool(hitbox, false), Some(false));
+        assert_eq!(ctx.eval_update_bool(hitbox, true), Some(true));
+    }
+
+    /// A text script that returns `undefined` (unstubbed scene API) must not
+    /// render the literal "undefined" — the caller keeps its current text.
+    #[test]
+    fn text_script_returning_undefined_yields_none() {
+        let mut ctx = ScriptContext::new();
+        assert_eq!(
+            ctx.eval_update_string(
+                "export function update(v) { return undefined; }",
+                "keep",
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            ctx.eval_update_string("export function update(v) { return 'ok'; }", "keep", None)
+                .as_deref(),
+            Some("ok")
         );
     }
 

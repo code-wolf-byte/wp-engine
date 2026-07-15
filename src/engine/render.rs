@@ -146,6 +146,12 @@ pub struct Layer {
     /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
     /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
     pub transform_scripts: TransformScripts,
+    /// The object's AUTHORED `visible` value — the starting visibility and the
+    /// `value` fed to a `visible` script. Critical: scripts that only define
+    /// cursor handlers (invisible click hitboxes, `"value": false`) have no
+    /// `update()`, so the script returns `value` unchanged — feeding `true`
+    /// here would render those hitboxes as opaque boxes.
+    pub visible_base: bool,
 }
 
 /// The per-frame SceneScripts a layer's transform can carry. Each `update`
@@ -883,6 +889,7 @@ fn layer_from_object(
         text_dynamic: None,
         order_index: 0,
         transform_scripts,
+        visible_base: obj.is_visible(),
     }
 }
 
@@ -1874,6 +1881,7 @@ mod tests {
             text_dynamic: None,
             order_index: 1,
             transform_scripts: TransformScripts::default(),
+            visible_base: true,
         }];
 
         let particle_layers = vec![
