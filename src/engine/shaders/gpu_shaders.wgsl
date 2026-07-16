@@ -398,26 +398,49 @@ struct PulseParams {
     phase: f32,
     bounds_x: f32,
     bounds_y: f32,
-    _p3: f32,
+    // BLENDMODE combo (imageblending table, default 9 = linear dodge).
+    blendmode: f32,
     tint_low: vec3<f32>,
-    _pad0: f32,
+    // PULSECOLOR combo (default 1): blend rgb·tintlow toward rgb·tinthigh.
+    pulse_color: f32,
     tint_high: vec3<f32>,
-    _pad1: f32,
+    // PULSEALPHA combo (default 0): multiply alpha by the pulse.
+    pulse_alpha: f32,
+    noise_speed: f32,
+    noise_amount: f32,
+    _p0: f32,
+    _p1: f32,
 }
 @group(1) @binding(0) var<uniform> pulse: PulseParams;
 
-// pulse.frag's non-audio path with its default BLENDMODE 9 (linear dodge):
-// rgb = rgb*tintlow + rgb*tinthigh * pulse, where pulse =
-// smoothstep(bounds, sin wave)*amount ^ power; the opacity mask (material
-// slot 2) lerps the whole effect against the untouched sample.
+// pulse.frag's non-audio path: pulse = smoothstep(bounds, sin wave)·amount
+// + noise(g_Texture1, slot 1 → dest_copy_tex)·noiseamount, raised to
+// `power`; PULSECOLOR routes rgb·tintlow toward rgb·tinthigh through the
+// authored BLENDMODE via ApplyBlending's mix-by-pulse; PULSEALPHA scales
+// alpha instead/in addition. The opacity mask (slot 2 → extra_tex1) lerps
+// the whole effect against the untouched sample.
 @fragment
 fn fs_pulse(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv);
     let mask = textureSample(extra_tex1, src_sampler, uv).r;
     let raw = sin(pulse.time * pulse.speed + pulse.phase - 1.5708) * 0.5 + 0.5;
-    let p = pow(smoothstep(pulse.bounds_x, pulse.bounds_y, raw) * pulse.amount, pulse.power);
-    let pulsed = s.rgb * pulse.tint_low + s.rgb * pulse.tint_high * p;
-    return vec4(mix(s.rgb, min(pulsed, vec3(1.0)), mask), s.a);
+    let noise_uv = vec2(pulse.time * 0.08333333, pulse.time * 0.02777777) * pulse.noise_speed;
+    let noise = textureSample(dest_copy_tex, src_sampler, noise_uv).r * pulse.noise_amount;
+    let p = pow(
+        smoothstep(pulse.bounds_x, pulse.bounds_y, raw) * pulse.amount + noise,
+        pulse.power,
+    );
+    var albedo = s;
+    if pulse.pulse_color > 0.5 {
+        let a = s.rgb * pulse.tint_low;
+        let b = s.rgb * pulse.tint_high;
+        albedo = vec4(mix(a, blend_rgb(i32(pulse.blendmode), a, b), clamp(p, 0.0, 1.0)), albedo.a);
+    }
+    if pulse.pulse_alpha > 0.5 {
+        albedo.a = albedo.a * p;
+    }
+    let mixed = mix(s, albedo, mask);
+    return vec4(max(mixed.rgb, vec3(0.0)), mixed.a);
 }
 
 // ── Scroll ───────────────────────────────────────────────────────────────────
@@ -526,18 +549,29 @@ struct TintParams {
     g: f32,
     b: f32,
     alpha: f32,
+    blendmode: f32,
+    _p0: f32,
+    _p1: f32,
+    _p2: f32,
 }
 @group(1) @binding(0) var<uniform> tint: TintParams;
 
-// tint.frag's default BLENDMODE 30 = BlendTint: the max channel of the
-// base broadcast, colored by the tint — not a plain multiply.
+// tint.frag: rgb = ApplyBlending(BLENDMODE, rgb, tintColor, alpha·mask).
+// The combo defaults to 30 = BlendTint (max channel of the base broadcast,
+// colored) but authors pick any imageblending mode; mode 0 also forces
+// alpha to 1 (the shader's own `#if BLENDMODE == 0` branch).
 @fragment
 fn fs_tint(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv);
     let mask = textureSample(dest_copy_tex, src_sampler, uv).r;
-    let peak = max(s.r, max(s.g, s.b));
-    let tinted = mix(s.rgb, vec3(peak) * vec3(tint.r, tint.g, tint.b), tint.alpha * mask);
-    return vec4(tinted, s.a);
+    let mode = i32(tint.blendmode);
+    let tint_rgb = vec3(tint.r, tint.g, tint.b);
+    let tinted = mix(s.rgb, blend_rgb(mode, s.rgb, tint_rgb), clamp(tint.alpha * mask, 0.0, 1.0));
+    var a = s.a;
+    if mode == 0 {
+        a = 1.0;
+    }
+    return vec4(tinted, a);
 }
 
 // ── Opacity ──────────────────────────────────────────────────────────────────
@@ -602,7 +636,11 @@ fn fs_waterwaves(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let mask = textureSample(dest_copy_tex, src_sampler, uv).r;
     let dir = vec2(waves.dir_x, waves.dir_y);
     let perp = vec2(dir.y, -dir.x);
-    let d = waves.time * waves.speed + dot(uv, dir) * waves.scale;
+    // TIMEOFFSET (g_Texture2, slot 2 → extra_tex1): per-pixel phase, r·2π.
+    // The white 1×1 fallback adds a full period — identical to the authored
+    // black default's zero.
+    let time_offset = textureSample(extra_tex1, src_sampler, uv).r * 6.28318530718;
+    let d = waves.time * waves.speed + dot(uv, dir) * waves.scale + time_offset;
     let s = sin(d);
     let val = pow(abs(s), waves.exponent) * sign(s);
     let tc = uv + perp * val * waves.strength * waves.strength * mask;
@@ -618,7 +656,7 @@ struct SpinParams {
     center_y: f32,
     size: f32,
     feather: f32,
-    _p1: f32,
+    repeat: f32,
     _p2: f32,
 }
 @group(1) @binding(0) var<uniform> spin: SpinParams;
@@ -633,10 +671,105 @@ fn fs_spin(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let angle = spin.speed * spin.time;
     let cs = vec2(cos(angle), sin(angle));
     let rotated = vec2(delta.x * cs.x - delta.y * cs.y, delta.x * cs.y + delta.y * cs.x);
-    let tc = fract(rotated + center);
+    // REPEAT combo (default 1): wrap the rotated coordinate; 0 clamps.
+    var tc = rotated + center;
+    if spin.repeat > 0.5 {
+        tc = fract(tc);
+    } else {
+        tc = clamp(tc, vec2(0.0), vec2(1.0));
+    }
     let original = textureSample(src_tex, src_sampler, uv);
     let spun = textureSample(src_tex, src_sampler, tc);
     var mask = smoothstep(spin.size + spin.feather + 0.00001, spin.size - spin.feather, length(delta));
     mask = mask * textureSample(dest_copy_tex, src_sampler, uv).r;
     return mix(original, spun, mask);
+}
+
+// ── GPU particles ─────────────────────────────────────────────────────────────
+// The CPU simulation emits pre-transformed triangle-list vertices (6 per
+// sprite quad / rope sub-quad, absolute scene pixels — see particle.rs's
+// GpuVertex); this pipeline replaces the old budgeted CPU rasterizer, so
+// particles draw at full output resolution with hardware filtering and
+// float blending (the reference draws GPU quads too). Sprite-sheet frames
+// are array layers; cross-fade samples two layers (genericparticle.frag's
+// SPRITESHEETBLEND) — sampled unconditionally, WGSL forbids textureSample
+// in non-uniform control flow.
+
+struct PVertex {
+    pos: vec2<f32>,
+    uv: vec2<f32>,
+    color: vec4<f32>,
+    frame_blend: vec4<f32>,
+}
+@group(0) @binding(0) var<storage, read> particle_verts: array<PVertex>;
+@group(0) @binding(1) var particle_tex: texture_2d_array<f32>;
+@group(0) @binding(2) var particle_sampler: sampler;
+struct ParticleDrawParams {
+    scene_size: vec2<f32>,
+    overbright: f32,
+    frame_count: f32,
+}
+@group(0) @binding(3) var<uniform> pdraw: ParticleDrawParams;
+
+struct ParticleVsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) frame_blend: vec2<f32>,
+}
+
+@vertex
+fn vs_particles(@builtin(vertex_index) vi: u32) -> ParticleVsOut {
+    let v = particle_verts[vi];
+    var out: ParticleVsOut;
+    // Scene pixels (y-down) -> NDC.
+    out.position = vec4(
+        v.pos.x / pdraw.scene_size.x * 2.0 - 1.0,
+        1.0 - v.pos.y / pdraw.scene_size.y * 2.0,
+        0.0,
+        1.0,
+    );
+    out.uv = v.uv;
+    out.color = v.color;
+    out.frame_blend = v.frame_blend.xy;
+    return out;
+}
+
+@fragment
+fn fs_particles(in: ParticleVsOut) -> @location(0) vec4<f32> {
+    let frames = max(pdraw.frame_count, 1.0);
+    let f0 = i32(clamp(in.frame_blend.x, 0.0, frames - 1.0));
+    let f1 = min(f0 + 1, i32(frames) - 1);
+    let s0 = textureSample(particle_tex, particle_sampler, in.uv, f0);
+    let s1 = textureSample(particle_tex, particle_sampler, in.uv, f1);
+    let s = mix(s0, s1, in.frame_blend.y);
+    // genericparticle.frag: albedo * vertex color, rgb *= g_Overbright.
+    return vec4(s.rgb * in.color.rgb * pdraw.overbright, s.a * in.color.a);
+}
+
+// ── Static 3D meshes ──────────────────────────────────────────────────────────
+// Real geometry (spheres, skyboxes, cylinders) from a scene object's `model`
+// .mdl, drawn through the scene camera with a depth buffer — unlike every other
+// pipeline here, which composites flat quads. See `engine::mesh3d`.
+
+@group(0) @binding(0) var<uniform> mesh3d_mvp: mat4x4<f32>;
+@group(0) @binding(1) var mesh3d_tex: texture_2d<f32>;
+@group(0) @binding(2) var mesh3d_sampler: sampler;
+
+struct Mesh3dVsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_mesh3d(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>) -> Mesh3dVsOut {
+    var out: Mesh3dVsOut;
+    out.position = mesh3d_mvp * vec4(pos, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
+    return textureSample(mesh3d_tex, mesh3d_sampler, in.uv);
 }

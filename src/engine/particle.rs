@@ -25,6 +25,11 @@ pub struct ParticleConfig {
     /// `controlpointattract` (CParticle.cpp/ObjectParser.cpp).
     #[serde(default)]
     pub controlpoint: Vec<ControlPointConfig>,
+    /// Delay in seconds before this system begins emitting. Present on nearly
+    /// every real preset (610/610) so a burst ramps in instead of all
+    /// particles appearing at frame 0.
+    #[serde(default)]
+    pub starttime: Option<f64>,
     /// Path to the material JSON providing this system's sprite texture
     /// (e.g. `"materials/presets/water_faucet.json"`). Resolved by callers
     /// (this module stays asset-agnostic) and passed into `render_onto`.
@@ -115,14 +120,25 @@ pub struct ControlPointConfig {
     pub offset: Option<serde_json::Value>,
     #[serde(default)]
     pub flags: Option<u32>,
+    /// Orientation of the control point's local frame (z used in 2D): rotates
+    /// the `offset` about the object origin so oriented control points land in
+    /// the right place.
+    #[serde(default)]
+    pub angles: Option<serde_json::Value>,
+    /// `locktopointer`: the control point tracks the mouse cursor. Parsed;
+    /// we have no live pointer input, so it resolves to its static offset.
+    #[serde(default)]
+    pub locktopointer: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Emitter {
     #[serde(default)]
     pub name: String,
+    /// Emission rate per second. `None` (absent) takes the reference's
+    /// default of 10; an explicit `0` stays 0 (instantaneous-only emitters).
     #[serde(default)]
-    pub rate: f64,
+    pub rate: Option<f64>,
     #[serde(default)]
     pub origin: Option<String>,
     #[serde(default)]
@@ -133,10 +149,36 @@ pub struct Emitter {
     pub distancemin: Option<serde_json::Value>,
     #[serde(default)]
     pub distancemax: Option<serde_json::Value>,
+    /// Optional emitter-driven radial speed range (rare; most presets set
+    /// velocity via initializers).
+    #[serde(default)]
+    pub speedmin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub speedmax: Option<serde_json::Value>,
     #[serde(default)]
     pub sign: Option<String>,
     #[serde(default)]
     pub id: Option<u32>,
+    /// One-shot burst count: this many particles are emitted in a single frame
+    /// when the emitter first activates (at `starttime`), then normal `rate`
+    /// emission continues. `0`/absent = purely rate-driven.
+    #[serde(default)]
+    pub instantaneous: Option<f64>,
+    /// Emitter lifetime in seconds: after `starttime + duration`, this emitter
+    /// stops emitting. Absent = emits forever.
+    #[serde(default)]
+    pub duration: Option<f64>,
+    /// Presence of any `audioprocessing*` field makes emission react to the
+    /// captured audio level (rate scales with loudness). We use the mode as
+    /// the trigger; band bounds are parsed but not yet split per-frequency.
+    #[serde(default)]
+    pub audioprocessingmode: Option<serde_json::Value>,
+    #[serde(default)]
+    pub audioprocessingbounds: Option<serde_json::Value>,
+    #[serde(default)]
+    pub audioprocessingexponent: Option<serde_json::Value>,
+    #[serde(default)]
+    pub audioprocessingfrequencyend: Option<serde_json::Value>,
 }
 
 /// `min`/`max` are untyped because real presets mix plain numbers
@@ -152,6 +194,11 @@ pub struct Initializer {
     pub max: Option<serde_json::Value>,
     #[serde(default)]
     pub min: Option<serde_json::Value>,
+    /// Biases the uniform `random(min,max)` toward `min` (exponent > 1) or
+    /// `max` (< 1): the sample `t` is raised to this power before the lerp.
+    /// Absent = 1.0 (uniform).
+    #[serde(default)]
+    pub exponent: Option<f64>,
     /// `turbulentvelocityrandom` (CParticle.cpp
     /// createTurbulentVelocityRandomInitializer): a curl-noise-directed
     /// spawn velocity. `forward`/`right` are `"x y z"` vector strings;
@@ -285,6 +332,20 @@ pub struct Operator {
     pub ringpulldistance: Option<f64>,
     #[serde(default)]
     pub ringpullforce: Option<f64>,
+    /// `remapvalue` (CParticle createValueRemapOperator): samples a noise
+    /// function at the particle position and remaps it into `outputrange*`,
+    /// writing the `output` channel (`velocity`/`speed`). `outputrangemin`/
+    /// `max` are `"x y z"` vec3 for velocity, scalar for speed.
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub outputrangemin: Option<serde_json::Value>,
+    #[serde(default)]
+    pub outputrangemax: Option<serde_json::Value>,
+    #[serde(default)]
+    pub transformfunction: Option<String>,
+    #[serde(default)]
+    pub transforminputscale: Option<f64>,
 }
 
 /// Scene.json's per-instance `instanceoverride` on a particle object —
@@ -422,6 +483,9 @@ pub struct ParticleSystem {
     life_max: f32,
     size_min: f32,
     size_max: f32,
+    /// `exponent` distribution bias for lifetime/size random sampling (1.0 = uniform).
+    life_exp: f32,
+    size_exp: f32,
     /// `alpharandom` initializer range (CParticle.cpp's `AlphaRandomInitializer`):
     /// defaults to `(1.0, 1.0)` — a no-op — when the config has no such
     /// initializer at all, matching `ParticleInstance::alpha`'s `1.0f` default.
@@ -432,6 +496,12 @@ pub struct ParticleSystem {
     color_min: [f32; 3],
     color_max: [f32; 3],
     gravity: [f32; 2],
+    /// Scene-global constant acceleration (`general.gravity*` + `wind*`),
+    /// added to every particle's velocity each step. Set post-construction.
+    scene_force: [f32; 2],
+    /// Current audio loudness in ~[0,1], set per frame; audio-reactive emitters
+    /// scale their emission rate by it.
+    audio_level: f32,
     /// `movement.drag`: velocity decays by `1 - drag*dt` (clamped at 0)
     /// each step, matching the reference's reversal-preventing clamp.
     movement_drag: f32,
@@ -508,9 +578,16 @@ pub struct ParticleSystem {
     turbulence: Option<TurbulenceParams>,
     /// `vortex` operator parameters.
     vortex: Option<VortexParams>,
+    /// `remapvalue` operator parameters.
+    remap: Option<RemapParams>,
     /// Simulation clock (sum of `step` dts) — drives the time-scrolled
     /// noise fields, the reference's `m_time`/`currentTime`.
     time: f32,
+    /// `starttime`: emission is suppressed until the clock reaches this.
+    start_time: f32,
+    /// Preset `flags & 4` (perspective particles): sphere emitters use the
+    /// 3D spherical-shell spawn distribution instead of the 2D disk.
+    shell_3d: bool,
     /// Monotonic source for `Particle::id`.
     next_particle_id: u64,
     /// Attached child presets (see [`ChildRef`]); each holds its own live
@@ -639,19 +716,48 @@ struct VortexParams {
     ring_pull_force: f32,
 }
 
+/// `remapvalue`: a noise value at `pos*input_scale` (+time) remapped into
+/// `[out_min, out_max]` per axis, written to the `velocity` or `speed` channel.
+#[derive(Clone, Copy)]
+struct RemapParams {
+    /// 0 = write velocity vector, 1 = scale speed along current heading.
+    to_speed: bool,
+    out_min: [f32; 3],
+    out_max: [f32; 3],
+    input_scale: f32,
+    /// `fbmnoise` sums octaves; both approximated with our Perlin noise.
+    fbm: bool,
+}
+
 struct EmitterState {
     id: u32,
     rate: f32,
     origin: [f32; 3],
     directions: [f32; 3],
     sign: [f32; 3],
+    /// True for `sphererandom` (annulus/shell spawn), false for box.
+    is_sphere: bool,
+    /// Spawn-offset range: sphere radius in `[0]` (min/max annulus), or the
+    /// box emitter's per-axis half-extents. CParticle.cpp spawns particles
+    /// randomly WITHIN this volume, scaled per-axis by `directions` —
+    /// distancemax is a POSITION range, never a velocity.
+    distance_min: [f32; 3],
+    distance_max: [f32; 3],
+    /// Optional emitter-driven radial speed (`speedmin`/`speedmax` JSON
+    /// fields — distinct from distance!). 0 = the reference's default:
+    /// emitters set no velocity, initializers do.
     speed_min: f32,
     speed_max: f32,
-    /// Spawn-position spread around `origin`: a box emitter's real extent
-    /// (from `distancemax`, an `"x y z"` vector) when available, else a small
-    /// default so particles don't all spawn from the exact same point.
-    spread: [f32; 2],
     accumulator: f32,
+    /// `instantaneous` one-shot burst count, emitted once when the emitter
+    /// activates; `burst_done` tracks that it's fired.
+    burst: u32,
+    burst_done: bool,
+    /// `duration`: emitter stops after `start_time + duration` (None = forever).
+    duration: Option<f32>,
+    /// True when the emitter has `audioprocessing*` — its rate scales with the
+    /// current audio level.
+    audio_reactive: bool,
 }
 
 impl ParticleSystem {
@@ -671,36 +777,35 @@ impl ParticleSystem {
             .iter()
             .map(|e| {
                 let local_origin = parse_f32_vec3(e.origin.as_deref());
-                let directions = parse_f32_vec3(e.directions.as_deref());
+                // Reference default (1, 1, 0) — a zero default would scale
+                // every spawn offset to nothing for emitters that omit the
+                // field, collapsing them to a point at the origin.
+                let directions = e
+                    .directions
+                    .as_deref()
+                    .map(|d| parse_f32_vec3(Some(d)))
+                    .unwrap_or([1.0, 1.0, 0.0]);
                 let sign = parse_f32_vec3(e.sign.as_deref());
                 let is_sphere = e.name == "sphererandom";
 
-                // Sphere emitters use a scalar radius for distancemin/max;
-                // box emitters use an "x y z" extent vector — mixing the two
-                // representations up would misparse either shape's real values.
-                let (speed_min, speed_max, spread) = if is_sphere {
-                    let min = e
-                        .distancemin
-                        .as_ref()
-                        .and_then(value_as_f32)
-                        .unwrap_or(10.0);
-                    let max = e
-                        .distancemax
-                        .as_ref()
-                        .and_then(value_as_f32)
-                        .unwrap_or(100.0);
-                    (min, max, [30.0, 30.0])
-                } else {
-                    let extent = e.distancemax.as_ref().and_then(value_as_vec3);
-                    let spread = extent
-                        .map(|v| [v[0].abs().max(1.0), v[1].abs().max(1.0)])
-                        .unwrap_or([60.0, 60.0]);
-                    (10.0, 100.0, spread)
+                // Sphere radii are scalars, box extents "x y z" vectors —
+                // accept either shape for both (splat scalars).
+                let dist = |v: &Option<serde_json::Value>, default: f32| -> [f32; 3] {
+                    v.as_ref()
+                        .and_then(|v| {
+                            value_as_vec3(v).or_else(|| value_as_f32(v).map(|f| [f, f, f]))
+                        })
+                        .unwrap_or([default, default, default])
                 };
+                let distance_min = dist(&e.distancemin, 0.0);
+                // Reference default 256 for both emitter kinds.
+                let distance_max = dist(&e.distancemax, 256.0);
+                let speed_min = e.speedmin.as_ref().and_then(value_as_f32).unwrap_or(0.0);
+                let speed_max = e.speedmax.as_ref().and_then(value_as_f32).unwrap_or(0.0);
 
                 EmitterState {
                     id: e.id.unwrap_or(0),
-                    rate: e.rate as f32,
+                    rate: e.rate.unwrap_or(10.0) as f32,
                     origin: [
                         spawn_center[0] + local_origin[0],
                         // The emitter's local origin is authored y-up
@@ -715,10 +820,17 @@ impl ParticleSystem {
                     ],
                     directions,
                     sign,
+                    is_sphere,
+                    distance_min,
+                    distance_max,
                     speed_min,
                     speed_max,
-                    spread,
                     accumulator: 0.0,
+                    burst: e.instantaneous.unwrap_or(0.0).max(0.0) as u32,
+                    burst_done: false,
+                    duration: e.duration.map(|d| d as f32),
+                    audio_reactive: e.audioprocessingmode.is_some()
+                        || e.audioprocessingbounds.is_some(),
                 }
             })
             .collect();
@@ -735,10 +847,16 @@ impl ParticleSystem {
             _ => 500,
         };
 
+        // Initializer-absent defaults are the reference's exact spawn values
+        // (CParticle.cpp: `p.lifetime = 1.0`, `p.size = 20.0` before
+        // initializers run) — size passes through the sizerandom /2, so the
+        // range default is 40.
         let (life_min, life_max) =
-            scalar_range_from_initializers(&config.initializer, "lifetimerandom", 2.0, 6.0);
+            scalar_range_from_initializers(&config.initializer, "lifetimerandom", 1.0, 1.0);
         let (size_min, size_max) =
-            scalar_range_from_initializers(&config.initializer, "sizerandom", 2.0, 6.0);
+            scalar_range_from_initializers(&config.initializer, "sizerandom", 40.0, 40.0);
+        let life_exp = initializer_exponent(&config.initializer, "lifetimerandom");
+        let size_exp = initializer_exponent(&config.initializer, "sizerandom");
         let (alpha_min, alpha_max) =
             scalar_range_from_initializers(&config.initializer, "alpharandom", 1.0, 1.0);
         let velocity_range = vec3_range_from_initializers(&config.initializer, "velocityrandom");
@@ -778,18 +896,14 @@ impl ParticleSystem {
                 )
             });
         let fade_range_op = |name: &str| -> Option<(f32, f32, f32, f32)> {
-            config
-                .operator
-                .iter()
-                .find(|op| op.name == name)
-                .map(|op| {
-                    (
-                        op.starttime.unwrap_or(0.0) as f32,
-                        op.endtime.unwrap_or(1.0) as f32,
-                        op.startvalue.as_ref().and_then(value_as_f32).unwrap_or(0.0),
-                        op.endvalue.as_ref().and_then(value_as_f32).unwrap_or(1.0),
-                    )
-                })
+            config.operator.iter().find(|op| op.name == name).map(|op| {
+                (
+                    op.starttime.unwrap_or(0.0) as f32,
+                    op.endtime.unwrap_or(1.0) as f32,
+                    op.startvalue.as_ref().and_then(value_as_f32).unwrap_or(0.0),
+                    op.endvalue.as_ref().and_then(value_as_f32).unwrap_or(1.0),
+                )
+            })
         };
         let sizechange = fade_range_op("sizechange");
         let alphachange = fade_range_op("alphachange");
@@ -830,11 +944,26 @@ impl ParticleSystem {
             .controlpoint
             .iter()
             .map(|cp| {
-                let offset = cp
+                let mut offset = cp
                     .offset
                     .as_ref()
                     .and_then(value_as_vec3)
                     .unwrap_or([0.0; 3]);
+                // `angles.z` rotates the offset about the object origin.
+                if let Some(az) = cp
+                    .angles
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .map(|a| a[2])
+                    .filter(|z| z.abs() > 1e-6)
+                {
+                    let (s, c) = az.sin_cos();
+                    offset = [
+                        offset[0] * c - offset[1] * s,
+                        offset[0] * s + offset[1] * c,
+                        offset[2],
+                    ];
+                }
                 [
                     spawn_center[0] + offset[0],
                     spawn_center[1] + offset[1],
@@ -897,12 +1026,13 @@ impl ParticleSystem {
         let sprite_trail = config
             .renderer
             .iter()
-            .find(|r| {
-                r.get("name").and_then(|n| n.as_str()) == Some("spritetrail")
-            })
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some("spritetrail"))
             .map(|r| {
                 let f = |key: &str, default: f32| -> f32 {
-                    r.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
+                    r.get(key)
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(default)
                 };
                 SpriteTrailParams {
                     length: f("length", 0.05),
@@ -920,8 +1050,16 @@ impl ParticleSystem {
             .iter()
             .find(|init| init.name == "angularvelocityrandom")
             .map(|init| {
-                let min = init.min.as_ref().and_then(value_as_vec3).unwrap_or([0.0, 0.0, -5.0]);
-                let max = init.max.as_ref().and_then(value_as_vec3).unwrap_or([0.0, 0.0, 5.0]);
+                let min = init
+                    .min
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0, 0.0, -5.0]);
+                let max = init
+                    .max
+                    .as_ref()
+                    .and_then(value_as_vec3)
+                    .unwrap_or([0.0, 0.0, 5.0]);
                 (min[2], max[2])
             })
             .unwrap_or((0.0, 0.0));
@@ -945,12 +1083,16 @@ impl ParticleSystem {
             .iter()
             .find(|init| init.name == "rotationrandom")
             .map(|init| {
-                let min = init.min.as_ref().and_then(value_as_vec3).unwrap_or([0.0; 3]);
-                let max = init
-                    .max
+                let min = init
+                    .min
                     .as_ref()
                     .and_then(value_as_vec3)
-                    .unwrap_or([0.0, 0.0, std::f32::consts::TAU]);
+                    .unwrap_or([0.0; 3]);
+                let max = init.max.as_ref().and_then(value_as_vec3).unwrap_or([
+                    0.0,
+                    0.0,
+                    std::f32::consts::TAU,
+                ]);
                 (min[2], max[2])
             });
 
@@ -1072,6 +1214,26 @@ impl ParticleSystem {
                 }
             });
 
+        let remap = config
+            .operator
+            .iter()
+            .find(|op| op.name == "remapvalue")
+            .map(|op| {
+                let range = |v: &Option<serde_json::Value>, d: f32| {
+                    v.as_ref()
+                        .and_then(value_as_vec3)
+                        .or_else(|| v.as_ref().and_then(value_as_f32).map(|s| [s, s, s]))
+                        .unwrap_or([d, d, d])
+                };
+                RemapParams {
+                    to_speed: op.output.as_deref() == Some("speed"),
+                    out_min: range(&op.outputrangemin, 0.0),
+                    out_max: range(&op.outputrangemax, 0.0),
+                    input_scale: op.transforminputscale.unwrap_or(1.0) as f32,
+                    fbm: op.transformfunction.as_deref() == Some("fbmnoise"),
+                }
+            });
+
         Self {
             particles: Vec::with_capacity(max_count),
             emitters,
@@ -1080,6 +1242,8 @@ impl ParticleSystem {
             life_max,
             size_min,
             size_max,
+            life_exp,
+            size_exp,
             alpha_min,
             alpha_max,
             velocity_min,
@@ -1112,6 +1276,7 @@ impl ParticleSystem {
             rope_uv_scale,
             rope_uv_scrolling,
             rope_uv_smoothing,
+            shell_3d: config.flags.unwrap_or(0) & 4 != 0,
             next_particle_id: 0,
             children: Vec::new(),
             angular_velocity_min,
@@ -1135,8 +1300,22 @@ impl ParticleSystem {
             turbulent_velocity,
             turbulence,
             vortex,
+            remap,
             time: 0.0,
+            start_time: config.starttime.unwrap_or(0.0).max(0.0) as f32,
+            scene_force: [0.0, 0.0],
+            audio_level: 0.0,
         }
+    }
+
+    /// Apply the scene-global constant force (`general.gravity*`/`wind*`).
+    pub fn set_scene_force(&mut self, force: [f32; 2]) {
+        self.scene_force = force;
+    }
+
+    /// Set the current audio loudness (~[0,1]) driving audio-reactive emitters.
+    pub fn set_audio_level(&mut self, level: f32) {
+        self.audio_level = level.clamp(0.0, 4.0);
     }
 
     /// Tell the system its resolved sprite's frame count/loop duration, so
@@ -1161,8 +1340,8 @@ impl ParticleSystem {
             // reversing it.
             p.x += p.vx * dt;
             p.y += p.vy * dt;
-            p.vx += self.gravity[0] * dt * self.speed_mult;
-            p.vy += self.gravity[1] * dt * self.speed_mult;
+            p.vx += (self.gravity[0] * self.speed_mult + self.scene_force[0]) * dt;
+            p.vy += (self.gravity[1] * self.speed_mult + self.scene_force[1]) * dt;
             let drag_factor = (1.0 - self.movement_drag * dt).max(0.0);
             p.vx *= drag_factor;
             p.vy *= drag_factor;
@@ -1204,10 +1383,7 @@ impl ParticleSystem {
                 // under which cross products flip sign: mirror the axis's y
                 // and negate the resulting tangent to reproduce the same
                 // on-screen spin direction.
-                let axis = vec3_normalize_or(
-                    [v.axis[0], -v.axis[1], v.axis[2]],
-                    [0.0, 0.0, 1.0],
-                );
+                let axis = vec3_normalize_or([v.axis[0], -v.axis[1], v.axis[2]], [0.0, 0.0, 1.0]);
                 let to_particle = [p.x - center[0], p.y - center[1], -center[2]];
 
                 // Infinite axis: cylinder shape (project out the axis
@@ -1276,6 +1452,35 @@ impl ParticleSystem {
                 }
             }
 
+            // `remapvalue`: sample a noise field at the particle position and
+            // remap it into the output range, setting velocity (or rescaling
+            // speed). fbmnoise adds a second octave.
+            if let Some(r) = self.remap {
+                let s = r.input_scale;
+                let noise = |seed: f64| -> f32 {
+                    use crate::engine::noise::perlin_noise;
+                    let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, self.time as f64);
+                    let mut n = perlin_noise(x + seed, y, t);
+                    if r.fbm {
+                        n = (n + 0.5 * perlin_noise(x * 2.0 + seed, y * 2.0, t * 2.0)) / 1.5;
+                    }
+                    ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
+                };
+                let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                if r.to_speed {
+                    let sp = lerp(r.out_min[0], r.out_max[0], noise(0.0));
+                    let mag = (p.vx * p.vx + p.vy * p.vy).sqrt();
+                    if mag > 1e-4 {
+                        let k = sp / mag;
+                        p.vx *= k;
+                        p.vy *= k;
+                    }
+                } else {
+                    p.vx = lerp(r.out_min[0], r.out_max[0], noise(0.0));
+                    p.vy = lerp(r.out_min[1], r.out_max[1], noise(13.7));
+                }
+            }
+
             // Position-oscillate integrates a velocity (derivative of
             // scale*cos(w*t+phase)) into position each frame, matching
             // CParticle.cpp's createOscillatePositionOperator exactly.
@@ -1296,7 +1501,8 @@ impl ParticleSystem {
                 if let Some(cp) = self.control_points.get(idx) {
                     let center = [cp[0] + origin[0], cp[1] + origin[1]];
                     let to_center = [center[0] - p.x, center[1] - p.y];
-                    let distance = (to_center[0] * to_center[0] + to_center[1] * to_center[1]).sqrt();
+                    let distance =
+                        (to_center[0] * to_center[0] + to_center[1] * to_center[1]).sqrt();
                     let radius = threshold / 2.0;
                     if distance > 0.001 && distance < radius {
                         let force = scale * dt * self.speed_mult;
@@ -1332,7 +1538,9 @@ impl ParticleSystem {
                 match self.animation_mode {
                     AnimationMode::RandomFrame => {
                         if p.frame < 0.0 {
-                            p.frame = (fastrand::f32() * frame_count).floor().min(frame_count - 1.0);
+                            p.frame = (fastrand::f32() * frame_count)
+                                .floor()
+                                .min(frame_count - 1.0);
                         }
                     }
                     AnimationMode::Once => {
@@ -1341,7 +1549,8 @@ impl ParticleSystem {
                     }
                     AnimationMode::Loop => {
                         p.frame = if self.sprite_duration > 0.0 {
-                            let time_in_cycle = (age * self.sequence_multiplier) % self.sprite_duration;
+                            let time_in_cycle =
+                                (age * self.sequence_multiplier) % self.sprite_duration;
                             let cycle_pos = time_in_cycle / self.sprite_duration;
                             (cycle_pos * frame_count) % frame_count
                         } else {
@@ -1428,58 +1637,124 @@ impl ParticleSystem {
         }
         self.particles.retain(|p| p.life > 0.0);
 
+        // Hold off emission until `starttime` — existing particles still
+        // simulate and die, the burst just ramps in from zero at start_time.
+        let emitting = self.time >= self.start_time;
+        let since_start = self.time - self.start_time;
         for emitter in &mut self.emitters {
-            emitter.accumulator += emitter.rate * self.rate_mult * dt;
+            // Per-emitter `duration` cutoff (after start_time).
+            let expired = emitter.duration.is_some_and(|d| since_start > d);
+            if !emitting || expired {
+                continue;
+            }
+            // One-shot burst: seed the accumulator with the full count once, so
+            // the spawn loop below emits it in this frame (capped by max_count).
+            if !emitter.burst_done {
+                emitter.accumulator += emitter.burst as f32;
+                emitter.burst_done = true;
+            }
+            // Audio-reactive emitters scale their rate with loudness (a small
+            // baseline keeps a trickle when quiet).
+            let audio_gain = if emitter.audio_reactive {
+                0.15 + self.audio_level
+            } else {
+                1.0
+            };
+            emitter.accumulator += emitter.rate * self.rate_mult * audio_gain * dt;
             while emitter.accumulator >= 1.0 && self.particles.len() < self.max_count {
                 emitter.accumulator -= 1.0;
                 // `createLifetimeRandomInitializer`: `p.lifetime =
-                // random(min, max) * lifetimeOverride`.
+                // random(min, max) * lifetimeOverride`. `exponent` biases the
+                // uniform sample toward one end before the lerp.
                 let life = (self.life_min
-                    + fastrand::f32() * (self.life_max - self.life_min).max(0.0))
+                    + fastrand::f32().powf(self.life_exp)
+                        * (self.life_max - self.life_min).max(0.0))
                     * self.lifetime_mult;
                 // Reference halves the sizerandom range (CParticle.cpp: `size = (min +
                 // t*(max-min)) * override / 2.0`) — the initializer's value is a
                 // diameter, not a radius.
                 let size = (self.size_min
-                    + fastrand::f32() * (self.size_max - self.size_min).max(0.0))
+                    + fastrand::f32().powf(self.size_exp)
+                        * (self.size_max - self.size_min).max(0.0))
                     * self.size_mult
                     / 2.0;
 
                 let ox = emitter.origin[0];
                 let oy = emitter.origin[1];
 
-                let (mut vx, mut vy) = if let (Some(min), Some(max)) =
-                    (self.velocity_min, self.velocity_max)
-                {
-                    (
-                        (min[0] + fastrand::f32() * (max[0] - min[0])) * self.speed_mult,
-                        (min[1] + fastrand::f32() * (max[1] - min[1])) * self.speed_mult,
-                    )
+                // Spawn offset — CParticle.cpp's create{Box,Sphere}Emitter:
+                // a random point WITHIN the emitter volume, scaled per-axis
+                // by `directions` (the emitter never encodes velocity in
+                // its distances; rainperspective's 1024 radius is a spawn
+                // band, which our old model collapsed into a ±15px column
+                // at the emitter origin while misreading the radius as a
+                // fallback speed).
+                let mut offset = if emitter.is_sphere {
+                    let (rmin, rmax) = (emitter.distance_min[0], emitter.distance_max[0]);
+                    if self.shell_3d {
+                        // flags & 4 (perspective): 3D spherical shell,
+                        // cbrt-uniform radius; our 2D sim keeps xy.
+                        let theta = fastrand::f32() * std::f32::consts::TAU;
+                        let cos_t = fastrand::f32() * 2.0 - 1.0;
+                        let sin_t = (1.0 - cos_t * cos_t).sqrt();
+                        let r =
+                            (rmin.powi(3) + fastrand::f32() * (rmax.powi(3) - rmin.powi(3))).cbrt();
+                        [sin_t * theta.cos() * r, sin_t * theta.sin() * r]
+                    } else {
+                        // 2D disk/annulus, sqrt-uniform for even area density.
+                        let angle = fastrand::f32() * std::f32::consts::TAU;
+                        let r2 = rmin * rmin + fastrand::f32() * (rmax * rmax - rmin * rmin);
+                        let r = r2.max(0.0).sqrt();
+                        [angle.cos() * r, angle.sin() * r]
+                    }
                 } else {
-                    let speed = (emitter.speed_min
-                        + fastrand::f32() * (emitter.speed_max - emitter.speed_min))
-                        * self.speed_mult;
-                    let angle = fastrand::f32() * std::f32::consts::TAU;
-                    let sign_x = if emitter.sign[0] == 0.0 {
-                        1.0
-                    } else {
-                        emitter.sign[0].signum()
-                    };
-                    let sign_y = if emitter.sign[1] == 0.0 {
-                        1.0
-                    } else {
-                        emitter.sign[1].signum()
-                    };
-                    let id_phase = emitter.id as f32 * 0.173;
-                    (
-                        (angle + id_phase).cos() * speed * emitter.directions[0].max(0.1) * sign_x,
-                        (angle + id_phase).sin() * speed * emitter.directions[1].max(0.1) * sign_y,
-                    )
+                    // Box: per-axis distance in [min, max], random sign flip.
+                    let mut o = [0.0f32; 2];
+                    for (axis, out) in o.iter_mut().enumerate() {
+                        let d = emitter.distance_min[axis]
+                            + fastrand::f32()
+                                * (emitter.distance_max[axis] - emitter.distance_min[axis]);
+                        *out = if fastrand::f32() < 0.5 { -d } else { d };
+                    }
+                    o
                 };
+                offset[0] *= emitter.directions[0];
+                offset[1] *= emitter.directions[1];
+                // `sign`: 1 forces positive, -1 negative, 0 leaves both.
+                for axis in 0..2 {
+                    if emitter.sign[axis] >= 1.0 {
+                        offset[axis] = offset[axis].abs();
+                    } else if emitter.sign[axis] <= -1.0 {
+                        offset[axis] = -offset[axis].abs();
+                    }
+                }
+                let mut spawn_x = ox + offset[0];
+                let mut spawn_y = oy + offset[1];
 
-                let (spread_x, spread_y) = (emitter.spread[0], emitter.spread[1]);
-                let mut spawn_x = ox + (fastrand::f32() - 0.5) * spread_x;
-                let mut spawn_y = oy + (fastrand::f32() - 0.5) * spread_y;
+                // Velocity: velocityrandom initializer first; else the
+                // emitter's own optional radial speed (`speedmin`/`speedmax`
+                // fields, pointing outward from the offset); else zero —
+                // "Emitter does not set velocity - initializers handle that".
+                let (mut vx, mut vy) =
+                    if let (Some(min), Some(max)) = (self.velocity_min, self.velocity_max) {
+                        (
+                            (min[0] + fastrand::f32() * (max[0] - min[0])) * self.speed_mult,
+                            (min[1] + fastrand::f32() * (max[1] - min[1])) * self.speed_mult,
+                        )
+                    } else if emitter.speed_max > 0.0 || emitter.speed_min != 0.0 {
+                        let len = (offset[0] * offset[0] + offset[1] * offset[1]).sqrt();
+                        let dir = if len > 0.0 {
+                            [offset[0] / len, offset[1] / len]
+                        } else {
+                            [0.0, 1.0]
+                        };
+                        let speed = (emitter.speed_min
+                            + fastrand::f32() * (emitter.speed_max - emitter.speed_min))
+                            * self.speed_mult;
+                        (dir[0] * speed, dir[1] * speed)
+                    } else {
+                        (0.0, 0.0)
+                    };
 
                 // `mapsequencebetweencontrolpoints`: the Nth spawn sits at
                 // the Nth slot along the cp0->cp1 segment (mirror =
@@ -1492,7 +1767,11 @@ impl ParticleSystem {
                     let slot = if ms.mirror {
                         let period = 2 * last;
                         let k = idx % period.max(1);
-                        if k <= last { k } else { period - k }
+                        if k <= last {
+                            k
+                        } else {
+                            period - k
+                        }
                     } else {
                         idx % ms.count
                     };
@@ -1510,8 +1789,8 @@ impl ParticleSystem {
                 // evenly-spaced angles around a circle (the initializer
                 // *assigns* position/velocity, unlike the additive ones).
                 if let Some(ms) = self.map_sequence {
-                    let angle = (self.map_sequence_index as f32 / ms.count as f32)
-                        * std::f32::consts::TAU;
+                    let angle =
+                        (self.map_sequence_index as f32 / ms.count as f32) * std::f32::consts::TAU;
                     self.map_sequence_index = (self.map_sequence_index + 1) % ms.count;
                     if let Some(cp) = self.control_points.get(ms.control_point) {
                         spawn_x = cp[0];
@@ -1596,14 +1875,11 @@ impl ParticleSystem {
                 // max) * colorOverride` — colorn is a 0-1 per-channel tint.
                 let color = self.color_override.unwrap_or_else(|| {
                     [
-                        (lerp_u8(self.color_min[0], self.color_max[0]) as f32
-                            * self.colorn_mult[0])
+                        (lerp_u8(self.color_min[0], self.color_max[0]) as f32 * self.colorn_mult[0])
                             .clamp(0.0, 255.0) as u8,
-                        (lerp_u8(self.color_min[1], self.color_max[1]) as f32
-                            * self.colorn_mult[1])
+                        (lerp_u8(self.color_min[1], self.color_max[1]) as f32 * self.colorn_mult[1])
                             .clamp(0.0, 255.0) as u8,
-                        (lerp_u8(self.color_min[2], self.color_max[2]) as f32
-                            * self.colorn_mult[2])
+                        (lerp_u8(self.color_min[2], self.color_max[2]) as f32 * self.colorn_mult[2])
                             .clamp(0.0, 255.0) as u8,
                     ]
                 });
@@ -1938,8 +2214,19 @@ impl ParticleSystem {
                     None => (p.size * scale, p.size * scale, p.rotation),
                 };
                 draw_textured_particle(
-                    canvas, px_pos, py_pos, half_w, half_h, rotation, p.color, alpha, tex,
-                    next_frame, sprite.overbright, additive, scale < 0.9,
+                    canvas,
+                    px_pos,
+                    py_pos,
+                    half_w,
+                    half_h,
+                    rotation,
+                    p.color,
+                    alpha,
+                    tex,
+                    next_frame,
+                    sprite.overbright,
+                    additive,
+                    scale < 0.9,
                 );
                 continue;
             }
@@ -2014,16 +2301,27 @@ impl ParticleSystem {
         additive: bool,
         scale: f32,
     ) {
+        let Some(geo) = self.build_rope_geometry(origin, scale) else {
+            return;
+        };
+        let tex = sprite.and_then(|s| s.frames.first());
+        let overbright = sprite.map(|s| s.overbright).unwrap_or(1.0);
+        for &(i, v_a, v_b) in &geo.quads {
+            let (a, b) = (&geo.points[i], &geo.points[i + 1]);
+            fill_rope_segment(
+                canvas, a.pos, b.pos, a.normal, b.normal, a.size, b.size, a.color, b.color,
+                a.alpha, b.alpha, additive, tex, overbright, v_a, v_b,
+            );
+        }
+    }
+
+    /// Builds the rope's shared geometry — Catmull-Rom subpoints, per-joint
+    /// central-difference normals, and per-quad V ranges — consumed by both
+    /// the CPU scanline fill and the GPU vertex emitter.
+    fn build_rope_geometry(&self, origin: [f32; 2], scale: f32) -> Option<RopeGeometry> {
         let n = self.particles.len();
         if n < 2 {
-            return;
-        }
-
-        struct SubPoint {
-            pos: [f32; 2],
-            size: f32,
-            color: [u8; 3],
-            alpha: f32,
+            return None;
         }
 
         let subdiv = self.rope_subdivision;
@@ -2038,18 +2336,10 @@ impl ParticleSystem {
 
             for step in 0..subdiv {
                 let t = step as f32 / subdiv as f32;
-                let pos = catmull_rom_vec2(
-                    [p0.x, p0.y],
-                    [p1.x, p1.y],
-                    [p2.x, p2.y],
-                    [p3.x, p3.y],
-                    t,
-                );
-                subpoints.push(SubPoint {
-                    pos: [
-                        (pos[0] - origin[0]) * scale,
-                        (pos[1] - origin[1]) * scale,
-                    ],
+                let pos =
+                    catmull_rom_vec2([p0.x, p0.y], [p1.x, p1.y], [p2.x, p2.y], [p3.x, p3.y], t);
+                subpoints.push(RopePoint {
+                    pos: [(pos[0] - origin[0]) * scale, (pos[1] - origin[1]) * scale],
                     size: lerp_f32(p1.size, p2.size, t) * scale,
                     alpha: lerp_f32(p1.alpha, p2.alpha, t),
                     color: [
@@ -2057,24 +2347,18 @@ impl ParticleSystem {
                         lerp_f32(p1.color[1] as f32, p2.color[1] as f32, t) as u8,
                         lerp_f32(p1.color[2] as f32, p2.color[2] as f32, t) as u8,
                     ],
+                    normal: [0.0, 1.0],
                 });
             }
         }
         let last = &self.particles[n - 1];
-        subpoints.push(SubPoint {
-            pos: [
-                (last.x - origin[0]) * scale,
-                (last.y - origin[1]) * scale,
-            ],
+        subpoints.push(RopePoint {
+            pos: [(last.x - origin[0]) * scale, (last.y - origin[1]) * scale],
             size: last.size * scale,
             color: last.color,
             alpha: last.alpha,
+            normal: [0.0, 1.0],
         });
-
-        // Rope texture: frame 0 of the resolved material sprite. Rope
-        // materials are plain beam/trail strips, not animated sheets.
-        let tex = sprite.and_then(|s| s.frames.first());
-        let overbright = sprite.map(|s| s.overbright).unwrap_or(1.0);
 
         // V coordinates along the rope — CParticle::renderRope's exact
         // semantics: each sub-segment quad consumes 1/(trailLength-1) of UV
@@ -2125,21 +2409,227 @@ impl ParticleSystem {
             }
         };
         let normals: Vec<[f32; 2]> = (0..subpoints.len()).map(joint_normal).collect();
-
-        for (s, pair) in subpoints.windows(2).enumerate() {
-            let (a, b) = (&pair[0], &pair[1]);
-            let trail_position = if use_smoothing && total_arc > 0.0 {
-                cumulative_arc[s] / total_arc * total_sub
-            } else {
-                s as f32
-            } + scroll_offset;
-            let v_a = trail_position / usable_len;
-            let v_b = (trail_position + 1.0) / usable_len;
-            fill_rope_segment(
-                canvas, a.pos, b.pos, normals[s], normals[s + 1], a.size, b.size, a.color,
-                b.color, a.alpha, b.alpha, additive, tex, overbright, v_a, v_b,
-            );
+        for (i, n) in normals.into_iter().enumerate() {
+            subpoints[i].normal = n;
         }
+
+        let quads = (0..subpoints.len() - 1)
+            .map(|s| {
+                let trail_position = if use_smoothing && total_arc > 0.0 {
+                    cumulative_arc[s] / total_arc * total_sub
+                } else {
+                    s as f32
+                } + scroll_offset;
+                (
+                    s,
+                    trail_position / usable_len,
+                    (trail_position + 1.0) / usable_len,
+                )
+            })
+            .collect();
+
+        Some(RopeGeometry {
+            points: subpoints,
+            quads,
+        })
+    }
+
+    /// Appends pre-transformed triangle-list vertices for the GPU particle
+    /// pipeline: 6 per sprite quad (rotation/spritetrail applied here, the
+    /// same math as the CPU textured draw) or 6 per rope sub-quad. Positions
+    /// are absolute scene pixels; the vertex shader converts to NDC.
+    /// `frame_count` is the sprite's frame count (0/1 = static frame 0).
+    pub fn emit_gpu_vertices(&self, out: &mut Vec<GpuVertex>, frame_count: usize) {
+        if self.rope_mode {
+            self.emit_rope_gpu_vertices(out);
+            return;
+        }
+        for p in &self.particles {
+            if p.alpha <= 0.0 || p.size <= 0.0 {
+                continue;
+            }
+            // Frame/cross-fade selection — mirrors the CPU textured draw.
+            let (frame, blend) = if frame_count > 1 {
+                let f = p.frame.max(0.0);
+                let a = (f as usize).min(frame_count - 1);
+                let b = (a + 1).min(frame_count - 1);
+                let fract = f.fract();
+                if b != a && fract > 1.0 / 255.0 {
+                    (a as f32, fract)
+                } else {
+                    (a as f32, 0.0)
+                }
+            } else {
+                (0.0, 0.0)
+            };
+            let (half_w, half_h, rotation) = match self.sprite_trail {
+                Some(t) => {
+                    let vel_len = (p.vx * p.vx + p.vy * p.vy).sqrt();
+                    let trail = (vel_len * t.length)
+                        .clamp(t.min_length.min(t.max_length), t.max_length)
+                        .max(0.05);
+                    let angle = if vel_len > 0.0001 {
+                        p.vy.atan2(p.vx) + std::f32::consts::FRAC_PI_2
+                    } else {
+                        p.rotation
+                    };
+                    (p.size, p.size * trail, angle)
+                }
+                None => (p.size, p.size, p.rotation),
+            };
+            let (c, sn) = (rotation.cos(), rotation.sin());
+            let color = [
+                p.color[0] as f32 / 255.0,
+                p.color[1] as f32 / 255.0,
+                p.color[2] as f32 / 255.0,
+                p.alpha.clamp(0.0, 1.0),
+            ];
+            let corner = |lx: f32, ly: f32, u: f32, v: f32| GpuVertex {
+                pos: [p.x + lx * c - ly * sn, p.y + lx * sn + ly * c],
+                uv: [u, v],
+                color,
+                frame_blend: [frame, blend, 0.0, 0.0],
+            };
+            let tl = corner(-half_w, -half_h, 0.0, 0.0);
+            let tr = corner(half_w, -half_h, 1.0, 0.0);
+            let br = corner(half_w, half_h, 1.0, 1.0);
+            let bl = corner(-half_w, half_h, 0.0, 1.0);
+            out.extend_from_slice(&[tl, tr, br, br, bl, tl]);
+        }
+    }
+
+    fn emit_rope_gpu_vertices(&self, out: &mut Vec<GpuVertex>) {
+        let Some(geo) = self.build_rope_geometry([0.0, 0.0], 1.0) else {
+            return;
+        };
+        for &(i, v_a, v_b) in &geo.quads {
+            let (a, b) = (&geo.points[i], &geo.points[i + 1]);
+            // Same convexity guard as fill_rope_segment: keep both joint
+            // normals on the same side when the chain doubles back.
+            let nb = if a.normal[0] * b.normal[0] + a.normal[1] * b.normal[1] < 0.0 {
+                [-b.normal[0], -b.normal[1]]
+            } else {
+                b.normal
+            };
+            let (ha, hb) = (a.size.max(0.5), b.size.max(0.5));
+            let col = |p: &RopePoint| {
+                [
+                    p.color[0] as f32 / 255.0,
+                    p.color[1] as f32 / 255.0,
+                    p.color[2] as f32 / 255.0,
+                    p.alpha.clamp(0.0, 1.0),
+                ]
+            };
+            let (ca, cb) = (col(a), col(b));
+            let vert = |pos: [f32; 2], uv: [f32; 2], color: [f32; 4]| GpuVertex {
+                pos,
+                uv,
+                color,
+                frame_blend: [0.0, 0.0, 0.0, 0.0],
+            };
+            // U convention matches fill_rope_segment: +normal side = u 1.
+            let a1 = vert(
+                [a.pos[0] + a.normal[0] * ha, a.pos[1] + a.normal[1] * ha],
+                [1.0, v_a],
+                ca,
+            );
+            let b1 = vert(
+                [b.pos[0] + nb[0] * hb, b.pos[1] + nb[1] * hb],
+                [1.0, v_b],
+                cb,
+            );
+            let b0 = vert(
+                [b.pos[0] - nb[0] * hb, b.pos[1] - nb[1] * hb],
+                [0.0, v_b],
+                cb,
+            );
+            let a0 = vert(
+                [a.pos[0] - a.normal[0] * ha, a.pos[1] - a.normal[1] * ha],
+                [0.0, v_a],
+                ca,
+            );
+            out.extend_from_slice(&[a1, b1, b0, b0, a0, a1]);
+        }
+    }
+
+    /// Visits every live child instance with its child index (the GPU path
+    /// keys uploaded textures by child, since instances spawn at runtime)
+    /// and its material blending.
+    pub fn visit_gpu_children(&self, f: &mut dyn FnMut(&ParticleSystem, usize, bool)) {
+        for (child_idx, child) in self.children.iter().enumerate() {
+            for inst in &child.instances {
+                f(&inst.system, child_idx, child.additive);
+            }
+        }
+    }
+
+    /// Build-time child info for GPU texture upload: each child's sprite and
+    /// whether its preset uses a rope renderer.
+    pub fn child_sprite_info(&self) -> Vec<(Option<&ParticleSprite>, bool)> {
+        self.children
+            .iter()
+            .map(|c| {
+                let rope = c.config.renderer.iter().any(|r| {
+                    r.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|n| n == "rope" || n == "ropetrail")
+                        .unwrap_or(false)
+                });
+                (c.sprite.as_ref(), rope)
+            })
+            .collect()
+    }
+
+    pub fn is_rope(&self) -> bool {
+        self.rope_mode
+    }
+}
+
+/// One point along a rope's subdivided spine (see `build_rope_geometry`).
+struct RopePoint {
+    pos: [f32; 2],
+    size: f32,
+    color: [u8; 3],
+    alpha: f32,
+    /// Per-joint central-difference perpendicular (width direction).
+    normal: [f32; 2],
+}
+
+/// Shared rope geometry: spine points and per-quad `(start_index, v_a, v_b)`.
+struct RopeGeometry {
+    points: Vec<RopePoint>,
+    quads: Vec<(usize, f32, f32)>,
+}
+
+/// One pre-transformed vertex for the GPU particle pipeline (triangle list,
+/// read from a storage buffer by `vs_particles`). 48 bytes, std430-compatible.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuVertex {
+    /// Absolute scene pixels (y-down).
+    pub pos: [f32; 2],
+    pub uv: [f32; 2],
+    /// rgb 0-1, a = particle alpha.
+    pub color: [f32; 4],
+    /// x = sprite-sheet frame, y = cross-fade weight toward frame+1.
+    pub frame_blend: [f32; 4],
+}
+
+impl GpuVertex {
+    /// Flattens vertices to the byte layout `vs_particles` reads.
+    pub fn as_bytes(verts: &[GpuVertex]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(verts.len() * 48);
+        for v in verts {
+            for f in v
+                .pos
+                .iter()
+                .chain(v.uv.iter())
+                .chain(v.color.iter())
+                .chain(v.frame_blend.iter())
+            {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        out
     }
 }
 
@@ -2220,14 +2710,24 @@ fn fill_rope_segment(
         [a[0] - normal_a[0] * half_a, a[1] - normal_a[1] * half_a],
     ];
 
-    let min_x = corners.iter().map(|c| c[0]).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let min_x = corners
+        .iter()
+        .map(|c| c[0])
+        .fold(f32::MAX, f32::min)
+        .floor()
+        .max(0.0) as i32;
     let max_x = corners
         .iter()
         .map(|c| c[0])
         .fold(f32::MIN, f32::max)
         .ceil()
         .min(canvas.width() as f32 - 1.0) as i32;
-    let min_y = corners.iter().map(|c| c[1]).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let min_y = corners
+        .iter()
+        .map(|c| c[1])
+        .fold(f32::MAX, f32::min)
+        .floor()
+        .max(0.0) as i32;
     let max_y = corners
         .iter()
         .map(|c| c[1])
@@ -2257,10 +2757,7 @@ fn fill_rope_segment(
             if let Some(tex) = tex {
                 // Signed offset from the centerline along the interpolated
                 // joint normal, in [-half, +half] at this point's width.
-                let center = [
-                    lerp_f32(a[0], b[0], seg_t),
-                    lerp_f32(a[1], b[1], seg_t),
-                ];
+                let center = [lerp_f32(a[0], b[0], seg_t), lerp_f32(a[1], b[1], seg_t)];
                 let nl = [
                     lerp_f32(normal_a[0], normal_b[0], seg_t),
                     lerp_f32(normal_a[1], normal_b[1], seg_t),
@@ -2578,6 +3075,17 @@ fn fade_value(t: f32, start: f32, end: f32, start_val: f32, end_val: f32) -> f32
 /// `turbulentvelocityrandom`/`angularvelocityrandom` shadow
 /// `velocityrandom` (or `angularmovement` shadow `movement`) depending on
 /// declaration order.
+/// The `exponent` (distribution bias) of a named initializer, or 1.0 (uniform).
+fn initializer_exponent(initializers: &[Initializer], name: &str) -> f32 {
+    initializers
+        .iter()
+        .find(|i| i.name == name)
+        .and_then(|i| i.exponent)
+        .map(|e| e as f32)
+        .filter(|e| *e > 0.0)
+        .unwrap_or(1.0)
+}
+
 fn scalar_range_from_initializers(
     initializers: &[Initializer],
     name: &str,
@@ -2735,7 +3243,11 @@ mod tests {
         sys.step(0.01);
         let p = &sys.particles[0];
         assert_eq!(p.life, 4.0, "lifetime 2.0 should double the 2s lifetime");
-        assert_eq!(p.color, [100, 100, 50], "colorn should tint the red channel only");
+        assert_eq!(
+            p.color,
+            [100, 100, 50],
+            "colorn should tint the red channel only"
+        );
     }
 
     /// `enabled: false` in an instanceoverride must drop the whole system at
@@ -2985,7 +3497,10 @@ mod tests {
         // — a plain per-particle circle draw (radius 10) would leave this gap
         // empty since it's 25px from the nearest particle center.
         let mid_pixel = canvas.get_pixel(25, 100);
-        assert!(mid_pixel[3] > 0, "expected ribbon fill at midpoint, got {mid_pixel:?}");
+        assert!(
+            mid_pixel[3] > 0,
+            "expected ribbon fill at midpoint, got {mid_pixel:?}"
+        );
     }
 
     /// A rope with a material texture must sample it across the ribbon width
@@ -3013,14 +3528,21 @@ mod tests {
                 beam.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
             }
         }
-        let sprite = ParticleSprite { frames: vec![beam], duration: 0.0, overbright: 1.0 };
+        let sprite = ParticleSprite {
+            frames: vec![beam],
+            duration: 0.0,
+            overbright: 1.0,
+        };
 
         let mut canvas = RgbaImage::new(200, 200);
         sys.render_onto(&mut canvas, Some(&sprite), [0.0, 0.0]);
 
         // The rope spine (u = 0.5 → the white center column) is filled…
         let spine = canvas.get_pixel(25, 100);
-        assert!(spine[3] > 0, "expected filament on rope spine, got {spine:?}");
+        assert!(
+            spine[3] > 0,
+            "expected filament on rope spine, got {spine:?}"
+        );
         // …but the ribbon area off-center (still inside the 10px half-width
         // the old flat fill covered) samples the transparent texture edge.
         let edge = canvas.get_pixel(25, 92);
@@ -3117,7 +3639,10 @@ mod tests {
         assert_eq!(sys.children[0].instances.len(), 1);
         sys.step(0.1); // parent (life 0.05) dies
         let inst = &sys.children[0].instances[0];
-        assert!(inst.parent_id.is_none(), "dead parent should detach the instance");
+        assert!(
+            inst.parent_id.is_none(),
+            "dead parent should detach the instance"
+        );
         assert!(
             inst.system.emitters.iter().all(|e| e.rate == 0.0),
             "detached instance should stop emitting"
@@ -3134,8 +3659,18 @@ mod tests {
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
         let mut sys = ParticleSystem::from_config(&config, [40.0, 40.0], None);
-        sys.add_child(simple_child_config(), None, false, &child_ref(None, 1.0), [40.0, 40.0]);
-        assert_eq!(sys.children[0].instances.len(), 1, "static child instantiates immediately");
+        sys.add_child(
+            simple_child_config(),
+            None,
+            false,
+            &child_ref(None, 1.0),
+            [40.0, 40.0],
+        );
+        assert_eq!(
+            sys.children[0].instances.len(),
+            1,
+            "static child instantiates immediately"
+        );
         for _ in 0..10 {
             sys.step(0.05);
         }
@@ -3177,20 +3712,24 @@ mod tests {
         let mut tex = RgbaImage::new(8, 8);
         for y in 0..8 {
             for x in 0..8 {
-                let color = if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+                let color = if x < 4 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
                 tex.put_pixel(x, y, image::Rgba(color));
             }
         }
 
-        let config: ParticleConfig = serde_json::from_str(
-            r#"{"maxcount":1,"emitter":[{"name":"box","rate":1}]}"#,
-        )
-        .expect("should parse");
+        let config: ParticleConfig =
+            serde_json::from_str(r#"{"maxcount":1,"emitter":[{"name":"box","rate":1}]}"#)
+                .expect("should parse");
 
         let sprite = ParticleSprite::single(tex.clone());
         let render_at = |rotation: f32| -> image::Rgba<u8> {
             let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
-            sys.particles.push(make_particle(50.0, 50.0, 20.0, rotation));
+            sys.particles
+                .push(make_particle(50.0, 50.0, 20.0, rotation));
             let mut canvas = RgbaImage::new(100, 100);
             sys.render_onto(&mut canvas, Some(&sprite), [0.0, 0.0]);
             *canvas.get_pixel(44, 50)
@@ -3303,7 +3842,11 @@ mod tests {
             "expected tangential -Y velocity from vortex, got vy={}",
             p.vy
         );
-        assert!(p.vx.abs() < 1e-3, "no radial force expected, got vx={}", p.vx);
+        assert!(
+            p.vx.abs() < 1e-3,
+            "no radial force expected, got vx={}",
+            p.vx
+        );
     }
 
     /// `movement.drag` decays velocity by `1 - drag*dt` per step, clamped
@@ -3376,7 +3919,10 @@ mod tests {
         for p in &sys.particles {
             assert_eq!((p.x, p.y), (50.0, 60.0), "must spawn at the control point");
             let speed = (p.vx * p.vx + p.vy * p.vy).sqrt();
-            assert!((speed - 80.0).abs() < 1e-3, "speed must stay 80, got {speed}");
+            assert!(
+                (speed - 80.0).abs() < 1e-3,
+                "speed must stay 80, got {speed}"
+            );
         }
         // First two spawns: angle 0 (+X) then 2pi/4 = 90deg rotated.
         assert!((sys.particles[0].vx - 80.0).abs() < 1e-3);
@@ -3533,7 +4079,10 @@ mod tests {
                 "expected initial_alpha in [0.15, 0.2], got {}",
                 p.initial_alpha
             );
-            assert_eq!(p.alpha, p.initial_alpha, "no alphafade — alpha should equal initial_alpha before any fade operator runs");
+            assert_eq!(
+                p.alpha, p.initial_alpha,
+                "no alphafade — alpha should equal initial_alpha before any fade operator runs"
+            );
         }
     }
 
@@ -3547,7 +4096,10 @@ mod tests {
             "initializer": [{"id":1,"name":"alpharandom","min":1.0,"max":1.0}]
         }"#;
         let config: ParticleConfig = serde_json::from_str(json).expect("should parse");
-        let overrides = InstanceOverride { alpha: Some(0.5), ..Default::default() };
+        let overrides = InstanceOverride {
+            alpha: Some(0.5),
+            ..Default::default()
+        };
         let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], Some(&overrides));
         sys.step(0.01);
         assert_eq!(sys.particles[0].initial_alpha, 0.5);
@@ -3741,6 +4293,44 @@ mod tests {
         for _ in 0..50 {
             let s = params.sample();
             assert!((0.0..std::f32::consts::TAU).contains(&s.phase));
+        }
+    }
+
+    #[test]
+    fn remapvalue_sets_velocity_within_output_range() {
+        let json = r#"{
+            "maxcount": 20,
+            "emitter": [{"name":"boxrandom","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}],
+            "initializer": [
+                {"id":1,"name":"lifetimerandom","min":100,"max":100},
+                {"id":2,"name":"sizerandom","min":10,"max":10}
+            ],
+            "operator": [
+                {"id":1,"name":"remapvalue","output":"velocity",
+                 "outputrangemin":"-100 -200 0","outputrangemax":"100 -1200 1",
+                 "transformfunction":"simplexnoise","transforminputscale":10}
+            ]
+        }"#;
+        let config: ParticleConfig = serde_json::from_str(json).unwrap();
+        let mut sys = ParticleSystem::from_config(&config, [0.0, 0.0], None);
+        for _ in 0..10 {
+            sys.step(1.0 / 30.0);
+        }
+        assert!(!sys.particles.is_empty(), "should have spawned particles");
+        for p in &sys.particles {
+            // Velocity is set (then position-integrated) into the remapped
+            // range each frame; check it lands within bounds (+ a small margin
+            // for the integration/other operators).
+            assert!(
+                (-101.0..=101.0).contains(&p.vx),
+                "vx {} out of remapped x-range",
+                p.vx
+            );
+            assert!(
+                (-1201.0..=-199.0).contains(&p.vy),
+                "vy {} out of remapped y-range",
+                p.vy
+            );
         }
     }
 }

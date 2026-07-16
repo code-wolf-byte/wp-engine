@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use wp_engine::application::{ApplicationContext, WallpaperApplication};
-use wp_engine::render;
 use wp_engine::workshop::{self, Wallpaper};
 use wp_engine::{engine, platform, ui};
 
@@ -76,9 +75,6 @@ enum Command {
         /// Output PNG path
         #[arg(long, default_value = "scene_output.png")]
         output: PathBuf,
-        /// Exercise the new WGPU scene renderer instead of the CPU fallback
-        #[arg(long)]
-        gpu: bool,
         /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
         #[arg(long = "set-property", value_name = "NAME=VALUE")]
         properties: Vec<String>,
@@ -123,9 +119,8 @@ fn main() {
         Some(Command::RenderScene {
             id_or_path,
             output,
-            gpu,
             properties,
-        }) => cmd_render_scene(&id_or_path, &output, gpu, properties),
+        }) => cmd_render_scene(&id_or_path, &output, properties),
         Some(Command::PreviewScene {
             id_or_path,
             width,
@@ -383,7 +378,6 @@ fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Resul
 fn cmd_render_scene(
     id_or_path: &str,
     output: &std::path::Path,
-    gpu: bool,
     properties: Vec<String>,
 ) -> Result<()> {
     let overrides = properties
@@ -403,28 +397,6 @@ fn cmd_render_scene(
     println!("Loading scene from {}...", dir.display());
     let graph = engine::SceneGraph::from_directory(&dir)?;
     println!("Scene graph: {}", graph.stats().summary());
-
-    if gpu {
-        let result = render::wgpu_scene::render_scene_graph_to_rgba(&dir)?;
-        println!(
-            "WGPU graph: {} objects, {} passes, {} targets, {} diagnostics",
-            result.graph.objects.len(),
-            result.graph.passes.len(),
-            result.graph.targets.len(),
-            result.graph.diagnostics.len()
-        );
-        println!(
-            "WGPU rendered {}x{} scene graph",
-            result.image.width(),
-            result.image.height()
-        );
-        for diagnostic in result.diagnostics.iter().take(8) {
-            println!("WGPU:        {diagnostic}");
-        }
-        result.image.save(output)?;
-        println!("Saved to {}", output.display());
-        return Ok(());
-    }
 
     let scene = engine::ResolvedScene::from_directory(&dir)?;
     println!(
@@ -502,6 +474,15 @@ fn cmd_test_scene(id_or_path: &str, num_frames: usize) -> Result<()> {
     // holding the wgpu device/queue) can crash the driver on shutdown.
     drop(rx);
     let _ = handle.join();
+
+    // Headless GPU-frame capture for debugging "renders weirdly" reports
+    // (the only way to see a perspective/live-path frame off-screen).
+    if let Ok(path) = std::env::var("WP_DEBUG_DUMP_FRAME") {
+        if let Some(f) = collected.last() {
+            let _ = f.save(&path);
+            eprintln!("  saved last frame to {path}");
+        }
+    }
 
     if collected.len() < 2 {
         anyhow::bail!("not enough frames collected (got {})", collected.len());

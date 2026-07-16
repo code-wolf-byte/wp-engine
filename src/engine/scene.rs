@@ -115,6 +115,67 @@ pub struct General {
     pub bloom_strength: Option<serde_json::Value>,
     #[serde(rename = "bloomthreshold")]
     pub bloom_threshold: Option<serde_json::Value>,
+    // HDR bloom (99/195 wallpapers). We run one SDR bloom chain, so when `hdr`
+    // is on we feed it the HDR-tuned strength/threshold instead.
+    pub hdr: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrstrength")]
+    pub bloom_hdr_strength: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrthreshold")]
+    pub bloom_hdr_threshold: Option<serde_json::Value>,
+    // Camera zoom (105/195) — scales the whole scene about its center.
+    pub zoom: Option<serde_json::Value>,
+    // Whether the frame is cleared to clearcolor each frame (else transparent).
+    pub clearenabled: Option<serde_json::Value>,
+    // Scene ambient / sky lighting — applied as a global additive/multiplicative
+    // tint (a minimal lighting approximation, no per-normal shading).
+    pub ambientcolor: Option<serde_json::Value>,
+    pub skylightcolor: Option<serde_json::Value>,
+    // Bloom color tint.
+    pub bloomtint: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrfeather")]
+    pub bloom_hdr_feather: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdrscatter")]
+    pub bloom_hdr_scatter: Option<serde_json::Value>,
+    #[serde(rename = "bloomhdriterations")]
+    pub bloom_hdr_iterations: Option<serde_json::Value>,
+    // Global particle forces (12/195).
+    pub winddirection: Option<serde_json::Value>,
+    pub windstrength: Option<serde_json::Value>,
+    pub windenabled: Option<serde_json::Value>,
+    pub gravitydirection: Option<serde_json::Value>,
+    pub gravitystrength: Option<serde_json::Value>,
+    // Per-scene FOV override (16/195).
+    pub perspectiveoverridefov: Option<serde_json::Value>,
+    // Transparency sort mode (2/195).
+    pub transparentsorting: Option<serde_json::Value>,
+}
+
+impl General {
+    /// Combined global particle acceleration in particle space (screen y-down):
+    /// `gravitydirection*gravitystrength + winddirection*windstrength`. WE's
+    /// directions are y-up, so y is negated. Returns `[0,0]` when unset.
+    pub fn particle_force(&self) -> [f32; 2] {
+        let term = |dir: &Option<serde_json::Value>, str: &Option<serde_json::Value>| {
+            let d = dir.as_ref().and_then(parse_value_vec3).unwrap_or([0.0; 3]);
+            let s = str.as_ref().and_then(parse_value_f32).unwrap_or(0.0);
+            [d[0] as f32 * s, d[1] as f32 * s]
+        };
+        let wind_on = self
+            .windenabled
+            .as_ref()
+            .and_then(|v| {
+                v.as_bool()
+                    .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+            })
+            .unwrap_or(true);
+        let g = term(&self.gravitydirection, &self.gravitystrength);
+        let w = if wind_on {
+            term(&self.winddirection, &self.windstrength)
+        } else {
+            [0.0, 0.0]
+        };
+        [g[0] + w[0], -(g[1] + w[1])]
+    }
 }
 
 /// A single object/layer in the scene.
@@ -179,6 +240,64 @@ pub struct SceneObject {
     pub parent: Option<serde_json::Value>,
     #[serde(default)]
     pub dependencies: Vec<serde_json::Value>,
+    // Text background box (rendered behind the glyphs when opaquebackground).
+    #[serde(default)]
+    pub opaquebackground: Option<serde_json::Value>,
+    #[serde(default)]
+    pub backgroundcolor: Option<serde_json::Value>,
+    #[serde(default)]
+    pub backgroundbrightness: Option<serde_json::Value>,
+    #[serde(default)]
+    pub padding: Option<serde_json::Value>,
+    #[serde(default)]
+    pub anchor: Option<serde_json::Value>,
+    // Text wrapping / row limits.
+    #[serde(default)]
+    pub maxwidth: Option<serde_json::Value>,
+    #[serde(default)]
+    pub maxrows: Option<serde_json::Value>,
+    #[serde(default)]
+    pub blockalign: Option<serde_json::Value>,
+    // Sound objects (audio playback).
+    #[serde(default)]
+    pub sound: Option<serde_json::Value>,
+    #[serde(default)]
+    pub volume: Option<serde_json::Value>,
+    #[serde(default)]
+    pub playbackmode: Option<serde_json::Value>,
+    #[serde(default)]
+    pub startsilent: Option<serde_json::Value>,
+    // Object-level texture clamp override.
+    #[serde(default)]
+    pub clampuvs: Option<serde_json::Value>,
+    // Light objects (radial glow approximation).
+    #[serde(default)]
+    pub light: Option<serde_json::Value>,
+    #[serde(default)]
+    pub radius: Option<serde_json::Value>,
+    #[serde(default)]
+    pub intensity: Option<serde_json::Value>,
+    // Puppet animation layers (blended each frame).
+    #[serde(default)]
+    pub animationlayers: Option<serde_json::Value>,
+    /// A static 3D mesh reference (`models/x/x.mdl`) — an alternative to
+    /// `image` used by genuine 3D scenes for spheres/skyboxes/cylinders. NOT
+    /// redundant with `image`: these objects carry no `image` at all, so
+    /// without this they're skipped entirely. See `engine::mesh3d`.
+    #[serde(default)]
+    pub model: Option<serde_json::Value>,
+}
+
+impl SceneObject {
+    /// The `model` field as a `.mdl` path, when this object is a static 3D
+    /// mesh (`model` set, no `image`).
+    pub fn mesh3d_path(&self) -> Option<&str> {
+        if self.image.is_some() {
+            return None;
+        }
+        let p = self.model.as_ref()?.as_str()?;
+        p.to_lowercase().ends_with(".mdl").then_some(p)
+    }
 }
 
 impl SceneObject {
@@ -204,6 +323,19 @@ impl SceneObject {
                 m.get("value").and_then(|v| v.as_bool()).unwrap_or(true)
             }
             _ => true,
+        }
+    }
+
+    /// Inline SceneScript source driving `visible`, if the property was
+    /// authored as `{"value": …, "script": "…"}`. An object with a visible
+    /// script must not be dropped by the `is_visible()` load-time filter even
+    /// when its authored value is `false` — the script may turn it on.
+    pub fn visible_script(&self) -> Option<String> {
+        match &self.visible {
+            Some(serde_json::Value::Object(m)) => {
+                m.get("script").and_then(|v| v.as_str()).map(str::to_string)
+            }
+            _ => None,
         }
     }
 }
@@ -352,7 +484,13 @@ impl Scene {
                 // Depth guard: a malformed scene can loop or nest absurdly; bail
                 // to "visible" rather than spin (tolerant parsing).
                 for _ in 0..64 {
-                    if !self.objects[cur].is_visible() {
+                    // A visibility script decides per-frame whether the layer
+                    // draws, so a statically-hidden but scripted object must
+                    // survive load (upstream's per-object rule, folded into the
+                    // hierarchical walk).
+                    if !self.objects[cur].is_visible()
+                        && self.objects[cur].visible_script().is_none()
+                    {
                         return false;
                     }
                     match parent_of(&self.objects[cur]) {

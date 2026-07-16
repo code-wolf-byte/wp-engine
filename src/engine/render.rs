@@ -33,7 +33,29 @@ pub struct ResolvedScene {
     pub height: u32,
     pub layers: Vec<Layer>,
     pub particle_layers: Vec<ParticleLayer>,
+    /// Static 3D mesh objects (`model` → `.mdl`) — only genuine perspective
+    /// scenes have these; the 2D compositor ignores them.
+    pub mesh3d_layers: Vec<Mesh3dLayer>,
     pub scene: Scene,
+}
+
+/// A scene object whose `model` field references a static 3D mesh. Rendered as
+/// real geometry through the perspective camera (see `engine::mesh3d`), not as
+/// a flat quad — spheres, skyboxes and cylinders can't be billboarded.
+pub struct Mesh3dLayer {
+    pub name: String,
+    pub mesh: crate::engine::mesh3d::Mesh3d,
+    /// Resolved from the material path embedded in the `.mdl` header.
+    pub texture: RgbaImage,
+    /// World-space transform (WE scene units; the mesh's own space is ≈ unit).
+    pub origin: [f32; 3],
+    pub scale: [f32; 3],
+    pub angles: [f32; 3],
+    /// The material's `"cullmode": "nocull"` — draw both faces. Everything
+    /// else culls back faces, which is what lets a skybox's near hemisphere
+    /// drop out instead of hiding the whole scene inside it.
+    pub nocull: bool,
+    pub order_index: usize,
 }
 
 /// A scene object whose `particle` field references a particle preset JSON
@@ -141,6 +163,26 @@ pub struct Layer {
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
+    /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
+    /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
+    pub transform_scripts: TransformScripts,
+    /// The object's AUTHORED `visible` value — the starting visibility and the
+    /// `value` fed to a `visible` script. Critical: scripts that only define
+    /// cursor handlers (invisible click hitboxes, `"value": false`) have no
+    /// `update()`, so the script returns `value` unchanged — feeding `true`
+    /// here would render those hitboxes as opaque boxes.
+    pub visible_base: bool,
+}
+
+/// The per-frame SceneScripts a layer's transform can carry. Each `update`
+/// receives the property's base value (a `Vec3` for scale/origin/angles, a
+/// bool for visible) and returns the value for this frame.
+#[derive(Clone, Default)]
+pub struct TransformScripts {
+    pub visible: Option<String>,
+    pub scale: Option<String>,
+    pub origin: Option<String>,
+    pub angles: Option<String>,
 }
 
 /// A loaded texture plus any additional animation frames (e.g. from a `.tex`
@@ -263,6 +305,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        let mut mesh3d_layers = Vec::new();
         // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
         let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
@@ -270,6 +313,20 @@ impl ResolvedScene {
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
             if !visible[obj_index] {
+                continue;
+            }
+            if obj.light.is_some() && obj.image.is_none() {
+                if let Some(mut layer) = light_layer_from_object(obj) {
+                    layer.order_index = obj_index;
+                    layers.push(layer);
+                }
+                continue;
+            }
+            if obj.mesh3d_path().is_some() {
+                if let Some(mut ml) = mesh3d_layer_from_object(obj, Some(dir), None) {
+                    ml.order_index = obj_index;
+                    mesh3d_layers.push(ml);
+                }
                 continue;
             }
             if obj.particle.is_some() {
@@ -328,6 +385,7 @@ impl ResolvedScene {
             height,
             layers,
             particle_layers,
+            mesh3d_layers,
             scene,
         })
     }
@@ -339,6 +397,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        let mut mesh3d_layers = Vec::new();
         // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
         let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
@@ -346,6 +405,20 @@ impl ResolvedScene {
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
             if !visible[obj_index] {
+                continue;
+            }
+            if obj.light.is_some() && obj.image.is_none() {
+                if let Some(mut layer) = light_layer_from_object(obj) {
+                    layer.order_index = obj_index;
+                    layers.push(layer);
+                }
+                continue;
+            }
+            if obj.mesh3d_path().is_some() {
+                if let Some(mut ml) = mesh3d_layer_from_object(obj, Some(dir), Some(pkg)) {
+                    ml.order_index = obj_index;
+                    mesh3d_layers.push(ml);
+                }
                 continue;
             }
             if obj.particle.is_some() {
@@ -405,6 +478,7 @@ impl ResolvedScene {
             height,
             layers,
             particle_layers,
+            mesh3d_layers,
             scene,
         })
     }
@@ -417,6 +491,7 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        let mut mesh3d_layers = Vec::new();
         // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
         let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
@@ -424,6 +499,20 @@ impl ResolvedScene {
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
             if !visible[obj_index] {
+                continue;
+            }
+            if obj.light.is_some() && obj.image.is_none() {
+                if let Some(mut layer) = light_layer_from_object(obj) {
+                    layer.order_index = obj_index;
+                    layers.push(layer);
+                }
+                continue;
+            }
+            if obj.mesh3d_path().is_some() {
+                if let Some(mut ml) = mesh3d_layer_from_object(obj, None, Some(pkg)) {
+                    ml.order_index = obj_index;
+                    mesh3d_layers.push(ml);
+                }
                 continue;
             }
             if obj.particle.is_some() {
@@ -479,6 +568,7 @@ impl ResolvedScene {
             height,
             layers,
             particle_layers,
+            mesh3d_layers,
             scene,
         })
     }
@@ -733,6 +823,43 @@ fn layer_from_object(
     // wallpaper won't flip AM↔PM mid-session without a reload (rare — re-select in
     // the render loop if that ceiling ever matters).
     select_spritesheet_frame(obj, &mut loaded);
+    // Attach puppet `animationlayers` (blended each frame) to the fresh runtime.
+    if let (Some(rt), Some(entries)) = (
+        loaded.puppet.as_mut(),
+        obj.animationlayers.as_ref().and_then(|v| v.as_array()),
+    ) {
+        if let Some(rt) = std::sync::Arc::get_mut(rt) {
+            let n = rt.model.animations.len();
+            if n > 0 {
+                let layers: Vec<crate::engine::puppet::AnimLayer> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
+                    .map(|(i, e)| {
+                        // The `animation` id doesn't map to an MDLA index (no
+                        // ids parsed), so resolve it as an index if in range,
+                        // else by declaration order — clamped to what exists.
+                        let raw = e
+                            .get("animation")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(i as u64);
+                        let anim_idx = if (raw as usize) < n {
+                            raw as usize
+                        } else {
+                            i.min(n - 1)
+                        };
+                        crate::engine::puppet::AnimLayer {
+                            anim_idx,
+                            additive: e.get("additive").and_then(|v| v.as_bool()).unwrap_or(false),
+                            blend: e.get("blend").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                            rate: e.get("rate").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+                        }
+                    })
+                    .collect();
+                rt.layers = layers;
+            }
+        }
+    }
     let parallax = obj
         .parallax_depth
         .as_ref()
@@ -742,20 +869,38 @@ fn layer_from_object(
     // WE stores angles already in radians; only the z component (2D roll)
     // applies to a flat layer quad. The reference negates it (rotate(-angle,
     // ...)) when building the object's screen transform.
-    let angles3 = obj
+    let angles_animated = obj
         .angles
         .as_ref()
-        .map(crate::engine::model::json_to_animated)
+        .map(crate::engine::model::json_to_animated);
+    let angles3 = angles_animated
+        .as_ref()
         .and_then(|v| v.as_vec3())
         .unwrap_or([0.0, 0.0, 0.0]);
     let angle = -angles3[2];
 
-    let scale = match &obj.scale {
-        Some(v) => {
-            let s = crate::engine::scene::parse_value_vec3(v).unwrap_or([1.0, 1.0, 1.0]);
-            s
-        }
-        None => [1.0, 1.0, 1.0],
+    let scale_animated = obj
+        .scale
+        .as_ref()
+        .map(crate::engine::model::json_to_animated);
+    let scale = scale_animated
+        .as_ref()
+        .and_then(|v| v.as_vec3())
+        .map(|s| [s[0] as f64, s[1] as f64, s[2] as f64])
+        .unwrap_or([1.0, 1.0, 1.0]);
+    let origin_animated = obj
+        .origin
+        .as_ref()
+        .map(crate::engine::model::json_to_animated);
+
+    // Per-frame transform scripts (evaluated by the live GPU path). origin/
+    // scale/angles carry their script on the animated value; visible carries
+    // it on the raw `visible` object.
+    let transform_scripts = TransformScripts {
+        visible: obj.visible_script(),
+        scale: scale_animated.as_ref().and_then(|v| v.script.clone()),
+        origin: origin_animated.as_ref().and_then(|v| v.script.clone()),
+        angles: angles_animated.as_ref().and_then(|v| v.script.clone()),
     };
 
     let alpha_animated = obj
@@ -799,8 +944,14 @@ fn layer_from_object(
     // its center (CImage.cpp lines 242-256), expressed here as an offset
     // folded directly into `origin` — every consumer of `Layer::origin`
     // (both render paths) then gets alignment for free.
+    // Text objects (the only caller passing `alignment_override`) size their
+    // quad from the rasterized glyph bitmap, not the scene `size` field —
+    // WE's CText uses `m_quadSize` (the raster dims) and ignores `size`
+    // (which is editor bounding-box metadata). Honoring it would stretch the
+    // glyphs to an unrelated box.
+    let is_text = alignment_override.is_some();
     let raw_size = obj.parsed_size();
-    let effective_size = if raw_size[0] > 0.0 && raw_size[1] > 0.0 {
+    let effective_size = if !is_text && raw_size[0] > 0.0 && raw_size[1] > 0.0 {
         [raw_size[0], raw_size[1]]
     } else {
         [loaded.image.width() as f64, loaded.image.height() as f64]
@@ -819,7 +970,12 @@ fn layer_from_object(
         extra_frames: loaded.extra_frames,
         frame_duration_ms: loaded.frame_duration_ms,
         origin,
-        size: obj.parsed_size(),
+        // Text: leave size 0 so both render paths fall back to the raster dims.
+        size: if is_text {
+            [0.0, 0.0, 0.0]
+        } else {
+            obj.parsed_size()
+        },
         scale,
         parallax_depth: parallax,
         angle,
@@ -831,11 +987,22 @@ fn layer_from_object(
         brightness,
         copybackground: obj.copybackground,
         no_interpolation: loaded.no_interpolation,
-        clamp_uvs: loaded.clamp_uvs,
+        // Object-level `clampuvs` overrides the .tex ClampUVs flag when set.
+        clamp_uvs: loaded.clamp_uvs
+            || obj
+                .clampuvs
+                .as_ref()
+                .and_then(|v| {
+                    v.as_bool()
+                        .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+                })
+                .unwrap_or(false),
         puppet: loaded.puppet,
         video: loaded.video,
         text_dynamic: None,
         order_index: 0,
+        transform_scripts,
+        visible_base: obj.is_visible(),
     }
 }
 
@@ -848,25 +1015,24 @@ fn is_video_path(p: &str) -> bool {
 /// directory, then its `scene.pkg` (if given), then the global Steam assets
 /// dir — mirroring the same wallpaper-first priority used for shaders/effects
 /// (`shaders::resolver::AssetResolver`).
-fn read_particle_json(dir: Option<&Path>, pkg: Option<&Package>, rel_path: &str) -> Option<String> {
+/// Read a scene asset from wherever it lives: loose files, the pkg archive,
+/// then the shared WE assets dir.
+fn read_asset_bytes(dir: Option<&Path>, pkg: Option<&Package>, rel_path: &str) -> Option<Vec<u8>> {
     if let Some(dir) = dir {
-        if let Ok(s) = std::fs::read_to_string(dir.join(rel_path)) {
-            return Some(s);
+        if let Ok(data) = std::fs::read(dir.join(rel_path)) {
+            return Some(data);
         }
     }
     if let Some(pkg) = pkg {
         if let Some(data) = pkg.get(rel_path) {
-            if let Ok(s) = String::from_utf8(data.to_vec()) {
-                return Some(s);
-            }
+            return Some(data.to_vec());
         }
     }
-    if let Some(assets_dir) = super::shaders::loader::find_we_assets_dir() {
-        if let Ok(s) = std::fs::read_to_string(assets_dir.join(rel_path)) {
-            return Some(s);
-        }
-    }
-    None
+    read_from_global_assets(rel_path)
+}
+
+fn read_particle_json(dir: Option<&Path>, pkg: Option<&Package>, rel_path: &str) -> Option<String> {
+    String::from_utf8(read_asset_bytes(dir, pkg, rel_path)?).ok()
 }
 
 /// Build a `ParticleLayer` from a scene object whose `particle` field is a
@@ -1087,8 +1253,103 @@ fn text_layer_from_object(
                 .or_else(|| v.get("value").and_then(|v| v.as_f64()))
         })
         .unwrap_or(32.0) as f32;
+    let scale = obj
+        .scale
+        .as_ref()
+        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .unwrap_or([1.0, 1.0, 1.0]);
+    // The on-screen text height is driven by the object's `size` BOX height,
+    // not pointsize: `layer_from_object` scales the rasterized bitmap by the
+    // object's `scale`, and WE authors size text via that box (a big box +
+    // scale>1 = big text; a modest box + scale<1 = small text). Rasterize at
+    // the box height so the bitmap ≈ its on-screen size (crisp, natural aspect,
+    // no stretch). `pointsize` here is only the fallback resolution when the
+    // object ships no box (then compensate for `scale` like CText does, so the
+    // glyphs don't collapse to a couple of pixels).
+    let box_h = obj.parsed_size()[1] as f32;
+    let raster_px = if box_h > 0.0 {
+        box_h
+    } else {
+        let avg_scale = (scale[0] + scale[1]) * 0.5;
+        let compensate = if avg_scale > 0.0 && avg_scale < 1.0 {
+            (1.0 / avg_scale).min(32.0)
+        } else {
+            1.0
+        };
+        point_size * compensate
+    }
+    .clamp(1.0, 1024.0);
     let font_data = super::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
-    let image = super::text::rasterize(&font_data, &text_str, point_size)?;
+    // Word-wrap to `maxwidth` (scene px == bitmap px at our raster resolution)
+    // and cap at `maxrows`, if authored.
+    let text_str = match obj
+        .maxwidth
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .filter(|w| *w > 0.0)
+    {
+        Some(mw) => {
+            let rows = obj
+                .maxrows
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_f32)
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            super::text::wrap_text(&font_data, &text_str, raster_px, mw, rows)
+        }
+        None => text_str,
+    };
+    let image = super::text::rasterize(&font_data, &text_str, raster_px)?;
+
+    // Opaque background box: bake the text color + bg color + padding into the
+    // bitmap and neutralize the layer tint (color set to white below). `pad`
+    // is authored in scene px, which maps 1:1 to bitmap px (we raster at the
+    // box height). Off by default — `opaquebackground` is usually false.
+    let opaque_bg = obj
+        .opaquebackground
+        .as_ref()
+        .and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.get("value").and_then(|i| i.as_bool()))
+        })
+        .unwrap_or(false);
+    let (image, bg_baked) = if opaque_bg {
+        let text_color = obj
+            .color
+            .as_ref()
+            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+            .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let bright = obj
+            .backgroundbrightness
+            .as_ref()
+            .and_then(crate::engine::scene::parse_value_f32)
+            .unwrap_or(1.0);
+        let bg = obj
+            .backgroundcolor
+            .as_ref()
+            .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+            .map(|c| {
+                [
+                    c[0] as f32 * bright,
+                    c[1] as f32 * bright,
+                    c[2] as f32 * bright,
+                ]
+            })
+            .unwrap_or([0.0, 0.0, 0.0]);
+        let pad = obj
+            .padding
+            .as_ref()
+            .and_then(crate::engine::scene::parse_value_f32)
+            .unwrap_or(0.0)
+            .max(0.0) as u32;
+        (
+            super::text::with_background(&image, text_color, bg, pad),
+            true,
+        )
+    } else {
+        (image, false)
+    };
 
     let halign = obj
         .horizontalalign
@@ -1120,15 +1381,139 @@ fn text_layer_from_object(
         layer.size[0] = fitted[0];
         layer.size[1] = fitted[1];
     }
+    if bg_baked {
+        // Text + bg colors are baked into the bitmap; don't tint it again.
+        layer.color = [1.0, 1.0, 1.0];
+    }
     if let Some(script) = script {
         layer.text_dynamic = Some(TextDynamic {
             script,
             script_properties,
             font_data,
-            point_size,
+            point_size: raster_px,
             last_text: text_str,
         });
     }
+    Some(layer)
+}
+
+/// Build a static-3D-mesh layer for an object whose `model` names a `.mdl`.
+/// `read` fetches an asset by relative path (dir- or pkg-backed), and
+/// `resolve_tex` turns the mesh's embedded material path into its texture.
+fn mesh3d_layer_from_object(
+    obj: &SceneObject,
+    dir: Option<&Path>,
+    pkg: Option<&Package>,
+) -> Option<Mesh3dLayer> {
+    let path = obj.mesh3d_path()?;
+    // The pkg stores every path lowercased, while scene.json and the `.mdl`
+    // header keep the author's casing (`models/LP/LP.mdl`, and real content
+    // has non-ASCII names too) — so retry lowercased on any miss.
+    let bytes = read_asset_bytes(dir, pkg, path)
+        .or_else(|| read_asset_bytes(dir, pkg, &path.to_lowercase()))?;
+    let mesh = crate::engine::mesh3d::parse(&bytes)?;
+    let resolve_tex = |p: &str| {
+        dir.and_then(|d| load_texture_from_dir(d, p).ok())
+            .or_else(|| pkg.and_then(|p2| load_texture_from_pkg(p2, p).ok()))
+            .map(|l| l.image)
+    };
+    let pass = material_first_pass(dir, pkg, &mesh.material);
+    let texture = resolve_tex(&mesh.material)
+        .or_else(|| resolve_tex(&mesh.material.to_lowercase()))
+        // Untextured materials are normal here (`"textures": [null,null,null]`
+        // with a flat `color` constant): draw them as that color. An
+        // unresolvable material falls through to white rather than vanishing.
+        .unwrap_or_else(|| {
+            let [r, g, b] = pass
+                .as_ref()
+                .and_then(pass_constant_color)
+                .unwrap_or([255; 3]);
+            RgbaImage::from_pixel(1, 1, image::Rgba([r, g, b, 255]))
+        });
+    let nocull = pass
+        .as_ref()
+        .and_then(|p| p.get("cullmode")?.as_str())
+        .is_some_and(|m| m == "nocull");
+
+    let scale = obj
+        .scale
+        .as_ref()
+        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .unwrap_or([1.0, 1.0, 1.0]);
+    let angles = obj
+        .angles
+        .as_ref()
+        .and_then(|v| crate::engine::model::json_to_animated(v).as_vec3())
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let o = obj.parsed_origin();
+
+    tracing::debug!(
+        target: "scene",
+        "mesh3d '{path}': {} verts, {} tris, material '{}'",
+        mesh.positions.len(),
+        mesh.indices.len() / 3,
+        mesh.material
+    );
+    Some(Mesh3dLayer {
+        name: obj.name.clone().unwrap_or_default(),
+        mesh,
+        texture,
+        origin: [o[0] as f32, o[1] as f32, o[2] as f32],
+        scale,
+        angles,
+        nocull,
+        order_index: 0,
+    })
+}
+
+/// A WE light object rendered as an additive radial glow — a minimal stand-in
+/// for the full lighting model. Colored by `color`, sized by `radius`, with a
+/// smooth quadratic falloff scaled by `intensity`. Additively blended so it
+/// brightens whatever is behind it (like a real light).
+fn light_layer_from_object(obj: &SceneObject) -> Option<Layer> {
+    let radius = obj
+        .radius
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .unwrap_or(256.0)
+        .max(1.0);
+    let intensity = obj
+        .intensity
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_f32)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let color = obj
+        .color
+        .as_ref()
+        .and_then(|v| crate::engine::scene::parse_value_vec3(v))
+        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .unwrap_or([1.0, 1.0, 1.0]);
+
+    let d = (radius * 2.0).min(2048.0) as u32;
+    let mut img = RgbaImage::new(d, d);
+    let c = d as f32 / 2.0;
+    for y in 0..d {
+        for x in 0..d {
+            let dist = (((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt() / c).min(1.0);
+            let a = (1.0 - dist).powi(2) * intensity; // quadratic falloff
+            img.put_pixel(
+                x,
+                y,
+                image::Rgba([
+                    (color[0] * 255.0) as u8,
+                    (color[1] * 255.0) as u8,
+                    (color[2] * 255.0) as u8,
+                    (a * 255.0) as u8,
+                ]),
+            );
+        }
+    }
+
+    let mut layer = layer_from_object(obj, LoadedImage::single(img), None);
+    // colorBlendMode 9 = Add (linear dodge) — the glow adds light.
+    layer.blend_mode = 9;
+    layer.color = [1.0, 1.0, 1.0];
     Some(layer)
 }
 
@@ -1380,6 +1765,36 @@ fn pass_overbright(pass: &serde_json::Value) -> f32 {
         .unwrap_or(1.0)
 }
 
+/// A mesh material's first pass. Meshes need two things out of it that the
+/// texture chain doesn't carry: the flat `color` constant and `cullmode`.
+fn material_first_pass(
+    dir: Option<&Path>,
+    pkg: Option<&Package>,
+    json_path: &str,
+) -> Option<serde_json::Value> {
+    let data = read_asset_bytes(dir, pkg, json_path)
+        .or_else(|| read_asset_bytes(dir, pkg, &json_path.to_lowercase()))?;
+    let val: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    val.get("passes")?.as_array()?.first().cloned()
+}
+
+/// A material's flat `color` constant, as 8-bit RGB. Only meaningful for
+/// materials with no texture at all — see `mesh3d_layer_from_object`.
+fn pass_constant_color(pass: &serde_json::Value) -> Option<[u8; 3]> {
+    let consts = pass.get("constantshadervalues")?;
+    // WE keys this as `color`; `Color` is a separate (usually white) tint.
+    let s = consts
+        .get("color")
+        .or_else(|| consts.get("Color"))?
+        .as_str()?;
+    let c = crate::engine::effect::parse_color(s);
+    Some([
+        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+    ])
+}
+
 /// Follow the model -> material -> texture chain for loose files on disk.
 fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Option<String>, f32)> {
     let data = std::fs::read(dir.join(json_path))
@@ -1528,7 +1943,11 @@ fn apply_puppet_mesh(
     // With a skeleton + animation, frame 0 of the animation IS the
     // assembled pose (skin = worldAnim * inverse(atlas-space bind)); the
     // raw mesh alone only reproduces the packed atlas layout.
-    let runtime = crate::engine::puppet::PuppetRuntime { model, atlas };
+    let runtime = crate::engine::puppet::PuppetRuntime {
+        model,
+        atlas,
+        layers: Vec::new(),
+    };
     let assembled = if runtime.model.has_animation() {
         runtime.render_at(0.0, runtime.atlas.width(), runtime.atlas.height())
     } else {
@@ -1899,11 +2318,26 @@ fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: 
 mod tests {
     use super::*;
 
+    /// Untextured mesh materials are common in real content
+    /// (`"textures": [null,null,null]`), and their flat `color` is the only
+    /// thing that keeps the mesh from drawing plain white.
+    #[test]
+    fn material_constant_color_reads_flat_color() {
+        // `color` wins over the separate (usually white) `Color` tint.
+        let m: serde_json::Value = serde_json::from_str(
+            r#"{"textures":[null],"constantshadervalues":
+               {"Color":"1.0 1.0 1.0","color":"0.6 0.0 0.2"}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(pass_constant_color(&m), Some([153, 0, 51]));
+        assert_eq!(pass_constant_color(&serde_json::json!({})), None);
+    }
+
     fn solid_particle_config(color: &str) -> particle::ParticleConfig {
         let json = format!(
             r#"{{
                 "maxcount": 2,
-                "emitter": [{{"name":"box","rate":1000}}],
+                "emitter": [{{"name":"box","rate":1000,"distancemin":"0 0 0","distancemax":"0 0 0"}}],
                 "initializer": [
                     {{"id":1,"name":"lifetimerandom","min":100,"max":100}},
                     {{"id":2,"name":"sizerandom","min":300,"max":300}},
@@ -1950,6 +2384,8 @@ mod tests {
             video: None,
             text_dynamic: None,
             order_index: 1,
+            transform_scripts: TransformScripts::default(),
+            visible_base: true,
         }];
 
         let particle_layers = vec![
@@ -1982,6 +2418,7 @@ mod tests {
             height: 100,
             layers,
             particle_layers,
+            mesh3d_layers: Vec::new(),
             scene,
         };
 

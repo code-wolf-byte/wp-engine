@@ -51,6 +51,12 @@ fastrand = "2"
 bytemuck = { version = "1", features = ["derive"] }
 fontdue  = "0.9"
 
+# Audio reactivity — cross-platform desktop-audio capture (ALSA/PulseAudio on
+# Linux, CoreAudio on macOS, WASAPI on Windows) + FFT for the g_AudioSpectrum*
+# shader uniforms. Both pure-Rust; cpal needs ALSA headers on Linux only.
+cpal    = "0.15"
+rustfft = "6"
+
 # Utilities
 anyhow = "1"
 dirs   = "5"

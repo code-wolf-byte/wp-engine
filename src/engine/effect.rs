@@ -220,7 +220,7 @@ fn extract_string(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key)?.as_str().map(|s| s.to_string())
 }
 
-fn parse_color(s: &str) -> [f32; 3] {
+pub(crate) fn parse_color(s: &str) -> [f32; 3] {
     let parts: Vec<f32> = s
         .split_whitespace()
         .filter_map(|p| p.parse().ok())

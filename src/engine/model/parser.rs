@@ -103,7 +103,10 @@ fn pass_to_model(pass: &scene::Pass) -> PassModel {
     let textures: Vec<Option<String>> = pass
         .textures
         .iter()
-        .map(|t| t.as_ref().and_then(|t| t.file.clone().or_else(|| t.name.clone())))
+        .map(|t| {
+            t.as_ref()
+                .and_then(|t| t.file.clone().or_else(|| t.name.clone()))
+        })
         .collect();
 
     PassModel {
