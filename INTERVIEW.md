@@ -32,6 +32,14 @@ into the codebase; the design ones are open-ended.
    valid wallpapers. Fields are interpreted only when a later stage understands
    them.
 
+5b. **A layer says `visible:true` but Wallpaper Engine hides it — why, and how do
+   you honor that?** WE hides a whole subtree when any ancestor is hidden, so
+   visibility is a property of the `parent` chain, not the single object. We fold
+   it into one `Scene::visibility_mask()` (own AND every ancestor) that every cull
+   site indexes, rather than re-walking the tree at each of the four cull sites.
+   Combos (e.g. a `language` selector) set the *group's* `visible`; the mask
+   propagates that to its children.
+
 ### Shader translation
 6. **Why go GLSL → shaderc → SPIR-V → naga instead of naga's GLSL frontend
    directly?** naga's `glsl-in` is too strict for WE's HLSL-flavored dialect;

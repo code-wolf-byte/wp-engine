@@ -20,6 +20,7 @@
 //
 // wgpu selects Metal automatically; WGSL is compiled to MSL by naga inside wgpu.
 
+use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
@@ -30,7 +31,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-use super::display::{DisplayPlatform, WallpaperHandle};
+use super::display::{DisplayPlatform, WallpaperHandle, WallpaperHandleInner};
 use super::GpuDevice;
 use crate::engine::gpu_renderer::GpuSceneInstance;
 use crate::render::{RenderSettings, WallpaperContent};
@@ -42,16 +43,46 @@ pub struct MacOSPlatform;
 impl DisplayPlatform for MacOSPlatform {
     fn spawn_wallpaper(
         &self,
-        _content: WallpaperContent,
-        _settings: Arc<Mutex<RenderSettings>>,
+        content: WallpaperContent,
+        settings: Arc<Mutex<RenderSettings>>,
     ) -> Result<WallpaperHandle> {
-        // See the module note: macOS must run the loop on the main thread, which
-        // the "spawn a thread, return a handle" contract can't express. The app
-        // lifecycle drives `run_wallpaper_on_main` directly instead.
-        bail!(
-            "macOS backend runs on the main thread; use \
-             platform::macos::run_wallpaper_on_main (WallpaperApplication wiring pending)"
-        )
+        // AppKit/winit demand the event loop on the process main thread, and the
+        // GUI (eframe) already owns this process's main thread — two winit event
+        // loops can't share it. So we can't run the wallpaper in-process here.
+        // Instead launch it as a child process (`wp-engine set-file <dir>`) that
+        // owns its own main thread and runs `run_wallpaper_on_main`. The returned
+        // handle stops the wallpaper by killing that child.
+        let dir = match &content {
+            WallpaperContent::Scene { dir } => dir.clone(),
+            _ => bail!("macOS backend currently renders only scene wallpapers"),
+        };
+        let exe = std::env::current_exe()
+            .map_err(|e| anyhow!("cannot locate wp-engine executable: {e}"))?;
+        let child = std::process::Command::new(exe)
+            .arg("set-file")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| anyhow!("failed to launch wallpaper process: {e}"))?;
+        Ok(WallpaperHandle::new(
+            Box::new(ChildWallpaperHandle { child }),
+            settings,
+        ))
+    }
+}
+
+/// Handle to a wallpaper running in a child `wp-engine set-file` process.
+/// `stop` kills it; `wait` blocks until it exits on its own.
+struct ChildWallpaperHandle {
+    child: Child,
+}
+
+impl WallpaperHandleInner for ChildWallpaperHandle {
+    fn stop(mut self: Box<Self>) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+    fn wait(mut self: Box<Self>) {
+        let _ = self.child.wait();
     }
 }
 

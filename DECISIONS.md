@@ -47,6 +47,19 @@ port in general). Newest first. Each entry: context → decision → why.
 
 ## Engine
 
+### Parent-group visibility is inherited via a per-object mask, not per-cull-site
+- **Context:** WE hides an entire subtree when any ancestor is hidden. Our cull
+  checked each object's own `is_visible()` only, so a hidden language group still
+  drew its child clock/date layers (LonelyCat rendered all 6 languages' text
+  stacked). Fixing it at each cull site would mean rebuilding the parent lookup in
+  four places (`render.rs` ×3 loaders, `graph.rs`).
+- **Decision:** one `Scene::visibility_mask() -> Vec<bool>` computes effective
+  visibility (own AND every ancestor, 64-deep cycle guard, same numeric-`id`/name
+  `parent` resolution the transform pass uses); every cull site indexes the mask.
+- **Why:** single source of truth, O(n) per scene build, and it lives on `Scene`
+  next to `is_visible()` where the next reader expects it. Mirrors how
+  `apply_parent_transforms` already centralizes parent-chain walking for TRS.
+
 ### `render_TRS.rs` folded back into `render.rs`
 - **Context:** the CPU-fallback render module was iterated as a parallel
   `render_TRS.rs` wired in via a `#[path = "render_TRS.rs"] pub mod render;`

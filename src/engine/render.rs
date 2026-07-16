@@ -83,8 +83,10 @@ pub struct ResolvedChildParticle {
 }
 
 /// Everything needed to re-rasterize a script-driven text layer at runtime:
-/// the script, the font, and the layout inputs (`layer_from_object` folds
-/// alignment into origin once at load; content changes re-derive it).
+/// the script and font. The layer's projected `rect` (position + size) is
+/// computed once at build through the full camera/parent transform; on a
+/// content change we keep that rect's center and only rescale its extent by
+/// the ratio of the new bitmap size to the old, so no projection is re-derived.
 #[derive(Clone)]
 pub struct TextDynamic {
     pub script: String,
@@ -96,11 +98,6 @@ pub struct TextDynamic {
     /// Text currently rasterized into the layer image (the `value` WE feeds
     /// back into `update` each tick).
     pub last_text: String,
-    /// Un-aligned authored origin (WE scene coords, y-up).
-    pub raw_origin: [f64; 3],
-    /// Combined "halign valign" string, as passed to `alignment_offset`.
-    pub alignment: String,
-    pub scale: [f64; 3],
 }
 
 pub struct Layer {
@@ -161,6 +158,12 @@ struct LoadedImage {
     /// Present for embedded-video textures: `image` holds the first frame,
     /// and the live GPU path re-uploads frames from this stream over time.
     video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
+    /// Set when the model's material declares the `SPRITESHEET` combo and the
+    /// `.tex` carries a frame table (e.g. a 2-cell AM/PM atlas): the per-frame
+    /// sub-rect images. `layer_from_object` picks the single frame the object's
+    /// frame script selects and uses it as the layer image. Without this the
+    /// flattened atlas stretches into the one-cell quad (all cells overlaid).
+    sprite_frames: Vec<RgbaImage>,
 }
 
 impl LoadedImage {
@@ -173,6 +176,7 @@ impl LoadedImage {
             clamp_uvs: false,
             puppet: None,
             video: None,
+            sprite_frames: Vec::new(),
         }
     }
 
@@ -198,6 +202,7 @@ impl LoadedImage {
                         clamp_uvs,
                         puppet: None,
                         video: None,
+                        sprite_frames: Vec::new(),
                     });
                 }
             }
@@ -258,11 +263,13 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() {
+            if !visible[obj_index] {
                 continue;
             }
             if obj.particle.is_some() {
@@ -332,11 +339,13 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() {
+            if !visible[obj_index] {
                 continue;
             }
             if obj.particle.is_some() {
@@ -408,11 +417,13 @@ impl ResolvedScene {
         let mut layers = Vec::new();
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() {
+            if !visible[obj_index] {
                 continue;
             }
             if obj.particle.is_some() {
@@ -690,11 +701,38 @@ fn additive_brightness_scale() -> f32 {
         .unwrap_or(0.55)
 }
 
+/// For a `SPRITESHEET` layer, pick the single frame the object's frame script
+/// selects and make it the layer image. Frames are the `.tex` TEXS sub-rects; the
+/// index comes from the object's frame-select script (WE hangs
+/// `getTextureAnimation().setFrame` off the `visible` script — e.g. AM/PM by
+/// `getHours()`). Falls back to frame 0 if the script sets none.
+fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
+    if loaded.sprite_frames.len() < 2 {
+        return;
+    }
+    let frame = obj
+        .visible
+        .as_ref()
+        .and_then(|v| v.get("script"))
+        .and_then(|s| s.as_str())
+        .and_then(|script| crate::engine::script::ScriptContext::new().eval_frame(script))
+        .unwrap_or(0)
+        .min(loaded.sprite_frames.len() as u32 - 1);
+    loaded.image = loaded.sprite_frames[frame as usize].clone();
+}
+
 fn layer_from_object(
     obj: &SceneObject,
-    loaded: LoadedImage,
+    mut loaded: LoadedImage,
     alignment_override: Option<&str>,
 ) -> Layer {
+    // Spritesheet: replace the flattened atlas with the single cell the object's
+    // frame script selects (e.g. AM/PM by `getHours()`), so the one-cell quad
+    // shows one glyph instead of every cell squished together.
+    // ponytail: frame is picked once at load from the current wall clock; a live
+    // wallpaper won't flip AM↔PM mid-session without a reload (rare — re-select in
+    // the render loop if that ceiling ever matters).
+    select_spritesheet_frame(obj, &mut loaded);
     let parallax = obj
         .parallax_depth
         .as_ref()
@@ -1061,6 +1099,27 @@ fn text_layer_from_object(
     let combined = format!("{halign} {valign}");
 
     let mut layer = layer_from_object(obj, LoadedImage::single(image), Some(&combined));
+    // WE fits the glyphs into the authored `size` box preserving their
+    // aspect (letterbox), not stretch-to-fill: a tall clock box (375×161)
+    // over ~99×26 glyphs would render the block ~6× too tall and collide with
+    // the layer below it. Shrink the box to the bitmap aspect — the
+    // constrained dimension keeps the box, the other pulls in.
+    // ponytail: refit only; origin's alignment offset was folded for the
+    // original box, so this is exact for center-aligned text (all clocks/dates
+    // here) and would need an offset re-fold for left/top anchors.
+    let bw = layer.image.width() as f64;
+    let bh = layer.image.height() as f64;
+    if bw > 0.0 && bh > 0.0 && layer.size[0] > 0.0 && layer.size[1] > 0.0 {
+        let aspect = bw / bh;
+        let (box_w, box_h) = (layer.size[0], layer.size[1]);
+        let fitted = if box_w / box_h > aspect {
+            [box_h * aspect, box_h]
+        } else {
+            [box_w, box_w / aspect]
+        };
+        layer.size[0] = fitted[0];
+        layer.size[1] = fitted[1];
+    }
     if let Some(script) = script {
         layer.text_dynamic = Some(TextDynamic {
             script,
@@ -1068,9 +1127,6 @@ fn text_layer_from_object(
             font_data,
             point_size,
             last_text: text_str,
-            raw_origin: obj.parsed_origin(),
-            alignment: combined,
-            scale: layer.scale,
         });
     }
     Some(layer)
@@ -1368,6 +1424,31 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
     anyhow::bail!("could not resolve texture from {json_path}")
 }
 
+/// Walk model → material and report whether any pass declares the `SPRITESHEET`
+/// combo (`image` is a multi-cell grid). `read` fetches a chain member's bytes.
+fn chain_has_spritesheet(json_path: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> bool {
+    let Some(data) = read(json_path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        return false;
+    };
+    if let Some(mat) = val.get("material").and_then(|v| v.as_str()) {
+        return chain_has_spritesheet(mat, read);
+    }
+    val.get("passes")
+        .and_then(|p| p.as_array())
+        .is_some_and(|passes| {
+            passes.iter().any(|pass| {
+                pass.get("combos")
+                    .and_then(|c| c.get("SPRITESHEET"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    != 0
+            })
+        })
+}
+
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
     let tex = find_model_chain_tex_pkg(pkg, json_path)?.0;
     if let Some(bytes) = tex.video_bytes() {
@@ -1376,11 +1457,16 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage
         return video_tex_to_loaded(&tex, bytes);
     }
     let atlas = tex.to_rgba()?;
-    Ok(apply_puppet_mesh(atlas, json_path, |rel| {
+    let read = |rel: &str| {
         pkg.get(rel)
             .map(|d| d.to_vec())
             .or_else(|| read_from_global_assets(rel))
-    }))
+    };
+    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    if chain_has_spritesheet(json_path, &read) {
+        loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
+    }
+    Ok(loaded)
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
@@ -1389,11 +1475,16 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
         return video_tex_to_loaded(&tex, bytes);
     }
     let atlas = tex.to_rgba()?;
-    Ok(apply_puppet_mesh(atlas, json_path, |rel| {
+    let read = |rel: &str| {
         std::fs::read(dir.join(rel))
             .ok()
             .or_else(|| read_from_global_assets(rel))
-    }))
+    };
+    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    if chain_has_spritesheet(json_path, &read) {
+        loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
+    }
+    Ok(loaded)
 }
 
 /// If the model JSON names a `"puppet"` mesh, its texture is a packed UV

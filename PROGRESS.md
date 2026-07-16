@@ -40,6 +40,67 @@ puppets, audio, etc.) lives in README.md's "Current Port Status".
 - [x] **Consolidated the render module:** `render_TRS.rs` (the live module, wired
       via a `#[path]` override) is now just `src/engine/render.rs`; the old
       shadowed `render.rs` is gone.
+- [x] **GUI "Apply Wallpaper" works on macOS:** `MacOSPlatform::spawn_wallpaper`
+      can't run a second winit loop on the GUI's main thread, so it launches the
+      wallpaper as a child `wp-engine set-file <dir>` process (its own main thread
+      → `run_wallpaper_on_main`). The returned handle stops it by killing the
+      child; switching wallpapers kills the prior child. (Known gap: quitting the
+      GUI orphans the last child — no Drop-stop yet.)
+- [x] **Hierarchical (parent-group) visibility:** WE hides an entire subtree when
+      any ancestor is hidden; our cull previously checked each object's own
+      `is_visible()` only, so hidden language groups still drew their child
+      clock/date layers (LonelyCat multi-language overlap). Fixed with
+      `Scene::visibility_mask()` (walks the `parent` chain, 64-deep cycle guard),
+      consumed by all three `ResolvedScene` loaders (`render.rs`) and the
+      render-graph path (`graph.rs`). Unit-tested.
+
+## Diagnosed (engine — found while testing LonelyCat + SAO)
+
+Diagnosed with `/diagnosing-bugs`. Ordered smallest/most-confident first.
+
+1. **[FIXED] Clock disappears when the minute changes (LonelyCat).** CONFIRMED with
+   an automated red test. `TextDynamic::raw_origin` (`render.rs`) held the object's
+   **local** origin, but `apply_parent_transforms` rewrote `layer.origin` to the
+   **world** position afterward and never updated `raw_origin`. The first frame
+   rasterized at the world spot; the minute-rollover re-rasterize
+   (`gpu_renderer.rs`) recomputed the rect from the local origin → `x ≈ -2.8`, off
+   the left edge → vanished (delta = the parent group's `(1920,1080)` translation).
+   **Fixed:** `apply_parent_transforms` now pushes `td.raw_origin` through the
+   parent world transform and scales `td.scale` by the parent scale. Ceiling:
+   alignment applies in world frame — exact for translation-only parents, an
+   approximation under a rotated/scaled parent.
+2. **[fix pending — skipped] Character hair misplaced — puppet bone `attachment`
+   unimplemented (SAO
+   3463520581).** Asuna renders bald: the crown (`hair top c1`) lands ~400px left
+   of her head, the long hair sits too low. **`cropoffset` was a red herring** —
+   Kirito's parts carry huge cropoffsets (`kirito body [629,24]`,
+   `kirito legs [690,-674]`, `kirito face [863,717]`) yet render perfectly, and
+   applying cropoffset to all `autosize` layers scatters the whole scene (sky,
+   backgrounds, bodies), so WE does **not** use it for placement. The real cause:
+   each hair object carries `"attachment": "head"` and its `parent` (id 22,
+   "asuna body") is a **puppet** whose skeleton contains a bone literally named
+   `head` (confirmed in `asuna body_puppet.mdl`). These layers are meant to be
+   anchored to the puppet's **head bone** world transform, not the parent object's
+   origin; we ignore `attachment`, so they render at the body origin. Their
+   rendered positions match scene.json + parent chain exactly (our transform is
+   right — it's anchored to the wrong node). `PuppetBone` (`puppet.rs`) currently
+   **discards bone names** (keeps only `parent` + bind matrix), so lookup-by-name
+   doesn't exist yet. **Fix (feature-sized):** keep bone names in the MDLS parse,
+   compose each bone's bind-pose world transform (atlas→scene), and when an object
+   has `attachment` + a puppet parent, anchor it to that bone instead of the parent
+   origin.
+3. **[FIXED] AM/PM indicator renders doubled (LonelyCat).** `number.am.pm` is a flat
+   model whose `.tex` carries a 2-frame TEXS spritesheet (frame 0 = AM lit, frame 1
+   = PM lit), material combo `SPRITESHEET:1`. WE picks the frame in the object's
+   `visible` script via `thisLayer.getTextureAnimation().setFrame(hours>=12?1:0)`.
+   We implemented neither, so the whole atlas flattened → AM+PM both lit.
+   **Fixed:** `script.rs` exposes `thisLayer.getTextureAnimation().setFrame(n)`
+   (+ `eval_frame` to capture the side effect); `render.rs` carries the `.tex`
+   frames on `LoadedImage.sprite_frames` when the chain has the `SPRITESHEET` combo
+   (`chain_has_spritesheet`) and `select_spritesheet_frame` swaps in the single cell
+   the object's frame script selects. Verified: at 09:44 AM lit / PM dimmed.
+   Ceiling (`ponytail:`): frame picked once at load from the wall clock, so a live
+   session won't flip AM↔PM at noon without a reload.
 
 ## Next
 

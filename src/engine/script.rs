@@ -169,7 +169,8 @@ impl ScriptContext {
              Vec3.prototype.subtract = function(o) { return new Vec3(this.x - o.x, this.y - o.y, this.z - o.z); };\n\
              Vec3.prototype.multiply = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x * (s ? o : o.x), this.y * (s ? o : o.y), this.z * (s ? o : o.z)); };\n\
              Vec3.prototype.divide = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x / (s ? o : o.x), this.y / (s ? o : o.y), this.z / (s ? o : o.z)); };\n\
-             var thisLayer = { origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), visible: true, pointsize: 32, font: '', text: '' };\n\
+             var thisLayer = { origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), visible: true, pointsize: 32, font: '', text: '', __frame: -1, \
+                 getTextureAnimation: function() { return { setFrame: function(f) { thisLayer.__frame = f; }, setFrameByName: function(){}, getFrameCount: function(){ return 1; } }; } };\n\
              var thisScene = { \
                  createLayer: function() { return { visible: false, origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), text: '' }; }, \
                  sortLayer: function() {}, \
@@ -201,7 +202,9 @@ impl ScriptContext {
     pub fn eval_update(&mut self, script: &str, current_value: f32) -> Option<f32> {
         // Reset in its own program: a function-declaration hoist in the user
         // script must win, which it can't if the reset shared the same program.
-        let _ = self.context.eval(Source::from_bytes(b"update = undefined;"));
+        let _ = self
+            .context
+            .eval(Source::from_bytes(b"update = undefined;"));
         let src = format!(
             "value = {v};\n{body}",
             v = js_num(current_value),
@@ -223,7 +226,9 @@ impl ScriptContext {
         current_value: &str,
         authored_props: Option<&serde_json::Value>,
     ) -> Option<String> {
-        let _ = self.context.eval(Source::from_bytes(b"update = undefined;"));
+        let _ = self
+            .context
+            .eval(Source::from_bytes(b"update = undefined;"));
         // serde_json string-escapes into a valid JS string literal.
         let quoted = serde_json::to_string(current_value).ok()?;
         let src = format!(
@@ -233,6 +238,28 @@ impl ScriptContext {
         let result = self.context.eval(Source::from_bytes(src.as_bytes())).ok()?;
         let js_str = result.to_string(&mut self.context).ok()?;
         Some(js_str.to_std_string_escaped())
+    }
+
+    /// Evaluate a script for its `thisLayer.getTextureAnimation().setFrame(n)`
+    /// side effect (spritesheet frame selection — e.g. an AM/PM clock cell picked
+    /// by `getHours()`). Returns the selected frame index, or `None` if the
+    /// script set none. `set_time` should be called first so `Date`/`timeOfDay`
+    /// reflect the intended clock.
+    pub fn eval_frame(&mut self, script: &str) -> Option<u32> {
+        let _ = self.context.eval(Source::from_bytes(
+            b"update = undefined; thisLayer.__frame = -1;",
+        ));
+        // Frame scripts hang the setFrame off `update`; run with a truthy `value`
+        // (these are usually `visible` scripts that just return the value back).
+        let src = format!("value = true;\n{body}", body = iife_body(script, None));
+        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+        let frame = self
+            .context
+            .eval(Source::from_bytes(b"thisLayer.__frame"))
+            .ok()?
+            .to_number(&mut self.context)
+            .ok()?;
+        (frame.is_finite() && frame >= 0.0).then_some(frame as u32)
     }
 }
 
@@ -364,9 +391,15 @@ mod tests {
     #[test]
     fn persistent_context_survives_a_throwing_script() {
         let mut ctx = ScriptContext::new();
-        assert_eq!(ctx.eval_update("function update(v){ return boom.x; }", 2.0), None);
+        assert_eq!(
+            ctx.eval_update("function update(v){ return boom.x; }", 2.0),
+            None
+        );
         // The context is still usable afterwards.
-        assert_eq!(ctx.eval_update("function update(v){ return v * 10; }", 2.0), Some(20.0));
+        assert_eq!(
+            ctx.eval_update("function update(v){ return v * 10; }", 2.0),
+            Some(20.0)
+        );
     }
 
     /// Real workshop text scripts are ES modules with `import`/`export` and a
@@ -401,7 +434,9 @@ export function update(value) {
             var h = d.getHours();
             return (h < 10 ? '0' : '') + h;
         }"#;
-        let out = ctx.eval_update_string(script, "", None).expect("should evaluate");
+        let out = ctx
+            .eval_update_string(script, "", None)
+            .expect("should evaluate");
         let n: u32 = out.parse().expect("two digits");
         assert!(n < 24, "hours out of range: {out}");
     }

@@ -1527,7 +1527,9 @@ impl GpuSceneInstance {
             ctx.set_time(time, time_of_day);
             for layer in &mut self.layers {
                 if let Some(script) = &layer.alpha_script {
-                    layer.alpha = ctx.eval_update(script, layer.alpha_base).unwrap_or(layer.alpha_base);
+                    layer.alpha = ctx
+                        .eval_update(script, layer.alpha_base)
+                        .unwrap_or(layer.alpha_base);
                 }
                 // Script-driven text: re-evaluate; only a CHANGED string pays
                 // for rasterization + upload (a clock re-rasterizes once per
@@ -1544,27 +1546,17 @@ impl GpuSceneInstance {
                                 &new_text,
                                 td.point_size,
                             ) {
-                                // Re-derive the aligned rect for the new
-                                // dimensions — same math layer_from_object +
-                                // build use (origin is y-up scene coords).
-                                let scaled = [
-                                    img.width() as f64 * td.scale[0],
-                                    img.height() as f64 * td.scale[1],
-                                ];
-                                let off = crate::engine::render::alignment_offset(
-                                    Some(&td.alignment),
-                                    scaled,
-                                );
-                                let origin = [
-                                    td.raw_origin[0] + off[0],
-                                    td.raw_origin[1] + off[1],
-                                ];
-                                layer.rect = [
-                                    (2.0 * origin[0] / self.width as f64 - 1.0) as f32,
-                                    (2.0 * origin[1] / self.height as f64 - 1.0) as f32,
-                                    (scaled[0] / self.width as f64) as f32,
-                                    (scaled[1] / self.height as f64) as f32,
-                                ];
+                                // The quad's rect was sized at build to the
+                                // object's authored `size` box and projected
+                                // through the camera/parent transform; the text
+                                // bitmap is stretched to fill it. A content
+                                // change only swaps that texture — the quad
+                                // stays put, so leave `rect` untouched (the old
+                                // per-change ortho recompute is what moved the
+                                // clock off-screen / shrank it).
+                                // ponytail: fixed authored-size quad — right for
+                                // the clock/date (constant-width). Text that
+                                // must grow to fit would need its box re-fit.
                                 layer.frames[0] = self.renderer.upload_texture(&img);
                                 td.last_text = new_text;
                             }
@@ -1684,7 +1676,13 @@ impl GpuSceneInstance {
         for (_, item) in items {
             match item {
                 DrawItem::Image(layer_idx) => {
-                    self.draw_image_layer_gpu(&mut encoder, &target_view, layer_idx, time, dynamics);
+                    self.draw_image_layer_gpu(
+                        &mut encoder,
+                        &target_view,
+                        layer_idx,
+                        time,
+                        dynamics,
+                    );
                 }
                 DrawItem::Particle(idx) => {
                     self.draw_particle_layer_gpu(&mut encoder, &target_view, idx, delta);
@@ -2483,7 +2481,10 @@ fn load_effect_instance(
                         let candidates = [format!("materials/{n}.tex"), format!("{n}.tex")];
                         candidates.iter().find_map(|rel| {
                             let bytes = resolver.read(rel)?;
-                            crate::engine::tex::TexFile::parse(&bytes).ok()?.to_rgba().ok()
+                            crate::engine::tex::TexFile::parse(&bytes)
+                                .ok()?
+                                .to_rgba()
+                                .ok()
                         })
                     });
                 // Missing-slot fallback is normally white (= unmasked), but
@@ -2495,9 +2496,11 @@ fn load_effect_instance(
                 } else {
                     image::Rgba([255, 255, 255, 255])
                 };
-                textures.push(renderer.upload_texture(
-                    &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
-                ));
+                textures.push(
+                    renderer.upload_texture(
+                        &img.unwrap_or_else(|| RgbaImage::from_pixel(1, 1, fallback)),
+                    ),
+                );
             }
         }
         // A shake with no texture overrides at all authors no flow map either
