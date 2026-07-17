@@ -28,3 +28,4 @@ target
 # porting comparison — not part of this project, not vendored.
 cpp-implementation/
 scratchpad/
+.cargo/

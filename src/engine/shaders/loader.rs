@@ -57,12 +57,13 @@ pub fn load_glsl_shader_with_resolver(
     Ok((frag_resolved, vert_resolved))
 }
 
-/// Bodies we carry for the two WE common headers we know. Returns `None` for
+/// Bodies we carry for the WE common headers we know. Returns `None` for
 /// any other include so it keeps the "not found" behaviour.
 fn embedded_we_header(include_file: &str) -> Option<&'static str> {
     let name = include_file.rsplit('/').next().unwrap_or(include_file);
     match name {
         "common_blending.h" => Some(super::transpiler::WE_COMMON_BLENDING_H),
+        "common_perspective.h" => Some(super::transpiler::WE_COMMON_PERSPECTIVE_H),
         "common.h" => Some(super::transpiler::WE_COMMON_H),
         _ => None,
     }
@@ -127,9 +128,12 @@ mod tests {
             .unwrap()
             .contains("ApplyBlending"));
         assert!(embedded_we_header("common.h").unwrap().contains("hsv2rgb"));
+        assert!(embedded_we_header("common_perspective.h")
+            .unwrap()
+            .contains("squareToQuad"));
         // Path-prefixed includes resolve by basename.
         assert!(embedded_we_header("shaders/common_blending.h").is_some());
         // Unknown headers keep the "not found" path.
-        assert!(embedded_we_header("common_perspective.h").is_none());
+        assert!(embedded_we_header("common_fragoutput.h").is_none());
     }
 }
