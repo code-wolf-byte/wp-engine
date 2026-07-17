@@ -24,9 +24,11 @@ impl SceneGraph {
     pub fn from_scene(assets: AssetStore, scene: Scene) -> Result<Self> {
         let mut images = Vec::new();
 
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         for object_index in scene.topological_render_order_indices() {
             let object = &scene.objects[object_index];
-            if !object.is_visible() {
+            if !visible[object_index] {
                 continue;
             }
             let Some(image_path) = object.image.as_deref() else {

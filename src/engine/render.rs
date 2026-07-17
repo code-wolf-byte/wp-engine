@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use image::RgbaImage;
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::particle;
@@ -104,8 +105,10 @@ pub struct ResolvedChildParticle {
 }
 
 /// Everything needed to re-rasterize a script-driven text layer at runtime:
-/// the script, the font, and the layout inputs (`layer_from_object` folds
-/// alignment into origin once at load; content changes re-derive it).
+/// the script and font. The layer's projected `rect` (position + size) is
+/// computed once at build through the full camera/parent transform; on a
+/// content change we keep that rect's center and only rescale its extent by
+/// the ratio of the new bitmap size to the old, so no projection is re-derived.
 #[derive(Clone)]
 pub struct TextDynamic {
     pub script: String,
@@ -117,11 +120,6 @@ pub struct TextDynamic {
     /// Text currently rasterized into the layer image (the `value` WE feeds
     /// back into `update` each tick).
     pub last_text: String,
-    /// Un-aligned authored origin (WE scene coords, y-up).
-    pub raw_origin: [f64; 3],
-    /// Combined "halign valign" string, as passed to `alignment_offset`.
-    pub alignment: String,
-    pub scale: [f64; 3],
 }
 
 pub struct Layer {
@@ -202,6 +200,12 @@ struct LoadedImage {
     /// Present for embedded-video textures: `image` holds the first frame,
     /// and the live GPU path re-uploads frames from this stream over time.
     video: Option<std::sync::Arc<std::sync::Mutex<VideoLayerStream>>>,
+    /// Set when the model's material declares the `SPRITESHEET` combo and the
+    /// `.tex` carries a frame table (e.g. a 2-cell AM/PM atlas): the per-frame
+    /// sub-rect images. `layer_from_object` picks the single frame the object's
+    /// frame script selects and uses it as the layer image. Without this the
+    /// flattened atlas stretches into the one-cell quad (all cells overlaid).
+    sprite_frames: Vec<RgbaImage>,
 }
 
 impl LoadedImage {
@@ -214,6 +218,7 @@ impl LoadedImage {
             clamp_uvs: false,
             puppet: None,
             video: None,
+            sprite_frames: Vec::new(),
         }
     }
 
@@ -239,6 +244,7 @@ impl LoadedImage {
                         clamp_uvs,
                         puppet: None,
                         video: None,
+                        sprite_frames: Vec::new(),
                     });
                 }
             }
@@ -300,11 +306,13 @@ impl ResolvedScene {
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
         let mut mesh3d_layers = Vec::new();
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() && obj.visible_script().is_none() {
+            if !visible[obj_index] {
                 continue;
             }
             if obj.light.is_some() && obj.image.is_none() {
@@ -371,6 +379,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
         Ok(Self {
             width,
             height,
@@ -389,11 +398,13 @@ impl ResolvedScene {
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
         let mut mesh3d_layers = Vec::new();
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() && obj.visible_script().is_none() {
+            if !visible[obj_index] {
                 continue;
             }
             if obj.light.is_some() && obj.image.is_none() {
@@ -461,6 +472,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
         Ok(Self {
             width,
             height,
@@ -480,11 +492,13 @@ impl ResolvedScene {
         let mut solid_indices = Vec::new();
         let mut particle_layers = Vec::new();
         let mut mesh3d_layers = Vec::new();
+        // Effective visibility (own AND every ancestor) — see Scene::visibility_mask.
+        let visible = scene.visibility_mask();
         // Raw `scene.objects` index (not a visible-only count): effect
         // instances record the same raw index, so layers and effects agree
         // on object identity no matter what gets skipped in between.
         for (obj_index, obj) in scene.objects.iter().enumerate() {
-            if !obj.is_visible() && obj.visible_script().is_none() {
+            if !visible[obj_index] {
                 continue;
             }
             if obj.light.is_some() && obj.image.is_none() {
@@ -548,6 +562,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
         Ok(Self {
             width,
             height,
@@ -767,11 +782,47 @@ pub(crate) fn alignment_offset(alignment: Option<&str>, scaled_size: [f64; 2]) -
 /// `alignment_override`, when given, replaces `obj.alignment` (text objects
 /// combine separate `horizontalalign`/`verticalalign` fields into one string
 /// before calling this, rather than reading `obj.alignment` directly).
+/// Brightness multiplier for additive (colorBlendMode 9) image layers — see the
+/// call site. Default 0.55; override live with `WP_ENGINE_ADDITIVE_BRIGHTNESS`.
+fn additive_brightness_scale() -> f32 {
+    std::env::var("WP_ENGINE_ADDITIVE_BRIGHTNESS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.55)
+}
+
+/// For a `SPRITESHEET` layer, pick the single frame the object's frame script
+/// selects and make it the layer image. Frames are the `.tex` TEXS sub-rects; the
+/// index comes from the object's frame-select script (WE hangs
+/// `getTextureAnimation().setFrame` off the `visible` script — e.g. AM/PM by
+/// `getHours()`). Falls back to frame 0 if the script sets none.
+fn select_spritesheet_frame(obj: &SceneObject, loaded: &mut LoadedImage) {
+    if loaded.sprite_frames.len() < 2 {
+        return;
+    }
+    let frame = obj
+        .visible
+        .as_ref()
+        .and_then(|v| v.get("script"))
+        .and_then(|s| s.as_str())
+        .and_then(|script| crate::engine::script::ScriptContext::new().eval_frame(script))
+        .unwrap_or(0)
+        .min(loaded.sprite_frames.len() as u32 - 1);
+    loaded.image = loaded.sprite_frames[frame as usize].clone();
+}
+
 fn layer_from_object(
     obj: &SceneObject,
     mut loaded: LoadedImage,
     alignment_override: Option<&str>,
 ) -> Layer {
+    // Spritesheet: replace the flattened atlas with the single cell the object's
+    // frame script selects (e.g. AM/PM by `getHours()`), so the one-cell quad
+    // shows one glyph instead of every cell squished together.
+    // ponytail: frame is picked once at load from the current wall clock; a live
+    // wallpaper won't flip AM↔PM mid-session without a reload (rare — re-select in
+    // the render loop if that ceiling ever matters).
+    select_spritesheet_frame(obj, &mut loaded);
     // Attach puppet `animationlayers` (blended each frame) to the fresh runtime.
     if let (Some(rt), Some(entries)) = (
         loaded.puppet.as_mut(),
@@ -875,6 +926,19 @@ fn layer_from_object(
         .map(crate::engine::model::json_to_animated)
         .and_then(|v| v.as_float())
         .unwrap_or(1.0);
+    // ponytail: additive (colorBlendMode 9) image planes with a near-white base
+    // (e.g. LonelyCat's water-ripple layer) blow out to a flat white disc,
+    // because our water effects refract the layer's *own* bright base instead of
+    // the real backdrop (backdrop capture is unimplemented — see PROGRESS.md).
+    // Until that lands, scale additive layers down so the ripple structure stays
+    // visible. Ceiling: this dims *every* additive image layer, not just ripples;
+    // remove once screen-space backdrop capture exists. Tunable live via
+    // WP_ENGINE_ADDITIVE_BRIGHTNESS (default 0.55).
+    let brightness = if obj.color_blend_mode == 9 {
+        brightness * additive_brightness_scale()
+    } else {
+        brightness
+    };
 
     // Alignment shifts the object so its origin becomes an edge rather than
     // its center (CImage.cpp lines 242-256), expressed here as an offset
@@ -1296,6 +1360,27 @@ fn text_layer_from_object(
     let combined = format!("{halign} {valign}");
 
     let mut layer = layer_from_object(obj, LoadedImage::single(image), Some(&combined));
+    // WE fits the glyphs into the authored `size` box preserving their
+    // aspect (letterbox), not stretch-to-fill: a tall clock box (375×161)
+    // over ~99×26 glyphs would render the block ~6× too tall and collide with
+    // the layer below it. Shrink the box to the bitmap aspect — the
+    // constrained dimension keeps the box, the other pulls in.
+    // ponytail: refit only; origin's alignment offset was folded for the
+    // original box, so this is exact for center-aligned text (all clocks/dates
+    // here) and would need an offset re-fold for left/top anchors.
+    let bw = layer.image.width() as f64;
+    let bh = layer.image.height() as f64;
+    if bw > 0.0 && bh > 0.0 && layer.size[0] > 0.0 && layer.size[1] > 0.0 {
+        let aspect = bw / bh;
+        let (box_w, box_h) = (layer.size[0], layer.size[1]);
+        let fitted = if box_w / box_h > aspect {
+            [box_h * aspect, box_h]
+        } else {
+            [box_w, box_w / aspect]
+        };
+        layer.size[0] = fitted[0];
+        layer.size[1] = fitted[1];
+    }
     if bg_baked {
         // Text + bg colors are baked into the bitmap; don't tint it again.
         layer.color = [1.0, 1.0, 1.0];
@@ -1307,9 +1392,6 @@ fn text_layer_from_object(
             font_data,
             point_size: raster_px,
             last_text: text_str,
-            raw_origin: obj.parsed_origin(),
-            alignment: combined,
-            scale: layer.scale,
         });
     }
     Some(layer)
@@ -1701,7 +1783,10 @@ fn material_first_pass(
 fn pass_constant_color(pass: &serde_json::Value) -> Option<[u8; 3]> {
     let consts = pass.get("constantshadervalues")?;
     // WE keys this as `color`; `Color` is a separate (usually white) tint.
-    let s = consts.get("color").or_else(|| consts.get("Color"))?.as_str()?;
+    let s = consts
+        .get("color")
+        .or_else(|| consts.get("Color"))?
+        .as_str()?;
     let c = crate::engine::effect::parse_color(s);
     Some([
         (c[0].clamp(0.0, 1.0) * 255.0) as u8,
@@ -1754,6 +1839,31 @@ fn find_model_chain_tex_dir(dir: &Path, json_path: &str) -> Result<(TexFile, Opt
     anyhow::bail!("could not resolve texture from {json_path}")
 }
 
+/// Walk model → material and report whether any pass declares the `SPRITESHEET`
+/// combo (`image` is a multi-cell grid). `read` fetches a chain member's bytes.
+fn chain_has_spritesheet(json_path: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> bool {
+    let Some(data) = read(json_path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        return false;
+    };
+    if let Some(mat) = val.get("material").and_then(|v| v.as_str()) {
+        return chain_has_spritesheet(mat, read);
+    }
+    val.get("passes")
+        .and_then(|p| p.as_array())
+        .is_some_and(|passes| {
+            passes.iter().any(|pass| {
+                pass.get("combos")
+                    .and_then(|c| c.get("SPRITESHEET"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    != 0
+            })
+        })
+}
+
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
     let tex = find_model_chain_tex_pkg(pkg, json_path)?.0;
     if let Some(bytes) = tex.video_bytes() {
@@ -1762,11 +1872,16 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage
         return video_tex_to_loaded(&tex, bytes);
     }
     let atlas = tex.to_rgba()?;
-    Ok(apply_puppet_mesh(atlas, json_path, |rel| {
+    let read = |rel: &str| {
         pkg.get(rel)
             .map(|d| d.to_vec())
             .or_else(|| read_from_global_assets(rel))
-    }))
+    };
+    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    if chain_has_spritesheet(json_path, &read) {
+        loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
+    }
+    Ok(loaded)
 }
 
 fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
@@ -1775,11 +1890,16 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
         return video_tex_to_loaded(&tex, bytes);
     }
     let atlas = tex.to_rgba()?;
-    Ok(apply_puppet_mesh(atlas, json_path, |rel| {
+    let read = |rel: &str| {
         std::fs::read(dir.join(rel))
             .ok()
             .or_else(|| read_from_global_assets(rel))
-    }))
+    };
+    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    if chain_has_spritesheet(json_path, &read) {
+        loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
+    }
+    Ok(loaded)
 }
 
 /// If the model JSON names a `"puppet"` mesh, its texture is a packed UV
@@ -1887,6 +2007,226 @@ fn resolve_particle_sprite_dir(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Parent-child transform composition (full TRS)
+//
+// In Wallpaper Engine a scene is a tree: an object's `origin`/`angles`/`scale`
+// are expressed in its PARENT's frame, not screen space. `layer_from_object`
+// bakes only the object's OWN local transform into each Layer, so anything with
+// a parent lands at its local offset instead of its true world position (the
+// clock/particles-in-the-corner bug). This pass walks each object's `parent`
+// chain and pre-multiplies the parent's world transform onto the already-baked
+// local layer.
+//
+// Position is exact TRS (parent scale → parent rotation → parent translation
+// applied to the child point). Orientation and scale compose as Euler-sum and
+// component-wise product respectively: exact for the flat z-rotation these 2D
+// scenes use and for a single parent level, an approximation only under nested,
+// non-coaxial 3D rotation (rare; the perspective path already treats layer
+// angles approximately).
+// ---------------------------------------------------------------------------
+
+/// An affine transform in WE scene space (Y-up), kept as decomposed
+/// translation / Euler-rotation (radians, un-negated) / scale.
+#[derive(Clone, Copy)]
+struct Xform {
+    t: [f64; 3],
+    r: [f64; 3],
+    s: [f64; 3],
+}
+
+impl Xform {
+    const IDENTITY: Xform = Xform {
+        t: [0.0; 3],
+        r: [0.0; 3],
+        s: [1.0, 1.0, 1.0],
+    };
+
+    fn is_identity(&self) -> bool {
+        self.t == [0.0; 3] && self.r == [0.0; 3] && self.s == [1.0, 1.0, 1.0]
+    }
+
+    /// Map a point living in a child frame into the frame this Xform is
+    /// expressed in: `p' = t + R · (s ⊙ p)`.
+    fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
+        let scaled = [p[0] * self.s[0], p[1] * self.s[1], p[2] * self.s[2]];
+        let rot = rotate_euler_f64(scaled, self.r);
+        [rot[0] + self.t[0], rot[1] + self.t[1], rot[2] + self.t[2]]
+    }
+
+    /// `world = self (parent world) ∘ local`.
+    fn compose(&self, local: &Xform) -> Xform {
+        Xform {
+            t: self.apply_point(local.t),
+            r: [
+                self.r[0] + local.r[0],
+                self.r[1] + local.r[1],
+                self.r[2] + local.r[2],
+            ],
+            s: [
+                self.s[0] * local.s[0],
+                self.s[1] * local.s[1],
+                self.s[2] * local.s[2],
+            ],
+        }
+    }
+}
+
+/// f64 mirror of `camera3d::rotate_euler` (Rx then Ry then Rz) — scene coords
+/// reach a few thousand pixels, so we keep the composition in f64.
+fn rotate_euler_f64(v: [f64; 3], a: [f64; 3]) -> [f64; 3] {
+    let (sx, cx) = a[0].sin_cos();
+    let (sy, cy) = a[1].sin_cos();
+    let (sz, cz) = a[2].sin_cos();
+    let v = [v[0], cx * v[1] - sx * v[2], sx * v[1] + cx * v[2]];
+    let v = [cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2]];
+    [cz * v[0] - sz * v[1], sz * v[0] + cz * v[1], v[2]]
+}
+
+/// This object's own local transform, read from the raw scene fields (the same
+/// sources `layer_from_object` uses, minus alignment which is a per-layer draw
+/// concern).
+fn obj_local_xform(obj: &SceneObject) -> Xform {
+    let t = obj.parsed_origin();
+    let r = obj
+        .angles
+        .as_ref()
+        .map(crate::engine::model::json_to_animated)
+        .and_then(|v| v.as_vec3())
+        .map(|a| [a[0] as f64, a[1] as f64, a[2] as f64])
+        .unwrap_or([0.0; 3]);
+    let s = obj
+        .scale
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_vec3)
+        .unwrap_or([1.0, 1.0, 1.0]);
+    Xform { t, r, s }
+}
+
+/// Resolve an object's `parent` reference to an index in `scene.objects`.
+/// WE stores the parent's `id` (a number), occasionally a name string.
+fn parent_index(
+    obj: &SceneObject,
+    id_to_idx: &HashMap<i64, usize>,
+    name_to_idx: &HashMap<&str, usize>,
+) -> Option<usize> {
+    let p = obj.parent.as_ref()?;
+    if let Some(id) = p.as_i64() {
+        return id_to_idx.get(&id).copied();
+    }
+    if let Some(id) = p.as_u64() {
+        return id_to_idx.get(&(id as i64)).copied();
+    }
+    if let Some(name) = p.as_str() {
+        return name_to_idx.get(name).copied();
+    }
+    None
+}
+
+/// World transform of object `idx`, including its own local transform, composed
+/// up the parent chain. Memoized; guards against cycles / dangling parents.
+fn world_xform(
+    idx: usize,
+    objects: &[SceneObject],
+    id_to_idx: &HashMap<i64, usize>,
+    name_to_idx: &HashMap<&str, usize>,
+    memo: &mut [Option<Xform>],
+    depth: u32,
+) -> Xform {
+    if let Some(x) = memo[idx] {
+        return x;
+    }
+    let local = obj_local_xform(&objects[idx]);
+    // depth guard: a malformed scene can loop or nest absurdly deep; fall back
+    // to the local transform rather than blow the stack (tolerant-parsing).
+    let world = match parent_index(&objects[idx], id_to_idx, name_to_idx) {
+        Some(p) if p != idx && depth < 64 => {
+            world_xform(p, objects, id_to_idx, name_to_idx, memo, depth + 1).compose(&local)
+        }
+        _ => local,
+    };
+    memo[idx] = Some(world);
+    world
+}
+
+/// Parent world transform for object `idx` (identity if it has no parent). This
+/// is what gets applied to a layer, whose OWN local transform is already baked
+/// in by `layer_from_object`.
+fn parent_world_xform(
+    idx: usize,
+    objects: &[SceneObject],
+    id_to_idx: &HashMap<i64, usize>,
+    name_to_idx: &HashMap<&str, usize>,
+    memo: &mut [Option<Xform>],
+) -> Xform {
+    match parent_index(&objects[idx], id_to_idx, name_to_idx) {
+        Some(p) if p != idx => world_xform(p, objects, id_to_idx, name_to_idx, memo, 0),
+        _ => Xform::IDENTITY,
+    }
+}
+
+/// Compose each layer's baked-in local transform with its parent chain so
+/// parented objects (clocks, dates, ripples, particle emitters) render at their
+/// true world position/orientation/scale instead of their local offset.
+fn apply_parent_transforms(
+    scene: &Scene,
+    layers: &mut [Layer],
+    particle_layers: &mut [ParticleLayer],
+) {
+    let objects = &scene.objects;
+    if objects.is_empty() {
+        return;
+    }
+    let id_to_idx: HashMap<i64, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.id.map(|id| (id, i)))
+        .collect();
+    let name_to_idx: HashMap<&str, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
+        .collect();
+    let mut memo: Vec<Option<Xform>> = vec![None; objects.len()];
+
+    for layer in layers.iter_mut() {
+        let idx = layer.order_index;
+        if idx >= objects.len() {
+            continue;
+        }
+        let pw = parent_world_xform(idx, objects, &id_to_idx, &name_to_idx, &mut memo);
+        if pw.is_identity() {
+            continue;
+        }
+        layer.origin = pw.apply_point(layer.origin);
+        layer.scale = [
+            layer.scale[0] * pw.s[0],
+            layer.scale[1] * pw.s[1],
+            layer.scale[2] * pw.s[2],
+        ];
+        // `Layer::angle` is the negated z-roll (screen convention); the raw 3D
+        // `angles` are un-negated.
+        layer.angle -= pw.r[2] as f32;
+        layer.angles = [
+            layer.angles[0] + pw.r[0] as f32,
+            layer.angles[1] + pw.r[1] as f32,
+            layer.angles[2] + pw.r[2] as f32,
+        ];
+    }
+
+    for pl in particle_layers.iter_mut() {
+        let idx = pl.order_index;
+        if idx >= objects.len() {
+            continue;
+        }
+        let pw = parent_world_xform(idx, objects, &id_to_idx, &name_to_idx, &mut memo);
+        if pw.is_identity() {
+            continue;
+        }
+        pl.origin = pw.apply_point(pl.origin);
+    }
+}
+
 fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
     // Perspective 3D scenes have no orthogonal projection and their layer
     // sizes are world-space, not pixels — inferring pixel dimensions from
@@ -1931,13 +2271,18 @@ fn guess_scene_dimensions(scene: &Scene, layers: &[Layer]) -> (u32, u32) {
     (1920, 1080)
 }
 
-/// For model/copybackground layers we can't render, create a solid gray placeholder
-/// so any screen-space effects applied to them have a visible base to work with.
+/// For model/copybackground layers we can't render, create a transparent
+/// placeholder so any screen-space effects applied to them have a base to work
+/// with. It must be transparent, not opaque grey: these are usually full-screen
+/// effect-only overlays (e.g. "Light shafts"), so an opaque base paints a giant
+/// grey box over the scene whenever the effect is a SKIP or an additive overlay.
+/// ponytail: transparent base; revisit if an effect needs to sample the real
+/// scene behind it (backdrop capture — not implemented).
 fn placeholder_for(obj: &SceneObject) -> RgbaImage {
     let size = obj.parsed_size();
     let w = if size[0] > 0.0 { size[0] as u32 } else { 1920 };
     let h = if size[1] > 0.0 { size[1] as u32 } else { 1080 };
-    RgbaImage::from_pixel(w, h, image::Rgba([140u8, 140, 140, 255]))
+    RgbaImage::from_pixel(w, h, image::Rgba([0u8, 0, 0, 0]))
 }
 
 fn is_special_layer(image_path: &str) -> bool {

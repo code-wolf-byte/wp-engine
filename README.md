@@ -238,12 +238,33 @@ Still pending:
 - audio-reactive uniforms (FFT), sound playback
 - JavaScript scene scripting (current evaluator handles simple `update()` returns)
 - web (CEF) wallpapers, MPRIS media integration, X11 backend
+- **screen-space backdrop capture** for refraction/distortion effects
+  (waterripple/waterflow): their hidden `g_Texture0` is meant to sample the scene
+  behind the layer, but we default it to the layer's own base texture, so water
+  effects distort themselves. Currently softened with a brightness band-aid — see
+  PROGRESS.md "Ripple / water refraction".
 
 Debugging aids:
 
 - `wp-engine test-scene <id>` — headless animation check, dumps frames to /tmp
 - `WP_ENGINE_SKIP_EFFECTS=name1,name2` — disable specific effects
 - `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
+
+## Building
+
+Two native libraries must be installed first — `cargo` links against them, it
+can't fetch them like a crate:
+
+- **shaderc** — GLSL→SPIR-V for the shader translation layer.
+  - Linux: `apt install libshaderc-dev` (or `pacman -S shaderc`). Found
+    automatically on the default search path.
+  - macOS: `brew install shaderc`. Homebrew's prefix isn't on `shaderc-sys`'s
+    search path, so point the build at it with `export
+    SHADERC_LIB_DIR=/opt/homebrew/lib`, or add it to a local
+    `.cargo/config.toml` `[env]` block. Keep that file out of version control —
+    a committed global path would break Linux builds.
+- **FFmpeg** — video-wallpaper decoding: `apt install ffmpeg` / `brew install
+  ffmpeg`.
 
 ## Development Checks
 

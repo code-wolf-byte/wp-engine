@@ -5,7 +5,9 @@
 //! resolve content → install property overrides → spawn the platform
 //! renderer → block until a stop request (SIGINT/SIGTERM or [`stop`]).
 
+#[cfg(not(target_os = "macos"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,8 +19,11 @@ pub mod application_context;
 pub use application_context::ApplicationContext;
 
 /// Set by the signal handler; polled by [`WallpaperApplication::show`].
+/// Linux/Wayland only — macOS runs the event loop inline on the main thread.
+#[cfg(not(target_os = "macos"))]
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(target_os = "macos"))]
 extern "C" fn handle_stop_signal(_sig: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::SeqCst);
 }
@@ -46,15 +51,27 @@ impl WallpaperApplication {
     /// Load the configured background and start rendering on all outputs.
     #[tracing::instrument(target = "app", level = "info", skip(self), fields(background = %self.context.background.display()))]
     pub fn setup(&mut self) -> Result<()> {
-        tracing::info!(target: "app", "loading wallpaper content");
-        let content = WallpaperContent::from_any_path(&self.context.background)
-            .with_context(|| format!("loading wallpaper {}", self.context.background.display()))?;
-        tracing::debug!(target: "app", "content loaded; spawning platform renderer");
-        let handle =
-            platform::detect_platform().spawn_wallpaper(content, self.context.settings.clone())?;
-        self.handle = Some(handle);
-        tracing::info!(target: "app", "wallpaper renderer started");
-        Ok(())
+        // macOS runs the wallpaper on the main thread in `show()` (winit/AppKit
+        // require the event loop there), so there's nothing to spawn here.
+        #[cfg(target_os = "macos")]
+        {
+            tracing::debug!(target: "app", "macOS: wallpaper runs on the main thread in show()");
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(target: "app", "loading wallpaper content");
+            let content =
+                WallpaperContent::from_any_path(&self.context.background).with_context(|| {
+                    format!("loading wallpaper {}", self.context.background.display())
+                })?;
+            tracing::debug!(target: "app", "content loaded; spawning platform renderer");
+            let handle = platform::detect_platform()
+                .spawn_wallpaper(content, self.context.settings.clone())?;
+            self.handle = Some(handle);
+            tracing::info!(target: "app", "wallpaper renderer started");
+            Ok(())
+        }
     }
 
     /// Run the wallpaper until SIGINT/SIGTERM (or [`Self::stop`] from another
@@ -62,28 +79,42 @@ impl WallpaperApplication {
     ///
     /// Calls [`Self::setup`] first when it hasn't run yet.
     pub fn show(&mut self) -> Result<()> {
-        if self.handle.is_none() {
-            self.setup()?;
+        // macOS: the winit/AppKit event loop must own the main thread, so run
+        // the wallpaper inline here rather than spawning a renderer and parking.
+        #[cfg(target_os = "macos")]
+        {
+            let content =
+                WallpaperContent::from_any_path(&self.context.background).with_context(|| {
+                    format!("loading wallpaper {}", self.context.background.display())
+                })?;
+            return platform::macos::run_wallpaper_on_main(content);
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if self.handle.is_none() {
+                self.setup()?;
+            }
 
-        STOP_REQUESTED.store(false, Ordering::SeqCst);
-        let handler =
-            handle_stop_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
-        unsafe {
-            libc::signal(libc::SIGINT, handler);
-            libc::signal(libc::SIGTERM, handler);
+            STOP_REQUESTED.store(false, Ordering::SeqCst);
+            let handler =
+                handle_stop_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+            unsafe {
+                libc::signal(libc::SIGINT, handler);
+                libc::signal(libc::SIGTERM, handler);
+            }
+
+            while !STOP_REQUESTED.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            self.cleanup();
+            Ok(())
         }
-
-        while !STOP_REQUESTED.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        self.cleanup();
-        Ok(())
     }
 
     /// Request the render loop to end (usable from signal-safe contexts).
     pub fn stop() {
+        #[cfg(not(target_os = "macos"))]
         STOP_REQUESTED.store(true, Ordering::SeqCst);
     }
 

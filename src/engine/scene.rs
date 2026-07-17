@@ -443,6 +443,66 @@ impl Scene {
         self.objects.iter().filter(|o| o.is_visible())
     }
 
+    /// Per-object *effective* visibility, indexed by position in `self.objects`.
+    ///
+    /// Wallpaper Engine hides an entire subtree when any ancestor is hidden, so
+    /// an object is drawn only if it AND every ancestor up its `parent` chain
+    /// are visible. Our per-object `is_visible()` alone ignores the chain, which
+    /// let hidden language-group children (clocks/dates) all draw at once — see
+    /// the LonelyCat multi-language overlap. This walks the chain (same `parent`
+    /// resolution the transform pass uses: numeric `id`, occasionally a name).
+    pub fn visibility_mask(&self) -> Vec<bool> {
+        use std::collections::HashMap;
+        let id_to_idx: HashMap<i64, usize> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.id.map(|id| (id, i)))
+            .collect();
+        let name_to_idx: HashMap<&str, usize> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
+            .collect();
+        let parent_of = |o: &SceneObject| -> Option<usize> {
+            let p = o.parent.as_ref()?;
+            if let Some(id) = p.as_i64() {
+                return id_to_idx.get(&id).copied();
+            }
+            if let Some(id) = p.as_u64() {
+                return id_to_idx.get(&(id as i64)).copied();
+            }
+            if let Some(name) = p.as_str() {
+                return name_to_idx.get(name).copied();
+            }
+            None
+        };
+        (0..self.objects.len())
+            .map(|i| {
+                let mut cur = i;
+                // Depth guard: a malformed scene can loop or nest absurdly; bail
+                // to "visible" rather than spin (tolerant parsing).
+                for _ in 0..64 {
+                    // A visibility script decides per-frame whether the layer
+                    // draws, so a statically-hidden but scripted object must
+                    // survive load (upstream's per-object rule, folded into the
+                    // hierarchical walk).
+                    if !self.objects[cur].is_visible()
+                        && self.objects[cur].visible_script().is_none()
+                    {
+                        return false;
+                    }
+                    match parent_of(&self.objects[cur]) {
+                        Some(p) if p != cur => cur = p,
+                        _ => return true,
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
     pub fn image_paths(&self) -> Vec<&str> {
         self.objects
             .iter()
@@ -588,5 +648,40 @@ pub fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
             m.get("value").and_then(|inner| parse_value_vec3(inner))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A visible text layer whose parent group is hidden must NOT draw — the WE
+    // subtree-hide rule (regression for the LonelyCat multi-language overlap).
+    #[test]
+    fn visibility_mask_inherits_hidden_ancestor() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "name": "HiddenGroup", "visible": false},
+                {"id": 2, "name": "Clock", "parent": 1, "visible": true, "text": "12:00"},
+                {"id": 3, "name": "VisibleGroup", "visible": true},
+                {"id": 4, "name": "Date", "parent": 3, "visible": true, "text": "Mon"}
+            ]}"#,
+        )
+        .unwrap();
+        let mask = scene.visibility_mask();
+        assert_eq!(mask, vec![false, false, true, true]);
+    }
+
+    // A parent cycle must not spin; every node in the cycle just stays visible.
+    #[test]
+    fn visibility_mask_tolerates_parent_cycle() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "parent": 2, "visible": true},
+                {"id": 2, "parent": 1, "visible": true}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(scene.visibility_mask(), vec![true, true]);
     }
 }

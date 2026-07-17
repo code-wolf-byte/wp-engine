@@ -13,15 +13,9 @@ path = "src/tests/scan_wallpapers.rs"
 
 [dependencies]
 # Structured logging (spans/targets); the subscriber is initialized in main.
-# Wayland renderer
-smithay-client-toolkit  = "0.18"
-wayland-client          = "0.31"
-# client_system: use libwayland so wl_display/wl_surface C pointers exist —
-# required to create wgpu (Vulkan) surfaces on the layer-shell surface.
-wayland-backend         = { version = "0.3", features = ["client_system"] }
-wayland-protocols-wlr   = "0.2"
-calloop                 = { version = "0.12", features = ["executor"] }
-calloop-wayland-source  = "0.2"
+# Cross-platform raw handles for wgpu surface creation (Wayland today, Metal
+# on macOS next). The Wayland client stack itself is Linux-only — see the
+# [target.'cfg(target_os = "linux")'.dependencies] section below.
 raw-window-handle       = "0.6"
 
 # Graceful SIGINT/SIGTERM shutdown in WallpaperApplication::show()
@@ -46,7 +40,7 @@ ffmpeg-next = "8"
 clap = { version = "4", features = ["derive"] }
 
 # Platform Abstraction Layer – GPU enumeration + device creation
-wgpu     = { version = "27", default-features = false, features = ["vulkan", "wgsl"] }
+wgpu     = { version = "27", default-features = false, features = ["vulkan", "metal", "wgsl"] }
 naga     = { version = "27", features = ["glsl-in", "wgsl-in", "wgsl-out", "spv-in"] }
 shaderc  = "0.8"
 pollster = "0.3"   # tiny block_on for wgpu's async device-open calls
@@ -76,3 +70,30 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Preview window (animation testing without Wayland)
 minifb = "0.27"
 boa_engine = "0.21.1"
+
+# Wayland renderer — Linux-only. Pulls in libwayland via wayland-backend's
+# client_system feature, so gating these off macOS is what lets the crate
+# build there. The wayland module in src/platform still needs its own
+# #[cfg(target_os = "linux")] gate to match.
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit  = "0.18"
+wayland-client          = "0.31"
+# client_system: use libwayland so wl_display/wl_surface C pointers exist —
+# required to create wgpu (Vulkan) surfaces on the layer-shell surface.
+wayland-backend         = { version = "0.3", features = ["client_system"] }
+wayland-protocols-wlr   = "0.2"
+calloop                 = { version = "0.12", features = ["executor"] }
+calloop-wayland-source  = "0.2"
+
+# macOS display backend — winit window pinned at desktop level, dropping to
+# objc2 / objc2-app-kit to reach the underlying NSWindow for wallpaper
+# placement (setLevel + collectionBehavior). Versions are pinned to what
+# winit 0.30 already resolves via eframe (winit 0.30.12 → objc2 0.5.2,
+# objc2-app-kit 0.2.2), so MacOSPlatform shares winit's NSWindow types rather
+# than a second, incompatible objc2 line — see DECISIONS.md. Staged for
+# MacOSPlatform::spawn_wallpaper; already in the tree via eframe, so declaring
+# them direct adds no build cost.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit         = "0.30"
+objc2         = "0.5"
+objc2-app-kit = "0.2"

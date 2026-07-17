@@ -2295,24 +2295,17 @@ impl GpuSceneInstance {
                                 &new_text,
                                 td.point_size,
                             ) {
-                                // Re-derive the aligned rect for the new
-                                // dimensions — same math layer_from_object +
-                                // build use (origin is y-up scene coords).
-                                let scaled = [
-                                    img.width() as f64 * td.scale[0],
-                                    img.height() as f64 * td.scale[1],
-                                ];
-                                let off = crate::engine::render::alignment_offset(
-                                    Some(&td.alignment),
-                                    scaled,
-                                );
-                                let origin = [td.raw_origin[0] + off[0], td.raw_origin[1] + off[1]];
-                                layer.rect = [
-                                    (2.0 * origin[0] / self.width as f64 - 1.0) as f32,
-                                    (2.0 * origin[1] / self.height as f64 - 1.0) as f32,
-                                    (scaled[0] / self.width as f64) as f32,
-                                    (scaled[1] / self.height as f64) as f32,
-                                ];
+                                // The quad's rect was sized at build to the
+                                // object's authored `size` box and projected
+                                // through the camera/parent transform; the text
+                                // bitmap is stretched to fill it. A content
+                                // change only swaps that texture — the quad
+                                // stays put, so leave `rect` untouched (the old
+                                // per-change ortho recompute is what moved the
+                                // clock off-screen / shrank it).
+                                // ponytail: fixed authored-size quad — right for
+                                // the clock/date (constant-width). Text that
+                                // must grow to fit would need its box re-fit.
                                 layer.frames[0] = self.renderer.upload_texture(&img);
                                 td.last_text = new_text;
                             }
