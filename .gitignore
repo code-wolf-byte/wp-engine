@@ -27,3 +27,4 @@ target
 # Read-only C++ reference clone (Almamu/linux-wallpaperengine) used for
 # porting comparison — not part of this project, not vendored.
 cpp-implementation/
+scratchpad/
