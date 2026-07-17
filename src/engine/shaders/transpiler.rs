@@ -2,7 +2,7 @@ use crate::engine::model::ShaderModel;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-const WE_COMMON_H: &str = "\
+pub(crate) const WE_COMMON_H: &str = "\
 #define M_PI 3.14159265359\n\
 #define M_PI_HALF 1.57079632679\n\
 #define M_PI_2 6.28318530718\n\
@@ -14,7 +14,7 @@ vec3 rgb2hsv(vec3 RGB){vec4 P=(RGB.g<RGB.b)?vec4(RGB.bg,-1.0,2.0/3.0):vec4(RGB.g
 vec2 rotateVec2(vec2 v,float r){vec2 cs=vec2(cos(r),sin(r));return vec2(v.x*cs.x-v.y*cs.y,v.x*cs.y+v.y*cs.x);}\n\
 ";
 
-const WE_COMMON_BLENDING_H: &str = "\
+pub(crate) const WE_COMMON_BLENDING_H: &str = "\
 vec3 _we_RGBToHSL(vec3 color){vec3 hsl;float fmin=min(min(color.r,color.g),color.b);float fmax=max(max(color.r,color.g),color.b);float delta=fmax-fmin;hsl.z=(fmax+fmin)/2.0;if(delta==0.0){hsl.x=0.0;hsl.y=0.0;}else{if(hsl.z<0.5)hsl.y=delta/(fmax+fmin);else hsl.y=delta/(2.0-fmax-fmin);float dR=(((fmax-color.r)/6.0)+(delta/2.0))/delta;float dG=(((fmax-color.g)/6.0)+(delta/2.0))/delta;float dB=(((fmax-color.b)/6.0)+(delta/2.0))/delta;if(color.r==fmax)hsl.x=dB-dG;else if(color.g==fmax)hsl.x=(1.0/3.0)+dR-dB;else hsl.x=(2.0/3.0)+dG-dR;if(hsl.x<0.0)hsl.x+=1.0;else if(hsl.x>1.0)hsl.x-=1.0;}return hsl;}\n\
 float _we_HueToRGB(float f1,float f2,float hue){if(hue<0.0)hue+=1.0;else if(hue>1.0)hue-=1.0;if((6.0*hue)<1.0)return f1+(f2-f1)*6.0*hue;if((2.0*hue)<1.0)return f2;if((3.0*hue)<2.0)return f1+(f2-f1)*((2.0/3.0)-hue)*6.0;return f1;}\n\
 vec3 _we_HSLToRGB(vec3 hsl){if(hsl.y==0.0)return vec3(hsl.z);float f2=hsl.z<0.5?hsl.z*(1.0+hsl.y):(hsl.z+hsl.y)-(hsl.y*hsl.z);float f1=2.0*hsl.z-f2;return vec3(_we_HueToRGB(f1,f2,hsl.x+(1.0/3.0)),_we_HueToRGB(f1,f2,hsl.x),_we_HueToRGB(f1,f2,hsl.x-(1.0/3.0)));}\n\
@@ -80,6 +80,33 @@ vec3 ApplyBlending(const int blendMode,in vec3 A,in vec3 B,in float opacity){\n\
 #if BLENDMODE==28\nreturn mix(A,BlendColor(A,B),opacity);\n#endif\n\
 #if BLENDMODE==29\nreturn mix(A,BlendLuminosity(A,B),opacity);\n#endif\n\
 return mix(A,B,opacity);}\n\
+";
+
+// squareToQuad from WE's common_perspective.h (assets/shaders/common_perspective.h),
+// verbatim math. Builds the unit-square→quad homography for the `perspective`
+// distort effect; its vert does inverse(squareToQuad(p0..p3)) * vec3(uv,1). The
+// file's own mat3 inverse is behind `#if HLSL`, which our shaderc/GLSL path never
+// defines (GLSL 4.50 has a builtin inverse), so only squareToQuad is carried.
+pub(crate) const WE_COMMON_PERSPECTIVE_H: &str = "\
+mat3 squareToQuad(vec2 p0,vec2 p1,vec2 p2,vec2 p3){\n\
+mat3 m=mat3(1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0);\n\
+float dx0=p0.x;float dy0=p0.y;float dx1=p1.x;float dy1=p1.y;\n\
+float dx2=p3.x;float dy2=p3.y;float dx3=p2.x;float dy3=p2.y;\n\
+float diffx1=dx1-dx3;float diffy1=dy1-dy3;float diffx2=dx2-dx3;float diffy2=dy2-dy3;\n\
+float det=diffx1*diffy2-diffx2*diffy1;\n\
+float sumx=dx0-dx1+dx3-dx2;float sumy=dy0-dy1+dy3-dy2;\n\
+if(det==0.0||(sumx==0.0&&sumy==0.0)){\n\
+m[0][0]=dx1-dx0;m[0][1]=dy1-dy0;m[0][2]=0.0;\n\
+m[1][0]=dx3-dx1;m[1][1]=dy3-dy1;m[1][2]=0.0;\n\
+m[2][0]=dx0;m[2][1]=dy0;m[2][2]=1.0;\n\
+return m;}else{\n\
+float ovdet=1.0/det;\n\
+float g=(sumx*diffy2-diffx2*sumy)*ovdet;\n\
+float h=(diffx1*sumy-sumx*diffy1)*ovdet;\n\
+m[0][0]=dx1-dx0+g*dx1;m[0][1]=dy1-dy0+g*dy1;m[0][2]=g;\n\
+m[1][0]=dx2-dx0+h*dx2;m[1][1]=dy2-dy0+h*dy2;m[1][2]=h;\n\
+m[2][0]=dx0;m[2][1]=dy0;m[2][2]=1.0;\n\
+return m;}}\n\
 ";
 
 /// A single scalar-or-vector uniform to be packed into the effect UBO.
@@ -2322,6 +2349,29 @@ mod tests {
             crate::engine::model::shader_model::WEBlending::Normal,
         );
         translate(&model).expect("pow(vec3, float) should translate via _wp_pow shims");
+    }
+
+    /// The embedded common_perspective.h body (squareToQuad) must be valid
+    /// GLSL: a vertex shader shaped like the `perspective` effect's vert —
+    /// `inverse(squareToQuad(p0..p3)) * vec3(uv,1)` — compiles with it inlined.
+    /// Without the body squareToQuad is undefined and this fails, which is the
+    /// exact macOS case the embedded-header fallback repairs.
+    #[test]
+    fn embedded_perspective_header_compiles() {
+        let glsl = format!(
+            "#version 450\n\
+             layout(location=0) in vec3 a_Position;\n\
+             layout(location=1) in vec2 a_TexCoord;\n\
+             layout(location=0) out vec3 v_TexCoord;\n\
+             {WE_COMMON_PERSPECTIVE_H}\n\
+             void main() {{\n\
+             \tmat3 xform = inverse(squareToQuad(vec2(0.0), vec2(1.0, 0.0), vec2(1.0), vec2(0.0, 1.0)));\n\
+             \tv_TexCoord = xform * vec3(a_TexCoord, 1.0);\n\
+             \tgl_Position = vec4(a_Position, 1.0);\n\
+             }}\n"
+        );
+        glsl_to_spirv_with_repairs(&glsl, naga::ShaderStage::Vertex)
+            .expect("perspective vert with embedded squareToQuad should compile");
     }
 
     #[test]
