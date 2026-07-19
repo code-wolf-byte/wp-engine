@@ -30,6 +30,7 @@ pub mod scene;
 pub mod script;
 pub mod shaders;
 pub mod tex;
+pub mod transform;
 pub mod text;
 
 // Convenience re-exports.

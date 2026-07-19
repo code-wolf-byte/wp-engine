@@ -9,10 +9,11 @@
 
 use crate::engine::scene::Scene;
 
-/// Column-major 4x4 matrix, matching glm's layout.
-type Mat4 = [[f32; 4]; 4];
+/// Column-major 4x4, `m[col][row]` — glm's layout, so it uploads to a WGSL
+/// `mat4x4<f32>` as-is.
+pub type Mat4 = [[f32; 4]; 4];
 
-fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
+pub fn mat4_mul(a: &Mat4, b: &Mat4) -> Mat4 {
     let mut out = [[0.0f32; 4]; 4];
     for (col, out_col) in out.iter_mut().enumerate() {
         for (row, cell) in out_col.iter_mut().enumerate() {
@@ -154,7 +155,7 @@ impl PerspectiveCamera {
     }
 }
 
-fn identity() -> Mat4 {
+pub fn identity() -> Mat4 {
     let mut m = [[0.0f32; 4]; 4];
     for (i, row) in m.iter_mut().enumerate() {
         row[i] = 1.0;
