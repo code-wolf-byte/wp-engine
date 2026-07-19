@@ -3913,6 +3913,11 @@ fn load_effect_instance(
             .iter_mut()
             .filter(|n| n.as_deref().is_some_and(|n| n.starts_with("_rt_")))
             .for_each(|n| *n = None);
+        if std::env::var("WP_DEBUG_TEX_SLOTS").is_ok() {
+            eprintln!("[texslots] {effect_name} pass{pass_idx}: merged={:?} names={:?} slots={:?}",
+                merged_textures, texture_names,
+                model.texture_slots.iter().map(|s| (s.glsl_name.clone(), s.default_path.clone(), s.is_framebuffer)).collect::<Vec<_>>());
+        }
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         for name in &texture_names {
             let path = name.as_deref().unwrap_or("");
