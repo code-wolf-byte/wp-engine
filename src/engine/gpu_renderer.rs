@@ -1542,10 +1542,58 @@ pub struct GpuSceneInstance {
     /// Parent chain + transform scripts. Only consulted when
     /// `TransformGraph::needs_per_frame()` — 189 of 197 scenes skip it.
     transform_graph: crate::engine::render::TransformGraph,
+    /// `general.zoom`, retained because the per-frame parent recompose rebuilds
+    /// orthographic rects and has to apply the same scene-wide scale the build
+    /// path does.
+    zoom: f32,
 }
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
 /// baked at load because these objects don't animate in real content.
+/// Project a world-space quad through the perspective camera into an NDC rect.
+///
+/// Returns `(rect, depth)`; a negative depth means the quad was culled (some
+/// corner sat at or behind the eye plane). Shared by the build path and the
+/// per-frame parent recompose so the two can't drift apart.
+///
+/// Approximation: no in-quad perspective warp — the four projected corners
+/// collapse to their axis-aligned bounding box, which is fine for the mostly
+/// camera-facing layers these scenes use.
+fn project_quad_ndc(
+    cam: &crate::engine::camera3d::PerspectiveCamera,
+    center: [f32; 3],
+    angles: [f32; 3],
+    size_px: [f64; 2],
+) -> ([f32; 4], f32) {
+    let hx = (size_px[0] / 2.0) as f32;
+    let hy = (size_px[1] / 2.0) as f32;
+    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
+        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], angles);
+        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
+    });
+    let ndc: Vec<[f32; 2]> = corners.iter().filter_map(|c| cam.project(*c)).collect();
+    if ndc.len() < 4 {
+        return ([-10.0, -10.0, 0.0, 0.0], -1.0);
+    }
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    for p in &ndc {
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    }
+    (
+        [
+            (min_x + max_x) / 2.0,
+            (min_y + max_y) / 2.0,
+            (max_x - min_x) / 2.0,
+            (max_y - min_y) / 2.0,
+        ],
+        cam.view_depth(center),
+    )
+}
+
 struct Mesh3dGpu {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
@@ -1717,44 +1765,9 @@ impl GpuSceneInstance {
                     effective_size[1] * l.scale[1],
                 ];
                 let (rect, angle, depth) = if let Some(cam) = &camera3d {
-                    // 3D scene: the quad lives at a world-space origin with
-                    // world-space extents (size × scale). Rotate its corner
-                    // offsets, project all four through the camera, and
-                    // composite the NDC bounding box. Approximation: no
-                    // in-quad perspective warp (corners collapse to an
-                    // axis-aligned rect) — fine for the mostly camera-facing
-                    // layers these scenes use.
                     let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
-                    let ang = l.angles;
-                    let hx = (size_px[0] / 2.0) as f32;
-                    let hy = (size_px[1] / 2.0) as f32;
-                    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
-                        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], ang);
-                        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
-                    });
-                    let ndc: Vec<[f32; 2]> =
-                        corners.iter().filter_map(|c| cam.project(*c)).collect();
-                    if ndc.len() < 4 {
-                        // Any corner at/behind the eye plane: cull the whole
-                        // quad rather than composite a blown-up projection.
-                        ([-10.0, -10.0, 0.0, 0.0], 0.0, -1.0)
-                    } else {
-                        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
-                        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
-                        for p in &ndc {
-                            min_x = min_x.min(p[0]);
-                            min_y = min_y.min(p[1]);
-                            max_x = max_x.max(p[0]);
-                            max_y = max_y.max(p[1]);
-                        }
-                        let rect = [
-                            (min_x + max_x) / 2.0,
-                            (min_y + max_y) / 2.0,
-                            (max_x - min_x) / 2.0,
-                            (max_y - min_y) / 2.0,
-                        ];
-                        (rect, 0.0, cam.view_depth(center))
-                    }
+                    let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
+                    (rect, 0.0, depth)
                 } else {
                     // `general.zoom` scales the whole scene about its center;
                     // NDC (0,0) is the scene center, so a uniform rect scale
@@ -2085,6 +2098,7 @@ impl GpuSceneInstance {
             mesh3d_depth,
             camera3d,
             transform_graph: resolved.transform_graph,
+            zoom,
         })
     }
 
@@ -2214,13 +2228,22 @@ impl GpuSceneInstance {
             };
         }
         let worlds = self.transform_graph.world(&locals);
+        // The PARENT's world transform, not the object's own — `worlds[i]`
+        // already folds in object i's local transform, and the layer/mesh
+        // values we apply it to are pre-parent locals. Applying the full world
+        // would compose i's own transform twice. This mirrors exactly what
+        // `apply_parent_transforms` does at load.
+        let parent_world = |i: usize| -> crate::engine::render::Xform {
+            match self.transform_graph.parent.get(i).copied().flatten() {
+                Some(p) if p != i => worlds[p],
+                _ => Xform::IDENTITY,
+            }
+        };
 
         // 3D meshes: rebuild the MVP from the recomposed world transform.
         if let Some(cam) = &self.camera3d {
             for m in &self.mesh3d {
-                let Some(w) = worlds.get(m.order_index) else {
-                    continue;
-                };
+                let w = parent_world(m.order_index);
                 let (lo, la, ls) = m.local;
                 let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
                 let mvp = cam.mvp(
@@ -2238,30 +2261,46 @@ impl GpuSceneInstance {
             }
         }
 
-        // 2D layers: only the orthographic path recomputes its rect from an
-        // origin here; the perspective path projects through the camera in
-        // `render()` and is left alone.
-        if !self.perspective {
-            let (w_px, h_px) = (self.width as f64, self.height as f64);
-            for layer in &mut self.layers {
-                let Some(w) = worlds.get(layer.order_index) else {
-                    continue;
-                };
-                if w.is_identity() {
-                    continue;
+        // 2D layers, both projections. The rect derivations differ (the
+        // perspective one projects the quad's corners through the camera) but
+        // both start from the same recomposed world transform.
+        let (w_px, h_px) = (self.width as f64, self.height as f64);
+        for layer in &mut self.layers {
+            let w = parent_world(layer.order_index);
+            if w.is_identity() {
+                continue;
+            }
+            let o = w.apply_point(layer.local_origin);
+            let size_px = [
+                layer.effective_size[0] * layer.local_scale[0] * w.s[0],
+                layer.effective_size[1] * layer.local_scale[1] * w.s[1],
+            ];
+            match &self.camera3d {
+                Some(cam) => {
+                    let angles: [f32; 3] =
+                        std::array::from_fn(|i| layer.local_angles[i] + w.r[i] as f32);
+                    let (rect, depth) = project_quad_ndc(
+                        cam,
+                        [o[0] as f32, o[1] as f32, o[2] as f32],
+                        angles,
+                        size_px,
+                    );
+                    layer.rect = rect;
+                    // Feeds the painter's-algorithm sort in `render()`; a
+                    // negative depth culls the quad, same as at build.
+                    layer.depth = depth;
                 }
-                let o = w.apply_point(layer.local_origin);
-                let size_px = [
-                    layer.effective_size[0] * layer.local_scale[0] * w.s[0],
-                    layer.effective_size[1] * layer.local_scale[1] * w.s[1],
-                ];
-                layer.rect = [
-                    (2.0 * o[0] / w_px - 1.0) as f32,
-                    (2.0 * o[1] / h_px - 1.0) as f32,
-                    (size_px[0] / w_px) as f32,
-                    (size_px[1] / h_px) as f32,
-                ];
-                layer.angle = -(layer.local_angles[2] + w.r[2] as f32);
+                None => {
+                    // Same `general.zoom` scene-wide scale the build path uses.
+                    let z = self.zoom;
+                    layer.rect = [
+                        (2.0 * o[0] / w_px - 1.0) as f32 * z,
+                        (2.0 * o[1] / h_px - 1.0) as f32 * z,
+                        (size_px[0] / w_px) as f32 * z,
+                        (size_px[1] / h_px) as f32 * z,
+                    ];
+                    layer.angle = -(layer.local_angles[2] + w.r[2] as f32);
+                }
             }
         }
     }
