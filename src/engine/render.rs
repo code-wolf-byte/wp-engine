@@ -64,6 +64,10 @@ pub struct Mesh3dLayer {
     /// else culls back faces, which is what lets a skybox's near hemisphere
     /// drop out instead of hiding the whole scene inside it.
     pub nocull: bool,
+    /// `depthtest: "disabled"` on the object (or its material pass) — draw
+    /// without depth comparison. Real content always leaves it enabled; this
+    /// exists so content that disables it isn't silently depth-culled.
+    pub depthtest: bool,
     pub order_index: usize,
 }
 
@@ -1326,7 +1330,14 @@ fn text_layer_from_object(
                 .filter(|_| gate(&obj.limitrows))
                 .unwrap_or(0.0)
                 .max(0.0) as usize;
-            super::text::wrap_text(&font_data, &text_str, raster_px, mw, rows)
+            super::text::wrap_text(
+                &font_data,
+                &text_str,
+                raster_px,
+                mw,
+                rows,
+                gate(&obj.limituseellipsis),
+            )
         }
         None => text_str,
     };
@@ -1465,6 +1476,14 @@ fn mesh3d_layer_from_object(
         .as_ref()
         .and_then(|p| p.get("cullmode")?.as_str())
         .is_some_and(|m| m == "nocull");
+    // The object's own `depthtest` wins over the material pass's.
+    let depthtest = obj
+        .depthtest
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .or_else(|| pass.as_ref().and_then(|p| p.get("depthtest")?.as_str()))
+        .map(|m| m != "disabled")
+        .unwrap_or(true);
 
     let scale = obj
         .scale
@@ -1496,6 +1515,7 @@ fn mesh3d_layer_from_object(
         local_scale: scale,
         local_angles: angles,
         nocull,
+        depthtest,
         order_index: 0,
     })
 }
@@ -2144,6 +2164,18 @@ fn parent_index(
     id_to_idx: &HashMap<i64, usize>,
     name_to_idx: &HashMap<&str, usize>,
 ) -> Option<usize> {
+    // `disablepropagation` severs the link: the object keeps its parent for
+    // grouping/visibility but stops inheriting its transform. Every occurrence
+    // in the 197 installed scenes is `false`, so this changes nothing today —
+    // it's here so authored content that does set it behaves correctly.
+    if obj
+        .disablepropagation
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let p = obj.parent.as_ref()?;
     if let Some(id) = p.as_i64() {
         return id_to_idx.get(&id).copied();
@@ -2474,6 +2506,46 @@ mod tests {
     /// on. WE keeps the numbers around while the box is unchecked, so applying
     /// them unconditionally wrapped text that should run free — 3091474852's
     /// day label wrapped at 500px despite `limitwidth: false`.
+    /// `disablepropagation` severs transform inheritance while leaving the
+    /// `parent` link intact for grouping/visibility.
+    #[test]
+    fn disablepropagation_severs_transform_inheritance() {
+        let objs: Vec<SceneObject> = serde_json::from_str(
+            r#"[{"id": 1, "origin": "10 0 0"},
+                {"id": 2, "origin": "1 0 0", "parent": 1},
+                {"id": 3, "origin": "1 0 0", "parent": 1, "disablepropagation": true}]"#,
+        )
+        .expect("valid objects");
+        let id_to_idx: HashMap<i64, usize> =
+            objs.iter().enumerate().filter_map(|(i, o)| o.id.map(|d| (d, i))).collect();
+        let name_to_idx: HashMap<&str, usize> = HashMap::new();
+        assert_eq!(parent_index(&objs[1], &id_to_idx, &name_to_idx), Some(0));
+        assert_eq!(
+            parent_index(&objs[2], &id_to_idx, &name_to_idx),
+            None,
+            "disablepropagation must stop transform inheritance"
+        );
+    }
+
+    /// `depthtest: "disabled"` on the object overrides the material pass.
+    #[test]
+    fn object_depthtest_overrides_material() {
+        let read = |o: &SceneObject, mat: Option<&str>| -> bool {
+            o.depthtest
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .or(mat)
+                .map(|m| m != "disabled")
+                .unwrap_or(true)
+        };
+        let plain: SceneObject = serde_json::from_str("{}").expect("valid");
+        let off: SceneObject =
+            serde_json::from_str(r#"{"depthtest": "disabled"}"#).expect("valid");
+        assert!(read(&plain, None), "default is depth-tested");
+        assert!(!read(&plain, Some("disabled")), "material pass applies");
+        assert!(!read(&off, Some("enabled")), "object wins over material");
+    }
+
     #[test]
     fn wrap_limits_respect_their_gates() {
         let obj = |lw: bool| -> SceneObject {

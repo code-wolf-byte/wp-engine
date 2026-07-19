@@ -249,6 +249,78 @@ pub struct SceneObject {
     pub backgroundbrightness: Option<serde_json::Value>,
     #[serde(default)]
     pub padding: Option<serde_json::Value>,
+    // ── Remaining scene.json object fields ───────────────────────────────
+    // Declared so the value tree always parses (a strict/missing field is how
+    // 31 scenes were rejected once before) and so callers can read them
+    // without re-deriving the JSON. Runtime behaviour is wired only where the
+    // semantics are actually determinable — see the notes on each.
+    /// Gates whether this object's transform propagates to its children.
+    /// Applied in `render::apply_parent_transforms`.
+    #[serde(default)]
+    pub disablepropagation: Option<serde_json::Value>,
+    /// `"enabled"`/`"disabled"` — depth testing for 3D mesh objects.
+    #[serde(default)]
+    pub depthtest: Option<serde_json::Value>,
+    /// Ellipsise rather than hard-truncate when `limitrows` clips text.
+    #[serde(default)]
+    pub limituseellipsis: Option<serde_json::Value>,
+    /// Cursor hit-testing, not rendering: the C++ reference's only use is a
+    /// commented-out `isSolid()` guard for "layer receives cursor events"
+    /// (CImage.cpp). Parsed; no visual effect to apply.
+    #[serde(default)]
+    pub solid: Option<serde_json::Value>,
+    /// Shadow casting. Parsed; there is no shadow subsystem to feed, and every
+    /// occurrence in real content is `false` anyway.
+    #[serde(default)]
+    pub castshadow: Option<serde_json::Value>,
+    /// Per-object time window. No reference implementation exists and real
+    /// content pins these at 1.0/5.0; parsed for completeness.
+    #[serde(default)]
+    pub mintime: Option<serde_json::Value>,
+    #[serde(default)]
+    pub maxtime: Option<serde_json::Value>,
+    /// Editor state: canvas-resize pinning, transform lock, editor mute,
+    /// authoring labels and paths. No runtime meaning.
+    #[serde(default)]
+    pub locktransforms: Option<serde_json::Value>,
+    #[serde(default)]
+    pub muteineditor: Option<serde_json::Value>,
+    #[serde(default)]
+    pub username: Option<serde_json::Value>,
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub path: Option<serde_json::Value>,
+    /// LED-strip output (Wallpaper Engine's ambient-lighting feature), not
+    /// screen rendering.
+    #[serde(default)]
+    pub ledsource: Option<serde_json::Value>,
+    /// Particle/instancing extras. `instance` is script-driven in real
+    /// content; `queuemode`/`shape`/`particlesrc` are constant at default.
+    #[serde(default)]
+    pub instance: Option<serde_json::Value>,
+    #[serde(default)]
+    pub queuemode: Option<serde_json::Value>,
+    #[serde(default)]
+    pub shape: Option<serde_json::Value>,
+    #[serde(default)]
+    pub particlesrc: Option<serde_json::Value>,
+    /// Volumetric-lighting parameters. Parsed; no lighting subsystem yet.
+    #[serde(default)]
+    pub castvolumetrics: Option<serde_json::Value>,
+    #[serde(default)]
+    pub volumetricsexponent: Option<serde_json::Value>,
+    #[serde(default)]
+    pub density: Option<serde_json::Value>,
+    #[serde(default)]
+    pub exponent: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cascadedistance0: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cascadedistance1: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cascadedistance2: Option<serde_json::Value>,
+
     /// Editor-only; deliberately not applied.
     ///
     /// `anchor` records which edge the editor pins an object to when the

@@ -102,7 +102,7 @@ pub struct GpuSceneRenderer {
     /// skybox work (its near hemisphere culls away instead of hiding the
     /// scene inside it), while `"cullmode": "nocull"` materials — hollow
     /// shells meant to be seen from both sides — must keep every face.
-    mesh3d_pipelines: [wgpu::RenderPipeline; 2],
+    mesh3d_pipelines: [wgpu::RenderPipeline; 4],
 }
 
 /// Depth format for the 3D mesh pass. Depth32Float is guaranteed everywhere
@@ -490,7 +490,7 @@ impl GpuSceneRenderer {
             bind_group_layouts: &[&mesh3d_bgl],
             push_constant_ranges: &[],
         });
-        let make_mesh3d_pipeline = |cull: Option<wgpu::Face>, label: &str| {
+        let make_mesh3d_pipeline = |cull: Option<wgpu::Face>, depth: bool, label: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&mesh3d_layout),
@@ -521,8 +521,12 @@ impl GpuSceneRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: MESH3D_DEPTH_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: depth,
+                    depth_compare: if depth {
+                        wgpu::CompareFunction::Less
+                    } else {
+                        wgpu::CompareFunction::Always
+                    },
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -531,9 +535,12 @@ impl GpuSceneRenderer {
                 cache: None,
             })
         };
+        // Indexed by `nocull as usize | (!depthtest as usize) << 1`.
         let mesh3d_pipelines = [
-            make_mesh3d_pipeline(Some(wgpu::Face::Back), "mesh3d"),
-            make_mesh3d_pipeline(None, "mesh3d_nocull"),
+            make_mesh3d_pipeline(Some(wgpu::Face::Back), true, "mesh3d"),
+            make_mesh3d_pipeline(None, true, "mesh3d_nocull"),
+            make_mesh3d_pipeline(Some(wgpu::Face::Back), false, "mesh3d_nodepth"),
+            make_mesh3d_pipeline(None, false, "mesh3d_nocull_nodepth"),
         ];
 
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
@@ -1605,6 +1612,7 @@ struct Mesh3dGpu {
     index_count: u32,
     bind_group: wgpu::BindGroup,
     nocull: bool,
+    depthtest: bool,
     /// Kept so a script-driven parent can rewrite the MVP each frame.
     ubo: wgpu::Buffer,
     /// Pre-parent transform + which scene object this is, so the per-frame
@@ -2193,6 +2201,7 @@ impl GpuSceneInstance {
             index_count: layer.mesh.indices.len() as u32,
             bind_group,
             nocull: layer.nocull,
+            depthtest: layer.depthtest,
             ubo,
             local: (layer.local_origin, layer.local_angles, layer.local_scale),
             order_index: layer.order_index,
@@ -2379,7 +2388,9 @@ impl GpuSceneInstance {
             }),
             ..Default::default()
         });
-        pass.set_pipeline(&self.renderer.mesh3d_pipelines[m.nocull as usize]);
+        pass.set_pipeline(
+            &self.renderer.mesh3d_pipelines[m.nocull as usize | ((!m.depthtest as usize) << 1)],
+        );
         pass.set_bind_group(0, &m.bind_group, &[]);
         pass.set_vertex_buffer(0, m.vbuf.slice(..));
         pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
