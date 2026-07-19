@@ -1606,6 +1606,10 @@ struct Mesh3dGpu {
     /// pass can recompose the chain (see `render::TransformGraph`).
     local: ([f32; 3], [f32; 3], [f32; 3]),
     order_index: usize,
+    /// View depth of the mesh centre, for the perspective back-to-front sort.
+    /// Meshes are never culled on it (a skybox legitimately surrounds the
+    /// camera); it only orders them against the 2D layers.
+    depth: f32,
 }
 
 impl GpuSceneInstance {
@@ -2186,6 +2190,7 @@ impl GpuSceneInstance {
             ubo,
             local: (layer.local_origin, layer.local_angles, layer.local_scale),
             order_index: layer.order_index,
+            depth: cam.view_depth(layer.origin),
         }
     }
 
@@ -2241,24 +2246,35 @@ impl GpuSceneInstance {
         };
 
         // 3D meshes: rebuild the MVP from the recomposed world transform.
-        if let Some(cam) = &self.camera3d {
-            for m in &self.mesh3d {
-                let w = parent_world(m.order_index);
-                let (lo, la, ls) = m.local;
-                let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
-                let mvp = cam.mvp(
-                    [o[0] as f32, o[1] as f32, o[2] as f32],
-                    std::array::from_fn(|i| la[i] + w.r[i] as f32),
-                    std::array::from_fn(|i| ls[i] * w.s[i] as f32),
-                );
-                let mut bytes: Vec<u8> = Vec::with_capacity(64);
-                for col in mvp.iter() {
-                    for f in col {
-                        bytes.extend_from_slice(&f.to_le_bytes());
+        // Computed up front so the write-back can borrow `self.mesh3d` mutably.
+        let mesh_updates: Vec<(Vec<u8>, f32)> = match &self.camera3d {
+            Some(cam) => self
+                .mesh3d
+                .iter()
+                .map(|m| {
+                    let w = parent_world(m.order_index);
+                    let (lo, la, ls) = m.local;
+                    let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
+                    let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
+                    let mvp = cam.mvp(
+                        centre,
+                        std::array::from_fn(|i| la[i] + w.r[i] as f32),
+                        std::array::from_fn(|i| ls[i] * w.s[i] as f32),
+                    );
+                    let mut bytes: Vec<u8> = Vec::with_capacity(64);
+                    for col in mvp.iter() {
+                        for f in col {
+                            bytes.extend_from_slice(&f.to_le_bytes());
+                        }
                     }
-                }
-                self.renderer.queue.write_buffer(&m.ubo, 0, &bytes);
-            }
+                    (bytes, cam.view_depth(centre))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        for (m, (bytes, depth)) in self.mesh3d.iter_mut().zip(mesh_updates) {
+            self.renderer.queue.write_buffer(&m.ubo, 0, &bytes);
+            m.depth = depth;
         }
 
         // 2D layers, both projections. The rect derivations differ (the
@@ -2312,8 +2328,22 @@ impl GpuSceneInstance {
     /// interleaving by `order_index` — real mesh scenes put their 2D content on
     /// top (overlays/UI) so it hasn't mattered. Interleaving needs the depth
     /// buffer shared with the composite pipeline.
-    fn draw_mesh3d(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
-        let Some(depth) = &self.mesh3d_depth else {
+    /// Draw one mesh, depth-tested, into the scene target.
+    ///
+    /// Per-mesh rather than one batched pass because meshes interleave with 2D
+    /// layers by `order_index` — a scene's background layers sort *before* its
+    /// meshes and must not paint over them (3453730450's moon sits at order 10
+    /// behind nine full-screen fills). `clear_depth` is set for the first mesh
+    /// of a frame; later ones load the existing buffer so they still occlude
+    /// each other correctly.
+    fn draw_one_mesh3d(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        idx: usize,
+        clear_depth: bool,
+    ) {
+        let (Some(depth), Some(m)) = (&self.mesh3d_depth, self.mesh3d.get(idx)) else {
             return;
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2330,20 +2360,22 @@ impl GpuSceneInstance {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: if clear_depth {
+                        wgpu::LoadOp::Clear(1.0)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
             ..Default::default()
         });
-        for m in &self.mesh3d {
-            pass.set_pipeline(&self.renderer.mesh3d_pipelines[m.nocull as usize]);
-            pass.set_bind_group(0, &m.bind_group, &[]);
-            pass.set_vertex_buffer(0, m.vbuf.slice(..));
-            pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..m.index_count, 0, 0..1);
-        }
+        pass.set_pipeline(&self.renderer.mesh3d_pipelines[m.nocull as usize]);
+        pass.set_bind_group(0, &m.bind_group, &[]);
+        pass.set_vertex_buffer(0, m.vbuf.slice(..));
+        pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..m.index_count, 0, 0..1);
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -2525,9 +2557,6 @@ impl GpuSceneInstance {
             });
         }
 
-        // 1b. Static 3D meshes, depth-tested, under everything 2D.
-        self.draw_mesh3d(&mut encoder, &target_view);
-
         // Re-pose animated puppet layers at a capped rate: skin the mesh at
         // the current animation time and re-upload frames[0]. CPU skinning +
         // rasterization runs ~30ms at 4K, so this ticks at
@@ -2570,6 +2599,7 @@ impl GpuSceneInstance {
         enum DrawItem {
             Image(usize),
             Particle(usize),
+            Mesh(usize),
         }
         let mut items: Vec<(usize, DrawItem)> = self
             .layers
@@ -2584,6 +2614,14 @@ impl GpuSceneInstance {
                     .enumerate()
                     .map(|(i, _)| (self.particle_order[i], DrawItem::Particle(i))),
             )
+            // Meshes interleave by scene order like everything else: a scene's
+            // background layers can sort before its meshes.
+            .chain(
+                self.mesh3d
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (m.order_index, DrawItem::Mesh(i))),
+            )
             .collect();
         items.sort_by_key(|(order, _)| *order);
 
@@ -2595,10 +2633,15 @@ impl GpuSceneInstance {
             items.retain(|(_, item)| match item {
                 DrawItem::Image(i) => self.layers[*i].depth >= 0.0,
                 DrawItem::Particle(_) => true,
+                // Never culled on centre depth — a skybox surrounds the camera.
+                DrawItem::Mesh(_) => true,
             });
             items.sort_by(|(oa, a), (ob, b)| {
                 let key = |it: &DrawItem, order: usize| match it {
                     DrawItem::Image(i) => (0, -self.layers[*i].depth, order),
+                    // Meshes share the images' back-to-front ordering so a
+                    // distant backdrop layer still draws behind them.
+                    DrawItem::Mesh(i) => (0, -self.mesh3d[*i].depth, order),
                     DrawItem::Particle(_) => (1, 0.0, order),
                 };
                 key(a, *oa)
@@ -2607,8 +2650,20 @@ impl GpuSceneInstance {
             });
         }
 
+        // The depth buffer is cleared by the frame's first mesh; later meshes
+        // load it so they still occlude one another.
+        let mut mesh_depth_cleared = false;
         for (_, item) in items {
             match item {
+                DrawItem::Mesh(idx) => {
+                    self.draw_one_mesh3d(
+                        &mut encoder,
+                        &target_view,
+                        idx,
+                        !mesh_depth_cleared,
+                    );
+                    mesh_depth_cleared = true;
+                }
                 DrawItem::Image(layer_idx) => {
                     self.draw_image_layer_gpu(
                         &mut encoder,
