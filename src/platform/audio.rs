@@ -54,11 +54,138 @@ pub enum CaptureSource {
     OutputLoopback,
 }
 
+/// User-chosen capture device, set from the UI. `None` = automatic.
+///
+/// Global because the renderer builds its `AudioCapture` deep inside a scene
+/// load on its own thread, with no path to thread a setting through — the same
+/// reason `engine::properties` keeps its overrides this way.
+static PREFERRED: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Override automatic selection. Pass `None` to go back to automatic.
+/// Takes effect the next time a wallpaper is applied.
+pub fn set_preferred_device(name: Option<String>) {
+    if let Ok(mut w) = PREFERRED.write() {
+        *w = name;
+    }
+}
+
+pub fn preferred_device() -> Option<String> {
+    PREFERRED.read().ok().and_then(|g| g.clone())
+}
+
+/// Capture devices to offer in the UI: every input device, plus the
+/// PulseAudio monitor sources cpal can reach through `PULSE_SOURCE` but never
+/// enumerates itself.
+pub fn list_capture_devices() -> Vec<CaptureOption> {
+    let mut out = vec![CaptureOption {
+        label: "Automatic".to_string(),
+        device: None,
+    }];
+    #[cfg(target_os = "linux")]
+    for m in pulse_monitor_sources() {
+        out.push(CaptureOption {
+            label: format!("{m}  (desktop audio)"),
+            device: Some(m),
+        });
+    }
+    if let Ok(devices) = cpal::default_host().input_devices() {
+        for name in devices.filter_map(|d| d.name().ok()) {
+            out.push(CaptureOption {
+                label: name.clone(),
+                device: Some(name),
+            });
+        }
+    }
+    out
+}
+
+/// One selectable entry for the device picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureOption {
+    /// Shown to the user.
+    pub label: String,
+    /// `None` = automatic selection.
+    pub device: Option<String>,
+}
+
+/// Whether a wallpaper drives anything from audio, so the UI only offers a
+/// device picker where it can matter.
+///
+/// Reads `general.supportsaudioprocessing` (WE's own flag) and falls back to
+/// scanning for per-effect `audioprocessing` keys, which some scenes set
+/// without the general flag.
+pub fn wallpaper_uses_audio(dir: &std::path::Path) -> bool {
+    let json = std::fs::read_to_string(dir.join("scene.json"))
+        .ok()
+        .or_else(|| {
+            let pkg = crate::engine::pkg::Package::from_file(&dir.join("scene.pkg")).ok()?;
+            pkg.get("scene.json")
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+        });
+    let Some(json) = json else { return false };
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+        if v.pointer("/general/supportsaudioprocessing")
+            .and_then(|x| x.as_bool())
+            == Some(true)
+        {
+            return true;
+        }
+    }
+    // Case matters: scenes spell the per-effect combo `"AUDIOPROCESSING"` in
+    // caps and the general flag in lowercase.
+    json.to_lowercase().contains("audioprocessing")
+}
+
+/// Every `.monitor` source PulseAudio/PipeWire exposes.
+#[cfg(target_os = "linux")]
+fn pulse_monitor_sources() -> Vec<String> {
+    let Some(out) = std::process::Command::new("pactl")
+        .args(["list", "short", "sources"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split('\t').nth(1))
+        .filter(|n| n.ends_with(".monitor"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Honour a user-chosen device: either a PulseAudio monitor source (routed
+/// through `PULSE_SOURCE`) or a cpal input device by name.
+fn use_preferred(host: &cpal::Host) -> Option<(cpal::Device, CaptureSource)> {
+    let want = preferred_device()?;
+    #[cfg(target_os = "linux")]
+    if want.ends_with(".monitor") {
+        let device = host
+            .input_devices()
+            .ok()?
+            .find(|d| d.name().map(|n| n == "pulse").unwrap_or(false))?;
+        std::env::set_var("PULSE_SOURCE", &want);
+        tracing::info!(target: "audio", "using user-selected desktop source '{want}'");
+        return Some((device, CaptureSource::Loopback));
+    }
+    let device = host
+        .input_devices()
+        .ok()?
+        .find(|d| d.name().map(|n| n == want).unwrap_or(false))?;
+    tracing::info!(target: "audio", "using user-selected capture device '{want}'");
+    Some((device, CaptureSource::DefaultInput))
+}
+
 /// Pick the best capture device for audio reactivity on this platform.
 ///
 /// Returns the device plus how it was found. `None` means the machine exposes
 /// no usable capture device at all, and the caller keeps a silent spectrum.
 pub fn pick_capture_device(host: &cpal::Host) -> Option<(cpal::Device, CaptureSource)> {
+    // An explicit user choice always wins over auto-detection.
+    if let Some(picked) = use_preferred(host) {
+        return Some(picked);
+    }
     // Preferred on Linux: point ALSA's pulse plugin at the default sink's
     // monitor. Tried first because it's the only path that reaches real
     // desktop audio on PipeWire.
@@ -140,6 +267,25 @@ fn match_hint(host: &cpal::Host) -> Option<cpal::Device> {
 mod tests {
     use super::*;
 
+    /// Minimal on-disk wallpaper carrying `scene.json`, for the detector.
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tempdir_with(scene_json: &str) -> Dir {
+        let p = std::env::temp_dir().join(format!("wpaudio{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        std::fs::write(p.join("scene.json"), scene_json).expect("write scene.json");
+        Dir(p)
+    }
+
     /// Every platform must offer at least one hint, or `match_hint` silently
     /// degrades to the microphone fallback on that OS.
     #[test]
@@ -149,6 +295,16 @@ mod tests {
             LOOPBACK_HINTS.iter().all(|h| *h == h.to_lowercase()),
             "hints are matched against a lowercased name, so they must be lowercase"
         );
+    }
+
+    /// The combo key is spelled `AUDIOPROCESSING` in caps inside `combos`,
+    /// while the general flag is lowercase — matching one case detects
+    /// neither reliably (a case-sensitive check found 0 of 197 scenes).
+    #[test]
+    fn audio_detection_is_case_insensitive() {
+        let dir = tempdir_with(r#"{"general":{},"objects":[
+            {"effects":[{"passes":[{"combos":{"AUDIOPROCESSING":3}}]}]}]}"#);
+        assert!(wallpaper_uses_audio(dir.path()));
     }
 
     /// Hint order is priority order, so the list must not contain a substring

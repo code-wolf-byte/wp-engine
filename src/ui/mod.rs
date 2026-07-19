@@ -48,6 +48,11 @@ pub struct WpApp {
     file_input: String,
     settings: Arc<Mutex<RenderSettings>>,
     pending_apply: Option<mpsc::Receiver<ApplyResult>>,
+    /// Cached capture-device list for the audio picker, built on first use —
+    /// enumerating devices shells out to `pactl`, so not every frame.
+    audio_devices: Option<Vec<crate::platform::audio::CaptureOption>>,
+    /// Index into `audio_devices`; 0 is "Automatic".
+    audio_choice: usize,
 }
 
 type ApplyResult = Result<(WallpaperHandle, String), String>;
@@ -141,6 +146,8 @@ impl WpApp {
             file_input: String::new(),
             settings: Arc::new(Mutex::new(RenderSettings::default())),
             pending_apply: None,
+            audio_devices: None,
+            audio_choice: 0,
         }
     }
 
@@ -526,9 +533,47 @@ impl WpApp {
         ui.add_space(12.0);
         ui.separator();
 
+        // Audio-reactive wallpapers can be driven from any capture device;
+        // only offer the choice where it actually changes something.
+        let audio_dir = self.wallpapers[idx].path.clone();
+        let uses_audio = crate::platform::audio::wallpaper_uses_audio(&audio_dir);
+
         // Apply button + settings panel — pinned to bottom
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             ui.add_space(6.0);
+
+            if uses_audio {
+                let devices = self
+                    .audio_devices
+                    .get_or_insert_with(crate::platform::audio::list_capture_devices);
+                let current = devices
+                    .get(self.audio_choice)
+                    .map(|d| d.label.clone())
+                    .unwrap_or_else(|| "Automatic".to_string());
+                ui.add_space(4.0);
+                let mut changed = None;
+                egui::ComboBox::from_id_salt("audio_device")
+                    .selected_text(current)
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for (i, d) in devices.iter().enumerate() {
+                            if ui
+                                .selectable_label(self.audio_choice == i, &d.label)
+                                .clicked()
+                            {
+                                changed = Some((i, d.device.clone()));
+                            }
+                        }
+                    });
+                if let Some((i, device)) = changed {
+                    self.audio_choice = i;
+                    crate::platform::audio::set_preferred_device(device);
+                    self.status =
+                        StatusMsg::ok("Audio source set — re-apply the wallpaper to use it");
+                }
+                ui.label(egui::RichText::new("🔊  Audio source").size(11.0).weak());
+                ui.add_space(2.0);
+            }
 
             if can_apply {
                 let btn = egui::Button::new(
