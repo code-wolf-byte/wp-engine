@@ -48,8 +48,8 @@ pub struct WpApp {
     file_input: String,
     settings: Arc<Mutex<RenderSettings>>,
     pending_apply: Option<mpsc::Receiver<ApplyResult>>,
-    /// Cached capture-device list for the audio picker, built on first use —
-    /// enumerating devices shells out to `pactl`, so not every frame.
+    /// Cached speaker list for the audio picker, built on first use —
+    /// enumerating shells out to `pactl`, so not every frame.
     audio_devices: Option<Vec<crate::platform::audio::CaptureOption>>,
     /// Index into `audio_devices`; 0 is "Automatic".
     audio_choice: usize,
@@ -545,7 +545,7 @@ impl WpApp {
             if uses_audio {
                 let devices = self
                     .audio_devices
-                    .get_or_insert_with(crate::platform::audio::list_capture_devices);
+                    .get_or_insert_with(crate::platform::audio::list_audio_outputs);
                 let current = devices
                     .get(self.audio_choice)
                     .map(|d| d.label.clone())
@@ -571,7 +571,7 @@ impl WpApp {
                     self.status =
                         StatusMsg::ok("Audio source set — re-apply the wallpaper to use it");
                 }
-                ui.label(egui::RichText::new("🔊  Audio source").size(11.0).weak());
+                ui.label(egui::RichText::new("🔊  React to sound from").size(11.0).weak());
                 ui.add_space(2.0);
             }
 

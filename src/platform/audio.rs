@@ -73,22 +73,35 @@ pub fn preferred_device() -> Option<String> {
     PREFERRED.read().ok().and_then(|g| g.clone())
 }
 
-/// Capture devices to offer in the UI: every input device, plus the
-/// PulseAudio monitor sources cpal can reach through `PULSE_SOURCE` but never
-/// enumerates itself.
-pub fn list_capture_devices() -> Vec<CaptureOption> {
+/// Speakers to offer in the UI.
+///
+/// These are *output* devices — the thing the user thinks of as "where sound
+/// comes out" — because that's the mental model the OS presents. That we
+/// capture desktop audio by recording an output's monitor source is an
+/// implementation detail the picker never exposes.
+pub fn list_audio_outputs() -> Vec<CaptureOption> {
     let mut out = vec![CaptureOption {
         label: "Automatic".to_string(),
         device: None,
     }];
     #[cfg(target_os = "linux")]
-    for m in pulse_monitor_sources() {
-        out.push(CaptureOption {
-            label: format!("{m}  (desktop audio)"),
-            device: Some(m),
-        });
+    {
+        let default = default_sink();
+        for (name, description) in pulse_sinks() {
+            let is_default = Some(&name) == default.as_ref();
+            out.push(CaptureOption {
+                label: if is_default {
+                    format!("{description}  (default)")
+                } else {
+                    description
+                },
+                device: Some(name),
+            });
+        }
     }
-    if let Ok(devices) = cpal::default_host().input_devices() {
+    // Non-Linux: cpal's output devices are already user-facing names.
+    #[cfg(not(target_os = "linux"))]
+    if let Ok(devices) = cpal::default_host().output_devices() {
         for name in devices.filter_map(|d| d.name().ok()) {
             out.push(CaptureOption {
                 label: name.clone(),
@@ -136,38 +149,67 @@ pub fn wallpaper_uses_audio(dir: &std::path::Path) -> bool {
     json.to_lowercase().contains("audioprocessing")
 }
 
-/// Every `.monitor` source PulseAudio/PipeWire exposes.
+/// `(sink name, human description)` for every output PulseAudio/PipeWire knows.
+/// The description is what the OS's own volume UI shows.
 #[cfg(target_os = "linux")]
-fn pulse_monitor_sources() -> Vec<String> {
+fn pulse_sinks() -> Vec<(String, String)> {
     let Some(out) = std::process::Command::new("pactl")
-        .args(["list", "short", "sources"])
+        .arg("list")
+        .arg("sinks")
         .output()
         .ok()
         .filter(|o| o.status.success())
     else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split('\t').nth(1))
-        .filter(|n| n.ends_with(".monitor"))
-        .map(str::to_string)
-        .collect()
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut sinks = Vec::new();
+    let mut name: Option<String> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(v) = line.strip_prefix("Name: ") {
+            name = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("Description: ") {
+            // Description always follows its Name in pactl's output.
+            if let Some(n) = name.take() {
+                sinks.push((n, v.to_string()));
+            }
+        }
+    }
+    sinks
+}
+
+#[cfg(target_os = "linux")]
+fn default_sink() -> Option<String> {
+    let out = std::process::Command::new("pactl")
+        .arg("get-default-sink")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Honour a user-chosen device: either a PulseAudio monitor source (routed
 /// through `PULSE_SOURCE`) or a cpal input device by name.
 fn use_preferred(host: &cpal::Host) -> Option<(cpal::Device, CaptureSource)> {
     let want = preferred_device()?;
+    // The UI stores a speaker (sink); capture comes from its monitor source.
     #[cfg(target_os = "linux")]
-    if want.ends_with(".monitor") {
-        let device = host
+    {
+        let monitor = if want.ends_with(".monitor") {
+            want.clone()
+        } else {
+            format!("{want}.monitor")
+        };
+        if let Some(device) = host
             .input_devices()
-            .ok()?
-            .find(|d| d.name().map(|n| n == "pulse").unwrap_or(false))?;
-        std::env::set_var("PULSE_SOURCE", &want);
-        tracing::info!(target: "audio", "using user-selected desktop source '{want}'");
-        return Some((device, CaptureSource::Loopback));
+            .ok()
+            .and_then(|mut d| d.find(|d| d.name().map(|n| n == "pulse").unwrap_or(false)))
+        {
+            std::env::set_var("PULSE_SOURCE", &monitor);
+            tracing::info!(target: "audio", "capturing from selected speaker '{want}'");
+            return Some((device, CaptureSource::Loopback));
+        }
     }
     let device = host
         .input_devices()
@@ -305,6 +347,31 @@ mod tests {
         let dir = tempdir_with(r#"{"general":{},"objects":[
             {"effects":[{"passes":[{"combos":{"AUDIOPROCESSING":3}}]}]}]}"#);
         assert!(wallpaper_uses_audio(dir.path()));
+    }
+
+    /// The picker is a speaker list, so no plumbing may leak into a label:
+    /// no `.monitor` suffix, no `alsa_output.`/`bluez_output.` prefixes.
+    /// Users pick "Echo Dot-0TS", not "bluez_output.28_73_….1.monitor".
+    #[test]
+    fn labels_expose_no_implementation_detail() {
+        for opt in list_audio_outputs() {
+            for leak in [".monitor", "alsa_output.", "bluez_output.", "alsa_input."] {
+                assert!(
+                    !opt.label.contains(leak),
+                    "label '{}' leaks '{leak}'",
+                    opt.label
+                );
+            }
+        }
+    }
+
+    /// "Automatic" must stay first so the default selection index (0) means
+    /// automatic.
+    #[test]
+    fn automatic_is_the_first_option() {
+        let outs = list_audio_outputs();
+        assert_eq!(outs[0].label, "Automatic");
+        assert!(outs[0].device.is_none());
     }
 
     /// Hint order is priority order, so the list must not contain a substring
