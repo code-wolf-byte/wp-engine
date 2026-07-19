@@ -1424,6 +1424,12 @@ struct SceneLayerGpu {
     origin_base: [f64; 3],
     scale_base: [f32; 3],
     angles_base: [f32; 3],
+    /// Pre-parent transform, for the per-frame parent recompose (see
+    /// `update_parent_transforms`). Distinct from `*_base`, which are the
+    /// post-parent values a per-object script updates from.
+    local_origin: [f64; 3],
+    local_scale: [f64; 3],
+    local_angles: [f32; 3],
     no_interpolation: bool,
     clamp_uvs: bool,
     /// Unscaled object size in pixels — matches the reference's `CImage::m_size`
@@ -1530,6 +1536,12 @@ pub struct GpuSceneInstance {
     /// Depth buffer for `mesh3d`; `None` when there are no meshes. The 2D
     /// layers never touch it — they keep their painter's ordering.
     mesh3d_depth: Option<wgpu::TextureView>,
+    /// Retained for the per-frame parent recompose, which has to rebuild each
+    /// mesh's MVP and each layer's projected rect.
+    camera3d: Option<crate::engine::camera3d::PerspectiveCamera>,
+    /// Parent chain + transform scripts. Only consulted when
+    /// `TransformGraph::needs_per_frame()` — 189 of 197 scenes skip it.
+    transform_graph: crate::engine::render::TransformGraph,
 }
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
@@ -1540,6 +1552,12 @@ struct Mesh3dGpu {
     index_count: u32,
     bind_group: wgpu::BindGroup,
     nocull: bool,
+    /// Kept so a script-driven parent can rewrite the MVP each frame.
+    ubo: wgpu::Buffer,
+    /// Pre-parent transform + which scene object this is, so the per-frame
+    /// pass can recompose the chain (see `render::TransformGraph`).
+    local: ([f32; 3], [f32; 3], [f32; 3]),
+    order_index: usize,
 }
 
 impl GpuSceneInstance {
@@ -1778,6 +1796,9 @@ impl GpuSceneInstance {
                     origin_base: l.origin,
                     scale_base: [l.scale[0] as f32, l.scale[1] as f32, l.scale[2] as f32],
                     angles_base: l.angles,
+                    local_origin: l.local_origin,
+                    local_scale: l.local_scale,
+                    local_angles: l.local_angles,
                 }
             })
             .collect();
@@ -2062,6 +2083,8 @@ impl GpuSceneInstance {
             perspective: camera3d.is_some(),
             mesh3d,
             mesh3d_depth,
+            camera3d,
+            transform_graph: resolved.transform_graph,
         })
     }
 
@@ -2146,6 +2169,100 @@ impl GpuSceneInstance {
             index_count: layer.mesh.indices.len() as u32,
             bind_group,
             nocull: layer.nocull,
+            ubo,
+            local: (layer.local_origin, layer.local_angles, layer.local_scale),
+            order_index: layer.order_index,
+        }
+    }
+
+    /// Recompose parent chains for this frame.
+    ///
+    /// `apply_parent_transforms` bakes the chain at load, which is correct only
+    /// while the chain is static. A scripted parent moves every frame, and
+    /// those parent nodes are usually image-less — they have no `Layer`, so the
+    /// per-layer script loop never touches them. This evaluates every object's
+    /// transform scripts (parents included), recomposes each chain, and pushes
+    /// the result into whatever the object actually draws as.
+    ///
+    /// Skipped entirely unless the scene both parents something and scripts a
+    /// transform — true for 8 of 197 real scenes.
+    fn update_parent_transforms(&mut self) {
+        if !self.transform_graph.needs_per_frame() {
+            return;
+        }
+        use crate::engine::render::Xform;
+
+        // Evaluate in declaration order: these scripts talk to each other
+        // through the shared `shared` object (one writes `shared.gjz`, another
+        // reads it), and declaration order is the only ordering WE implies.
+        let mut locals = self.transform_graph.local.clone();
+        for (i, scripts) in self.transform_graph.scripts.iter().enumerate() {
+            let base = self.transform_graph.local[i];
+            let eval = |ctx: &mut crate::engine::script::ScriptContext,
+                        src: &Option<String>,
+                        b: [f64; 3]| match src {
+                Some(src) => ctx
+                    .eval_update_vec3(src, [b[0] as f32, b[1] as f32, b[2] as f32])
+                    .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
+                    .unwrap_or(b),
+                None => b,
+            };
+            locals[i] = Xform {
+                t: eval(&mut self.script_ctx, &scripts[0], base.t),
+                r: eval(&mut self.script_ctx, &scripts[1], base.r),
+                s: eval(&mut self.script_ctx, &scripts[2], base.s),
+            };
+        }
+        let worlds = self.transform_graph.world(&locals);
+
+        // 3D meshes: rebuild the MVP from the recomposed world transform.
+        if let Some(cam) = &self.camera3d {
+            for m in &self.mesh3d {
+                let Some(w) = worlds.get(m.order_index) else {
+                    continue;
+                };
+                let (lo, la, ls) = m.local;
+                let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
+                let mvp = cam.mvp(
+                    [o[0] as f32, o[1] as f32, o[2] as f32],
+                    std::array::from_fn(|i| la[i] + w.r[i] as f32),
+                    std::array::from_fn(|i| ls[i] * w.s[i] as f32),
+                );
+                let mut bytes: Vec<u8> = Vec::with_capacity(64);
+                for col in mvp.iter() {
+                    for f in col {
+                        bytes.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+                self.renderer.queue.write_buffer(&m.ubo, 0, &bytes);
+            }
+        }
+
+        // 2D layers: only the orthographic path recomputes its rect from an
+        // origin here; the perspective path projects through the camera in
+        // `render()` and is left alone.
+        if !self.perspective {
+            let (w_px, h_px) = (self.width as f64, self.height as f64);
+            for layer in &mut self.layers {
+                let Some(w) = worlds.get(layer.order_index) else {
+                    continue;
+                };
+                if w.is_identity() {
+                    continue;
+                }
+                let o = w.apply_point(layer.local_origin);
+                let size_px = [
+                    layer.effective_size[0] * layer.local_scale[0] * w.s[0],
+                    layer.effective_size[1] * layer.local_scale[1] * w.s[1],
+                ];
+                layer.rect = [
+                    (2.0 * o[0] / w_px - 1.0) as f32,
+                    (2.0 * o[1] / h_px - 1.0) as f32,
+                    (size_px[0] / w_px) as f32,
+                    (size_px[1] / h_px) as f32,
+                ];
+                layer.angle = -(layer.local_angles[2] + w.r[2] as f32);
+            }
         }
     }
 
@@ -2319,6 +2436,10 @@ impl GpuSceneInstance {
                 }
             }
         }
+
+        // Recompose parent chains now that this frame's scripts have run —
+        // a scripted parent moves its whole subtree.
+        self.update_parent_transforms();
 
         // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
         // drive audio-reactive particle emitters from the overall loudness.

@@ -36,6 +36,9 @@ pub struct ResolvedScene {
     /// Static 3D mesh objects (`model` → `.mdl`) — only genuine perspective
     /// scenes have these; the 2D compositor ignores them.
     pub mesh3d_layers: Vec<Mesh3dLayer>,
+    /// Parent chain + transform scripts per object, for the live path's
+    /// per-frame recompose. See [`TransformGraph`].
+    pub transform_graph: TransformGraph,
     pub scene: Scene,
 }
 
@@ -51,6 +54,12 @@ pub struct Mesh3dLayer {
     pub origin: [f32; 3],
     pub scale: [f32; 3],
     pub angles: [f32; 3],
+    /// The same three before `apply_parent_transforms` composed the parent
+    /// chain in. A script-driven parent moves per frame, so the live path
+    /// recomposes from these rather than trying to invert the baked world value.
+    pub local_origin: [f32; 3],
+    pub local_scale: [f32; 3],
+    pub local_angles: [f32; 3],
     /// The material's `"cullmode": "nocull"` — draw both faces. Everything
     /// else culls back faces, which is what lets a skybox's near hemisphere
     /// drop out instead of hiding the whole scene inside it.
@@ -68,6 +77,8 @@ pub struct ParticleLayer {
     /// same convention as `Layer::origin`; callers convert to pixel space at
     /// render time (`px = origin.x`, `py = height - origin.y`).
     pub origin: [f64; 3],
+    /// `origin` before the parent chain was composed in (see `Layer`).
+    pub local_origin: [f64; 3],
     pub parallax_depth: [f64; 2],
     pub config: particle::ParticleConfig,
     pub overrides: Option<particle::InstanceOverride>,
@@ -132,6 +143,12 @@ pub struct Layer {
     pub origin: [f64; 3],
     pub size: [f64; 3],
     pub scale: [f64; 3], // WE scale multiplier (default 1.0), separate from size
+    /// `origin`/`scale`/`angles` before `apply_parent_transforms` composed the
+    /// parent chain in — the live path recomposes from these each frame when a
+    /// parent is script-driven. See `ResolvedScene::transform_graph`.
+    pub local_origin: [f64; 3],
+    pub local_scale: [f64; 3],
+    pub local_angles: [f32; 3],
     pub parallax_depth: [f64; 2],
     /// z-rotation in radians (WE `angles.z`; the JSON value is already in radians).
     pub angle: f32,
@@ -386,6 +403,7 @@ impl ResolvedScene {
             layers,
             particle_layers,
             mesh3d_layers,
+            transform_graph: build_transform_graph(&scene),
             scene,
         })
     }
@@ -479,6 +497,7 @@ impl ResolvedScene {
             layers,
             particle_layers,
             mesh3d_layers,
+            transform_graph: build_transform_graph(&scene),
             scene,
         })
     }
@@ -569,6 +588,7 @@ impl ResolvedScene {
             layers,
             particle_layers,
             mesh3d_layers,
+            transform_graph: build_transform_graph(&scene),
             scene,
         })
     }
@@ -977,6 +997,9 @@ fn layer_from_object(
             obj.parsed_size()
         },
         scale,
+        local_origin: origin,
+        local_scale: scale,
+        local_angles: angles3,
         parallax_depth: parallax,
         angle,
         angles: angles3,
@@ -1187,6 +1210,7 @@ fn particle_layer_from_object(
     Some(ParticleLayer {
         name: obj.name.clone().unwrap_or_default(),
         origin: obj.parsed_origin(),
+        local_origin: obj.parsed_origin(),
         parallax_depth,
         config,
         overrides,
@@ -1461,6 +1485,9 @@ fn mesh3d_layer_from_object(
         origin: [o[0] as f32, o[1] as f32, o[2] as f32],
         scale,
         angles,
+        local_origin: [o[0] as f32, o[1] as f32, o[2] as f32],
+        local_scale: scale,
+        local_angles: angles,
         nocull,
         order_index: 0,
     })
@@ -2029,33 +2056,33 @@ fn resolve_particle_sprite_dir(
 /// An affine transform in WE scene space (Y-up), kept as decomposed
 /// translation / Euler-rotation (radians, un-negated) / scale.
 #[derive(Clone, Copy)]
-struct Xform {
-    t: [f64; 3],
-    r: [f64; 3],
-    s: [f64; 3],
+pub struct Xform {
+    pub t: [f64; 3],
+    pub r: [f64; 3],
+    pub s: [f64; 3],
 }
 
 impl Xform {
-    const IDENTITY: Xform = Xform {
+    pub const IDENTITY: Xform = Xform {
         t: [0.0; 3],
         r: [0.0; 3],
         s: [1.0, 1.0, 1.0],
     };
 
-    fn is_identity(&self) -> bool {
+    pub fn is_identity(&self) -> bool {
         self.t == [0.0; 3] && self.r == [0.0; 3] && self.s == [1.0, 1.0, 1.0]
     }
 
     /// Map a point living in a child frame into the frame this Xform is
     /// expressed in: `p' = t + R · (s ⊙ p)`.
-    fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
+    pub fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
         let scaled = [p[0] * self.s[0], p[1] * self.s[1], p[2] * self.s[2]];
         let rot = rotate_euler_f64(scaled, self.r);
         [rot[0] + self.t[0], rot[1] + self.t[1], rot[2] + self.t[2]]
     }
 
     /// `world = self (parent world) ∘ local`.
-    fn compose(&self, local: &Xform) -> Xform {
+    pub fn compose(&self, local: &Xform) -> Xform {
         Xform {
             t: self.apply_point(local.t),
             r: [
@@ -2147,6 +2174,100 @@ fn world_xform(
     };
     memo[idx] = Some(world);
     world
+}
+
+/// Per-object transform data the live path needs to recompose the parent chain
+/// every frame.
+///
+/// `apply_parent_transforms` bakes the chain once at load, which is right for a
+/// static parent but wrong for a scripted one: a parent node's transform can
+/// change every frame, and those nodes are usually image-less (no `Layer` at
+/// all), so their scripts never run from the layer list. This carries them.
+pub struct TransformGraph {
+    /// Resolved parent index per object (`None` = root).
+    pub parent: Vec<Option<usize>>,
+    /// Authored local transform per object — the base a script updates from.
+    pub local: Vec<Xform>,
+    /// `(origin, angles, scale)` SceneScript sources per object.
+    pub scripts: Vec<[Option<String>; 3]>,
+}
+
+impl TransformGraph {
+    /// True when at least one object's transform is script-driven AND at least
+    /// one object is parented — the only case the per-frame pass is needed for.
+    /// 189 of 197 real scenes answer `false` and skip the whole thing.
+    pub fn needs_per_frame(&self) -> bool {
+        self.parent.iter().any(Option::is_some)
+            && self
+                .scripts
+                .iter()
+                .any(|s| s.iter().any(Option::is_some))
+    }
+
+    /// World transform per object, composing `locals` up each parent chain.
+    pub fn world(&self, locals: &[Xform]) -> Vec<Xform> {
+        let mut memo: Vec<Option<Xform>> = vec![None; self.parent.len()];
+        (0..self.parent.len())
+            .map(|i| self.world_of(i, locals, &mut memo, 0))
+            .collect()
+    }
+
+    fn world_of(
+        &self,
+        idx: usize,
+        locals: &[Xform],
+        memo: &mut Vec<Option<Xform>>,
+        depth: u32,
+    ) -> Xform {
+        if let Some(x) = memo[idx] {
+            return x;
+        }
+        // Same 64-deep guard as the load-time walker: a malformed scene must
+        // not blow the stack.
+        let w = match self.parent[idx] {
+            Some(p) if p != idx && depth < 64 => {
+                self.world_of(p, locals, memo, depth + 1).compose(&locals[idx])
+            }
+            _ => locals[idx],
+        };
+        memo[idx] = Some(w);
+        w
+    }
+}
+
+fn build_transform_graph(scene: &Scene) -> TransformGraph {
+    let objects = &scene.objects;
+    let id_to_idx: HashMap<i64, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.id.map(|id| (id, i)))
+        .collect();
+    let name_to_idx: HashMap<&str, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
+        .collect();
+    let script_of = |v: Option<&serde_json::Value>| {
+        v.map(crate::engine::model::json_to_animated)
+            .and_then(|a| a.script)
+    };
+    TransformGraph {
+        parent: objects
+            .iter()
+            .map(|o| parent_index(o, &id_to_idx, &name_to_idx))
+            .collect(),
+        local: objects.iter().map(obj_local_xform).collect(),
+        scripts: objects
+            .iter()
+            .map(|o| {
+                [
+                    script_of(o.origin.as_ref()),
+                    script_of(o.angles.as_ref()),
+                    script_of(o.scale.as_ref()),
+                ]
+            })
+            .collect(),
+    }
 }
 
 /// Parent world transform for object `idx` (identity if it has no parent). This
@@ -2383,6 +2504,9 @@ mod tests {
         let red_image = RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
 
         let layers = vec![Layer {
+            local_origin: [0.0; 3],
+            local_scale: [1.0; 3],
+            local_angles: [0.0; 3],
             name: "red".to_string(),
             image: red_image,
             extra_frames: Vec::new(),
@@ -2411,6 +2535,7 @@ mod tests {
 
         let particle_layers = vec![
             ParticleLayer {
+                local_origin: [0.0; 3],
                 name: "blue_particles".to_string(),
                 origin: [50.0, 50.0, 0.0],
                 parallax_depth: [0.0, 0.0],
@@ -2422,6 +2547,7 @@ mod tests {
                 children: Vec::new(),
             },
             ParticleLayer {
+                local_origin: [0.0; 3],
                 name: "green_particles".to_string(),
                 origin: [50.0, 50.0, 0.0],
                 parallax_depth: [0.0, 0.0],
@@ -2435,6 +2561,7 @@ mod tests {
         ];
 
         let resolved = ResolvedScene {
+            transform_graph: build_transform_graph(&scene),
             width: 100,
             height: 100,
             layers,
