@@ -379,7 +379,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers, &mut mesh3d_layers);
         Ok(Self {
             width,
             height,
@@ -472,7 +472,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers, &mut mesh3d_layers);
         Ok(Self {
             width,
             height,
@@ -562,7 +562,7 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
+        apply_parent_transforms(&scene, &mut layers, &mut particle_layers, &mut mesh3d_layers);
         Ok(Self {
             width,
             height,
@@ -2172,6 +2172,7 @@ fn apply_parent_transforms(
     scene: &Scene,
     layers: &mut [Layer],
     particle_layers: &mut [ParticleLayer],
+    mesh3d_layers: &mut [Mesh3dLayer],
 ) {
     let objects = &scene.objects;
     if objects.is_empty() {
@@ -2224,6 +2225,26 @@ fn apply_parent_transforms(
             continue;
         }
         pl.origin = pw.apply_point(pl.origin);
+    }
+
+    // Meshes take the same treatment as image layers — they're ordinary scene
+    // objects that happen to carry geometry. Without this a parented skybox
+    // stays at the origin while the camera moves out of it.
+    for m in mesh3d_layers.iter_mut() {
+        let idx = m.order_index;
+        if idx >= objects.len() {
+            continue;
+        }
+        let pw = parent_world_xform(idx, objects, &id_to_idx, &name_to_idx, &mut memo);
+        if pw.is_identity() {
+            continue;
+        }
+        let o = pw.apply_point([m.origin[0] as f64, m.origin[1] as f64, m.origin[2] as f64]);
+        m.origin = [o[0] as f32, o[1] as f32, o[2] as f32];
+        for i in 0..3 {
+            m.scale[i] *= pw.s[i] as f32;
+            m.angles[i] += pw.r[i] as f32;
+        }
     }
 }
 
