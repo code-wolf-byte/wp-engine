@@ -2847,6 +2847,14 @@ impl GpuSceneInstance {
                             (chain_view.clone(), chain_res)
                         } else if fbo_name == "_rt_FullFrameBuffer"
                             || fbo_name == "_rt_MipMappedFrameBuffer"
+                            // WE's per-layer composite buffer. Same meaning as
+                            // FullFrameBuffer for us: effects run before their
+                            // layer composites, so the scene target already
+                            // holds "everything behind this layer". Without
+                            // this the bind silently fails and the sampler
+                            // keeps its `util/white` default — which is what
+                            // blended 2821407073's mountains to solid white.
+                            || fbo_name.starts_with("_rt_imageLayerComposite")
                         {
                             // The wallpaper-global scene buffer (CWallpaper.cpp
                             // creates it at scene size; MipMapped is an alias).

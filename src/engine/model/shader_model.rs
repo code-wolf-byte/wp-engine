@@ -205,8 +205,21 @@ impl ShaderModel {
                         .as_ref()
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
+                    // Slot index comes from the NAME (`g_TextureN` -> N), not
+                    // declaration order: a material's `textures` array is
+                    // positional against those numbers, and shaders do declare
+                    // them out of order (blend.frag declares g_Texture7 before
+                    // g_Texture1). Counting declarations instead shifted every
+                    // later slot, binding the scene's blend texture to the
+                    // opacity-mask sampler and leaving the blend texture on its
+                    // `util/white` default — which blends the layer to white.
+                    let index = meta
+                        .uniform_name
+                        .strip_prefix("g_Texture")
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(tex_index);
                     texture_slots.push(TextureSlot {
-                        index: tex_index,
+                        index,
                         glsl_name: meta.uniform_name.clone(),
                         material_key: meta.material_key.clone(),
                         default_path,
@@ -240,6 +253,11 @@ impl ShaderModel {
                 }
             }
         }
+
+        // Consumers read this positionally (slot 0 = g_Texture0, then the
+        // material's texture list index-for-index), so order by slot index
+        // rather than the order the shader happened to declare them in.
+        texture_slots.sort_by_key(|s| s.index);
 
         let combo_annotations = ComboAnnotation::parse_combos(&frag_glsl);
 
