@@ -249,6 +249,22 @@ pub struct SceneObject {
     pub backgroundbrightness: Option<serde_json::Value>,
     #[serde(default)]
     pub padding: Option<serde_json::Value>,
+    /// Editor-only; deliberately not applied.
+    ///
+    /// `anchor` records which edge the editor pins an object to when the
+    /// canvas resizes. It does not position anything at runtime: across the 21
+    /// real objects that set it (all text), the value never correlates with
+    /// `origin` — `anchor: "left"` appears at x=3052, `anchor: "center"` on
+    /// origins scattered from 111 to 3100 — because `origin` is already the
+    /// resolved absolute position. The C++ reference doesn't implement it
+    /// either (its only `anchor` is Wayland surface placement). Applying it
+    /// would move 21 clocks that currently sit correctly.
+    ///
+    /// Same conclusion for the object-level `perspective` flag, which we don't
+    /// even declare: all 18 objects that set it sit at z=0 with zero angles in
+    /// orthographic scenes (no camera to project through), and the reference
+    /// uses `perspective` only for particles (CParticle.cpp, `flags & 4`),
+    /// never for the text/image objects that carry it here.
     #[serde(default)]
     pub anchor: Option<serde_json::Value>,
     // Text wrapping / row limits. `maxwidth`/`maxrows` only apply when their
