@@ -5,6 +5,7 @@ pub mod gpu;
 pub mod macos;
 pub mod platform_info;
 pub mod scaler;
+#[cfg(target_os = "linux")]
 pub mod wayland;
 
 pub use device::GpuDevice;

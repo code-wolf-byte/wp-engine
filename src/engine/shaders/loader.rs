@@ -9,6 +9,9 @@ pub fn find_we_assets_dir() -> Option<PathBuf> {
     let candidates = [
         home.join(".steam/steam/steamapps/common/wallpaper_engine/assets"),
         home.join(".local/share/Steam/steamapps/common/wallpaper_engine/assets"),
+        // macOS: Steam installs under ~/Library. WE isn't sold for macOS, but a
+        // user who copies the assets folder over lands it here.
+        home.join("Library/Application Support/Steam/steamapps/common/wallpaper_engine/assets"),
     ];
 
     candidates.into_iter().find(|p| p.exists())
@@ -54,6 +57,18 @@ pub fn load_glsl_shader_with_resolver(
     Ok((frag_resolved, vert_resolved))
 }
 
+/// Bodies we carry for the WE common headers we know. Returns `None` for
+/// any other include so it keeps the "not found" behaviour.
+fn embedded_we_header(include_file: &str) -> Option<&'static str> {
+    let name = include_file.rsplit('/').next().unwrap_or(include_file);
+    match name {
+        "common_blending.h" => Some(super::transpiler::WE_COMMON_BLENDING_H),
+        "common_perspective.h" => Some(super::transpiler::WE_COMMON_PERSPECTIVE_H),
+        "common.h" => Some(super::transpiler::WE_COMMON_H),
+        _ => None,
+    }
+}
+
 fn resolve_includes(
     resolver: &AssetResolver,
     dirs: &[&str],
@@ -75,11 +90,23 @@ fn resolve_includes(
                         result.push_str(&resolved);
                         result.push('\n');
                     }
-                    None => {
-                        result.push_str("// [include not found: ");
-                        result.push_str(include_file);
-                        result.push_str("]\n");
-                    }
+                    None => match embedded_we_header(include_file) {
+                        // WE's common headers live in the global assets dir,
+                        // which never resolves on macOS (WE isn't installed
+                        // there). Fall back to the bodies we already carry so
+                        // ApplyBlending / hsv2rgb etc. stay defined. On Linux
+                        // the real file is found first, so this never fires —
+                        // no redefinition.
+                        Some(body) => {
+                            result.push_str(body);
+                            result.push('\n');
+                        }
+                        None => {
+                            result.push_str("// [include not found: ");
+                            result.push_str(include_file);
+                            result.push_str("]\n");
+                        }
+                    },
                 }
                 continue;
             }
@@ -89,4 +116,24 @@ fn resolve_includes(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_header_fallback_covers_known_we_headers() {
+        assert!(embedded_we_header("common_blending.h")
+            .unwrap()
+            .contains("ApplyBlending"));
+        assert!(embedded_we_header("common.h").unwrap().contains("hsv2rgb"));
+        assert!(embedded_we_header("common_perspective.h")
+            .unwrap()
+            .contains("squareToQuad"));
+        // Path-prefixed includes resolve by basename.
+        assert!(embedded_we_header("shaders/common_blending.h").is_some());
+        // Unknown headers keep the "not found" path.
+        assert!(embedded_we_header("common_fragoutput.h").is_none());
+    }
 }

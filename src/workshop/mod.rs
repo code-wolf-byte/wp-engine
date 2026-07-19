@@ -87,6 +87,7 @@ fn find_steam_library_roots() -> Vec<PathBuf> {
     let candidates = [
         dirs::home_dir().map(|h| h.join(".local/share/Steam")),
         dirs::home_dir().map(|h| h.join(".steam/steam")),
+        dirs::home_dir().map(|h| h.join("Library/Application Support/Steam")),
     ];
 
     for candidate in candidates.into_iter().flatten() {

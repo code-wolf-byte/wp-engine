@@ -23,7 +23,14 @@ target
 
 # Claude Code local settings/worktrees (personal, not shared)
 .claude/
+CLAUDE.md
+
+# Local per-machine cargo config (e.g. macOS SHADERC_LIB_DIR) — not shared;
+# a committed global [env] path would break other platforms' builds.
+.cargo/
 
 # Read-only C++ reference clone (Almamu/linux-wallpaperengine) used for
 # porting comparison — not part of this project, not vendored.
 cpp-implementation/
+scratchpad/
+.cargo/

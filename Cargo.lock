@@ -5706,6 +5706,8 @@ dependencies = [
  "lz4_flex",
  "minifb",
  "naga",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
  "pollster",
  "raw-window-handle",
  "rustfft",
@@ -5719,6 +5721,7 @@ dependencies = [
  "wayland-client 0.31.12",
  "wayland-protocols-wlr 0.2.0",
  "wgpu",
+ "winit",
 ]
 
 [[package]]
