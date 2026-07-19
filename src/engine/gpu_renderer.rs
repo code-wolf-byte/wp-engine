@@ -1546,6 +1546,11 @@ pub struct GpuSceneInstance {
     /// orthographic rects and has to apply the same scene-wide scale the build
     /// path does.
     zoom: f32,
+    /// Live per-object local transforms, carried across frames. WE's
+    /// `update(value)` is handed the CURRENT value, so a script written as
+    /// `value.y += ...` accumulates — resetting to the authored value each
+    /// frame turns continuous rotation into jitter in place.
+    current_locals: Vec<crate::engine::render::Xform>,
 }
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
@@ -2101,6 +2106,7 @@ impl GpuSceneInstance {
             mesh3d,
             mesh3d_depth,
             camera3d,
+            current_locals: resolved.transform_graph.local.clone(),
             transform_graph: resolved.transform_graph,
             zoom,
         })
@@ -2214,9 +2220,10 @@ impl GpuSceneInstance {
         // Evaluate in declaration order: these scripts talk to each other
         // through the shared `shared` object (one writes `shared.gjz`, another
         // reads it), and declaration order is the only ordering WE implies.
-        let mut locals = self.transform_graph.local.clone();
+        let mut locals = self.current_locals.clone();
         for (i, scripts) in self.transform_graph.scripts.iter().enumerate() {
-            let base = self.transform_graph.local[i];
+            // Previous frame's value, not the authored one — see `current_locals`.
+            let base = self.current_locals[i];
             let eval = |ctx: &mut crate::engine::script::ScriptContext,
                         src: &Option<String>,
                         b: [f64; 3]| match src {
@@ -2232,6 +2239,7 @@ impl GpuSceneInstance {
                 s: eval(&mut self.script_ctx, &scripts[2], base.s),
             };
         }
+        self.current_locals.clone_from(&locals);
         let worlds = self.transform_graph.world(&locals);
         // The PARENT's world transform, not the object's own — `worlds[i]`
         // already folds in object i's local transform, and the layer/mesh
@@ -2413,7 +2421,10 @@ impl GpuSceneInstance {
             let time_of_day = secs_into_day as f32 / 3600.0;
             let (w, h, persp) = (self.width, self.height, self.perspective);
             let ctx = &mut self.script_ctx;
-            ctx.set_time(time, time_of_day, (time - self.last_time).max(0.0));
+            // `delta`, not `time - self.last_time`: last_time was already
+            // advanced to `time` above, so that expression is always exactly 0
+            // and every `engine.frametime` script silently multiplied by zero.
+            ctx.set_time(time, time_of_day, delta);
             for layer in &mut self.layers {
                 if let Some(script) = &layer.alpha_script {
                     layer.alpha = ctx
