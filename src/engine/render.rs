@@ -1306,17 +1306,24 @@ fn text_layer_from_object(
     let font_data = super::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
     // Word-wrap to `maxwidth` (scene px == bitmap px at our raster resolution)
     // and cap at `maxrows`, if authored.
+    let gate = |v: &Option<serde_json::Value>| {
+        v.as_ref()
+            .and_then(crate::engine::scene::parse_value_bool)
+            .unwrap_or(false)
+    };
     let text_str = match obj
         .maxwidth
         .as_ref()
         .and_then(crate::engine::scene::parse_value_f32)
         .filter(|w| *w > 0.0)
+        .filter(|_| gate(&obj.limitwidth))
     {
         Some(mw) => {
             let rows = obj
                 .maxrows
                 .as_ref()
                 .and_then(crate::engine::scene::parse_value_f32)
+                .filter(|_| gate(&obj.limitrows))
                 .unwrap_or(0.0)
                 .max(0.0) as usize;
             super::text::wrap_text(&font_data, &text_str, raster_px, mw, rows)
@@ -2463,6 +2470,36 @@ mod tests {
     /// Untextured mesh materials are common in real content
     /// (`"textures": [null,null,null]`), and their flat `color` is the only
     /// thing that keeps the mesh from drawing plain white.
+    /// `maxwidth`/`maxrows` are only active when their `limit*` checkbox is
+    /// on. WE keeps the numbers around while the box is unchecked, so applying
+    /// them unconditionally wrapped text that should run free — 3091474852's
+    /// day label wrapped at 500px despite `limitwidth: false`.
+    #[test]
+    fn wrap_limits_respect_their_gates() {
+        let obj = |lw: bool| -> SceneObject {
+            serde_json::from_value(serde_json::json!({
+                "text": "SUNDAY", "maxwidth": 500.0, "maxrows": 1,
+                "limitwidth": lw, "limitrows": lw,
+            }))
+            .expect("valid object")
+        };
+        let active = |o: &SceneObject| {
+            o.maxwidth
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_f32)
+                .filter(|w| *w > 0.0)
+                .filter(|_| {
+                    o.limitwidth
+                        .as_ref()
+                        .and_then(crate::engine::scene::parse_value_bool)
+                        .unwrap_or(false)
+                })
+                .is_some()
+        };
+        assert!(active(&obj(true)), "gate on: maxwidth applies");
+        assert!(!active(&obj(false)), "gate off: maxwidth must be ignored");
+    }
+
     #[test]
     fn material_constant_color_reads_flat_color() {
         // `color` wins over the separate (usually white) `Color` tint.

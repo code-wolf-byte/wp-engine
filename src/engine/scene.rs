@@ -251,11 +251,17 @@ pub struct SceneObject {
     pub padding: Option<serde_json::Value>,
     #[serde(default)]
     pub anchor: Option<serde_json::Value>,
-    // Text wrapping / row limits.
+    // Text wrapping / row limits. `maxwidth`/`maxrows` only apply when their
+    // `limit*` gate is on — WE keeps the numbers around while the checkbox is
+    // off, so applying them unconditionally wraps text that should run free.
     #[serde(default)]
     pub maxwidth: Option<serde_json::Value>,
     #[serde(default)]
     pub maxrows: Option<serde_json::Value>,
+    #[serde(default)]
+    pub limitwidth: Option<serde_json::Value>,
+    #[serde(default)]
+    pub limitrows: Option<serde_json::Value>,
     #[serde(default)]
     pub blockalign: Option<serde_json::Value>,
     // Sound objects (audio playback).
