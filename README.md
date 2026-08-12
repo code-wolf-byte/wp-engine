@@ -1,12 +1,20 @@
 # wp-engine
 
 `wp-engine` is a Rust Wallpaper Engine client. The scene-wallpaper renderer is
-ported from `linux-wallpaperengine` to a `wgpu` backend, keeping a CPU RGBA
-compositor as a fallback.
+ported from [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
+to a `wgpu` backend, keeping a CPU RGBA compositor as a fallback.
 
 It presents on Wayland (wlr-layer-shell), X11 (root pixmap), and macOS, and
 renders scene, video, image, and web wallpapers. Windows is out of scope — see
 **Current Port Status**.
+
+> This project stands on
+> [Almamu/linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine).
+> A great deal of the maths here — the pass model, particle simulation, texture
+> and model formats, camera behaviour, and shader translation — is based on the
+> work done in that project. See [Credits](#credits).
+>
+> Licensed under **GPL-3.0**, the same licence as the project it derives from.
 
 ## Engine Pipeline
 
@@ -311,3 +319,53 @@ cargo fmt
 cargo check
 cargo test
 ```
+
+## Credits
+
+This project would not exist without
+**[Almamu/linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)**
+— Almamu's C++ reverse-engineering of Wallpaper Engine's scene format and
+renderer.
+
+A great deal of the maths in this codebase is based on the work done there. The
+formats and formulae were derived by that project first, and this port follows
+them:
+
+- the pass model: material and effect passes, ping-pong FBOs, named render
+  targets, and the bloom chain
+- particle simulation — emitter shapes, initialisers, and the operator formulae
+  (`alphafade`, `sizechange`, the oscillators, `colorchange`,
+  `controlpointattract`) follow `CParticle.cpp`
+- the `.tex` container format, the `.mdl` mesh layout, and the texture/model
+  chain resolution rules
+- scene coordinates, layer alignment and quad placement (`CImage.cpp`), and text
+  layout (`CText.cpp`)
+- camera parallax and fade, and the pointer-position convention
+- shader translation: uniform naming, combo handling, and the binding rules
+  `CPass.cpp` establishes
+
+Some parts went further than the reference and are original work here, informed
+by its groundwork rather than ported from it: the puppet `.mdl` skeleton and
+animation tracks (the reference reads only the mesh, and rejects the format
+version these files use), rope/trail particle geometry, and the Wallpaper Engine
+JavaScript bridge for web wallpapers.
+
+Where this port deviates deliberately, the reason is recorded in a comment next
+to the code (camera shake, for instance, is applied here even though the
+reference parses but never applies it).
+
+The reference implementation is not redistributed here — `cpp-implementation/`
+is gitignored, and is a local checkout used as read-only reference material
+while porting. Clone it yourself from the link above if you want to compare.
+
+Wallpaper Engine itself is a product of Kristjan Skutta. This project is not
+affiliated with, endorsed by, or derived from its source.
+
+## License
+
+Licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
+
+`linux-wallpaperengine`, which this project derives from and whose maths it is
+based on, is GPL-3.0. As a derivative work this project carries the same licence.
+Upstream ships the GPL-3 text with no "or any later version" grant, so this is
+GPL-3.0-only rather than -or-later.
