@@ -70,6 +70,17 @@ impl FrameSource {
 
                 Ok(FrameSource::Video { current: first, rx })
             }
+            // Web wallpapers reuse the `Video` variant rather than adding one:
+            // it already means "a stream of frames plus the latest", which is
+            // exactly what CEF's off-screen painting produces. Scene fallback
+            // rendering shares it for the same reason.
+            WallpaperContent::Web { html } => {
+                let (first, rx) = super::web::start_web_stream(&html)?;
+                Ok(FrameSource::Video {
+                    current: Arc::new(first),
+                    rx,
+                })
+            }
             WallpaperContent::Video { path } => {
                 let (tx, rx) = sync_channel::<Arc<RgbaImage>>(2);
 

@@ -180,13 +180,15 @@ impl GpuSceneRenderer {
                     },
                     count: None,
                 },
-                // Extra texture slots for multi-texture effects (g_Texture1..6)
+                // Extra texture slots for multi-texture effects (g_Texture1..7,
+                // bound at N+2 — 7 is the highest the workshop corpus uses).
                 tex_entry(3),
                 tex_entry(4),
                 tex_entry(5),
                 tex_entry(6),
                 tex_entry(7),
                 tex_entry(8),
+                tex_entry(9),
             ],
         });
 
@@ -886,6 +888,21 @@ impl GpuSceneRenderer {
     }
 
     pub fn upload_texture(&self, img: &RgbaImage) -> wgpu::Texture {
+        let (fw, fh) =
+            crate::engine::fbo::fit_texture_limit(&self.device, img.width(), img.height());
+        let downscaled;
+        let img = if (fw, fh) != img.dimensions() {
+            tracing::warn!(
+                "layer texture {}x{} exceeds the GPU limit — downscaling to {fw}x{fh}",
+                img.width(),
+                img.height()
+            );
+            downscaled =
+                image::imageops::resize(img, fw, fh, image::imageops::FilterType::Triangle);
+            &downscaled
+        } else {
+            img
+        };
         let (w, h) = img.dimensions();
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("layer_tex"),
@@ -1081,6 +1098,10 @@ impl GpuSceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(slot(5)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(slot(6)),
                 },
             ],
         })
@@ -1447,6 +1468,8 @@ struct SceneLayerGpu {
     /// This layer's position in `scene.visible_objects()` — lets `render()`
     /// interleave with particle systems in true scene z-order.
     order_index: usize,
+    /// The scene object's `id`, for `_rt_imageLayerComposite_<id>_*` binds.
+    object_id: Option<i64>,
     /// Perspective scenes only: view-space distance of the quad center from
     /// the camera, for painter's-algorithm back-to-front sorting. Negative =
     /// behind the camera (culled). Always 0.0 in orthographic scenes.
@@ -1819,6 +1842,7 @@ impl GpuSceneInstance {
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
                     order_index: l.order_index,
+                    object_id: l.object_id,
                     visible: l.visible_base,
                     visible_base: l.visible_base,
                     transform_scripts: l.transform_scripts.clone(),
@@ -1932,6 +1956,28 @@ impl GpuSceneInstance {
                 }
             }
         }
+        // `_rt_imageLayerComposite_<objectId>_<a|b>`: WE's per-object composite
+        // buffer, referenced by effects on *other* objects (2321732083's
+        // samurai adds 5x object 101's buffer). Create one scene-sized target
+        // per referenced name; each is filled right after its owning layer
+        // composites. Aliasing these to the whole-scene snapshot instead —
+        // which is what we used to do — meant `blend` added 5x the entire lit
+        // city onto the samurai and blew it out to white.
+        let layer_composite_names: Vec<String> = scene_effects
+            .iter()
+            .flat_map(|inst| inst.pass_overrides.iter())
+            .flat_map(|over| {
+                over.textures
+                    .iter()
+                    .filter_map(|t| t.clone())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|n| n.starts_with("_rt_imageLayerComposite"))
+            .collect();
+        for name in &layer_composite_names {
+            fbo_pool.get_or_create(renderer.device(), name, w, h);
+        }
+
         if bloom.enabled {
             // Matches the reference's three-buffer chain exactly (CScene.cpp):
             // no ping-pong needed since each stage writes a *different* buffer.
@@ -2061,7 +2107,11 @@ impl GpuSceneInstance {
             Some(cam) => resolved
                 .mesh3d_layers
                 .iter()
-                .filter(|m| mesh_filter.as_ref().is_none_or(|f| m.name.contains(f.as_str())))
+                .filter(|m| {
+                    mesh_filter
+                        .as_ref()
+                        .is_none_or(|f| m.name.contains(f.as_str()))
+                })
                 .map(|m| Self::build_mesh3d(&renderer, cam, m))
                 .collect(),
             None => Vec::new(),
@@ -2678,12 +2728,7 @@ impl GpuSceneInstance {
         for (_, item) in items {
             match item {
                 DrawItem::Mesh(idx) => {
-                    self.draw_one_mesh3d(
-                        &mut encoder,
-                        &target_view,
-                        idx,
-                        !mesh_depth_cleared,
-                    );
+                    self.draw_one_mesh3d(&mut encoder, &target_view, idx, !mesh_depth_cleared);
                     mesh_depth_cleared = true;
                 }
                 DrawItem::Image(layer_idx) => {
@@ -2844,9 +2889,9 @@ impl GpuSceneInstance {
 
                     // Extra texture slots: shader/material textures first,
                     // FBO binds override.
-                    let mut extra: Vec<Option<wgpu::TextureView>> = vec![None; 6];
+                    let mut extra: Vec<Option<wgpu::TextureView>> = vec![None; 7];
                     if let Some(texs) = self.renderer.dynamic_textures.get(&pass.tex_key) {
-                        for (i, tex) in texs.iter().enumerate().take(6) {
+                        for (i, tex) in texs.iter().enumerate().take(7) {
                             extra[i] = Some(tex.create_view(&Default::default()));
                             engine.resolutions[i + 1] = tex_res(tex);
                         }
@@ -2856,15 +2901,24 @@ impl GpuSceneInstance {
                         // A bind named "previous" is the chain input itself.
                         let (view, res) = if fbo_name == "previous" {
                             (chain_view.clone(), chain_res)
+                        } else if let Some(rt) = fbo_name
+                            .starts_with("_rt_imageLayerComposite")
+                            .then(|| self.fbo_pool.get(fbo_name.as_str()))
+                            .flatten()
+                        {
+                            // The owning layer's own composite, captured when it
+                            // drew (see draw_image_layer_gpu). Transparent when
+                            // that layer hasn't drawn yet this frame, which adds
+                            // nothing — the safe direction.
+                            (rt.view(), tex_res(&rt.texture))
                         } else if fbo_name == "_rt_FullFrameBuffer"
                             || fbo_name == "_rt_MipMappedFrameBuffer"
-                            // WE's per-layer composite buffer. Same meaning as
-                            // FullFrameBuffer for us: effects run before their
-                            // layer composites, so the scene target already
-                            // holds "everything behind this layer". Without
-                            // this the bind silently fails and the sampler
-                            // keeps its `util/white` default — which is what
-                            // blended 2821407073's mountains to solid white.
+                            // A per-layer composite we never captured falls back
+                            // to the scene-so-far snapshot: effects run before
+                            // their layer composites, so the scene target holds
+                            // "everything behind this layer". Without any bind
+                            // the sampler keeps its `util/white` default — which
+                            // is what blended 2821407073's mountains to white.
                             || fbo_name.starts_with("_rt_imageLayerComposite")
                         {
                             // The wallpaper-global scene buffer (CWallpaper.cpp
@@ -2901,7 +2955,7 @@ impl GpuSceneInstance {
                         if *slot == 0 {
                             src_view = view;
                             engine.resolutions[0] = res;
-                        } else if (*slot as usize) <= 6 {
+                        } else if (*slot as usize) <= 7 {
                             extra[(*slot - 1) as usize] = Some(view);
                             engine.resolutions[*slot as usize] = res;
                         }
@@ -3043,6 +3097,29 @@ impl GpuSceneInstance {
                 6,
                 &[],
             );
+
+            // Capture this layer's own composite for effects on other objects
+            // that bind `_rt_imageLayerComposite_<thisId>_*` (WE keeps one
+            // buffer per object; ours is filled with the same draw, on a
+            // cleared scene-sized target so only this layer is in it).
+            if let Some(id) = layer.object_id {
+                for suffix in ['a', 'b'] {
+                    let name = format!("_rt_imageLayerComposite_{id}_{suffix}");
+                    if let Some(rt) = self.fbo_pool.get(name.as_str()) {
+                        self.renderer.run_pass(
+                            encoder,
+                            pipeline,
+                            &base_bg,
+                            None,
+                            &rt.view(),
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            "layer_composite_capture",
+                            6,
+                            &[],
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3656,6 +3733,13 @@ fn load_effect_instance(
                 image::Rgba([127, 127, 127, 255]),
             )));
         }
+        if std::env::var("WP_DEBUG_TEX_SLOTS").is_ok() {
+            eprintln!(
+                "[texslots] {effect_name} (hardcoded, instance {instance_idx}): overrides={:?} loaded={}",
+                inst.pass_overrides.first().map(|o| o.textures.clone()),
+                textures.len()
+            );
+        }
         if !textures.is_empty() {
             renderer.dynamic_textures.insert(tex_key.clone(), textures);
         }
@@ -3933,9 +4017,20 @@ fn load_effect_instance(
             .filter(|n| n.as_deref().is_some_and(|n| n.starts_with("_rt_")))
             .for_each(|n| *n = None);
         if std::env::var("WP_DEBUG_TEX_SLOTS").is_ok() {
-            eprintln!("[texslots] {effect_name} pass{pass_idx}: merged={:?} names={:?} slots={:?}",
-                merged_textures, texture_names,
-                model.texture_slots.iter().map(|s| (s.glsl_name.clone(), s.default_path.clone(), s.is_framebuffer)).collect::<Vec<_>>());
+            eprintln!(
+                "[texslots] {effect_name} pass{pass_idx}: merged={:?} names={:?} slots={:?}",
+                merged_textures,
+                texture_names,
+                model
+                    .texture_slots
+                    .iter()
+                    .map(|s| (
+                        s.glsl_name.clone(),
+                        s.default_path.clone(),
+                        s.is_framebuffer
+                    ))
+                    .collect::<Vec<_>>()
+            );
         }
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         for name in &texture_names {
@@ -3974,11 +4069,19 @@ fn load_effect_instance(
             key,
             hardcoded: false,
             target: pass.target.clone(),
-            binds: pass
-                .bind
-                .iter()
-                .filter_map(|b| b.name.as_ref().map(|n| (b.index.unwrap_or(0), n.clone())))
-                .chain(fbo_ref_binds)
+            // Draw-time binding applies these in order, so the effect's own
+            // `bind` entries must come LAST — CPass.cpp:809 "binds are set
+            // last as they're the most important to be set". With the
+            // material's texture-list _rt_ refs winning instead, godrays'
+            // combine pass read the (still empty) scene snapshot as its
+            // albedo and washed the whole layer to the clear colour.
+            binds: fbo_ref_binds
+                .into_iter()
+                .chain(
+                    pass.bind
+                        .iter()
+                        .filter_map(|b| b.name.as_ref().map(|n| (b.index.unwrap_or(0), n.clone()))),
+                )
                 .collect(),
             values,
             vertex_buffers,
@@ -4059,13 +4162,19 @@ fn insert_animated_components(
         map.insert(key.to_string(), f);
         map.insert(alias.to_string(), f);
     }
-    if let Some([r, g, b]) = v.as_vec3() {
-        for (name, val) in [("r", r), ("g", g), ("b", b)] {
-            map.insert(format!("{key}_{name}"), val);
-            map.insert(format!("{alias}_{name}"), val);
+    if let Some(comps) = v.components() {
+        // Both spellings: colors are read as _r/_g/_b/_a, geometry as
+        // _x/_y/_z/_w. A vec3 keeps its historical implicit _w/_a of 1.0.
+        let mut named: Vec<(&str, f32)> = Vec::new();
+        for (i, val) in comps.iter().enumerate() {
+            named.push((["r", "g", "b", "a"][i.min(3)], *val));
+            named.push((["x", "y", "z", "w"][i.min(3)], *val));
         }
-        // Vec2/vec4 lookups use _x/_y/_z/_w suffixes.
-        for (name, val) in [("x", r), ("y", g), ("z", b), ("w", 1.0)] {
+        if comps.len() == 3 {
+            named.push(("a", 1.0));
+            named.push(("w", 1.0));
+        }
+        for (name, val) in named {
             map.insert(format!("{key}_{name}"), val);
             map.insert(format!("{alias}_{name}"), val);
         }
@@ -4145,13 +4254,18 @@ fn make_params_from_translated_typed(
 ) -> Vec<u8> {
     let mut bytes: Vec<u8> = Vec::new();
 
-    // Resolve one uniform into up to 4 components.
-    let resolve = |key: &str, default: &[f32; 4]| -> [f32; 4] {
+    // Resolve one uniform into up to 4 components. A scene may key the value
+    // by the annotation's material key ("alpha") or by its UI label
+    // ("ui_editor_properties_outline_background") — and those two are not
+    // always spellings of each other, so both are tried.
+    let resolve = |entry: &transpiler::UniformEntry, default: &[f32; 4]| -> [f32; 4] {
+        let key = entry.key.as_str();
         if let Some(v) = engine.get(key) {
             return v;
         }
+        let names = || std::iter::once(key).chain(entry.label.as_deref());
         let mut out = *default;
-        if let Some(f) = vals.get(key) {
+        if let Some(f) = names().find_map(|k| vals.get(k)) {
             out = [*f; 4];
         }
         // Per-component spellings win over the scalar broadcast.
@@ -4164,11 +4278,12 @@ fn make_params_from_translated_typed(
         .iter()
         .enumerate()
         {
-            for s in suffixes.iter() {
-                if let Some(f) = vals.get(&format!("{key}{s}")) {
-                    out[i] = *f;
-                    break;
-                }
+            if let Some(f) = suffixes
+                .iter()
+                .flat_map(|s| names().map(move |k| format!("{k}{s}")))
+                .find_map(|k| vals.get(&k))
+            {
+                out[i] = *f;
             }
         }
         out
@@ -4185,16 +4300,15 @@ fn make_params_from_translated_typed(
     }
 
     for entry in keys {
-        let key = entry.key.as_str();
         match entry.glsl_type.as_str() {
             "vec2" => {
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 8);
                 push_f32(&mut bytes, v[0]);
                 push_f32(&mut bytes, v[1]);
             }
             "vec3" => {
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 16);
                 push_f32(&mut bytes, v[0]);
                 push_f32(&mut bytes, v[1]);
@@ -4203,7 +4317,7 @@ fn make_params_from_translated_typed(
                 // tail 4 bytes, so do NOT pad here.
             }
             "vec4" => {
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 16);
                 for f in v {
                     push_f32(&mut bytes, f);
@@ -4231,7 +4345,7 @@ fn make_params_from_translated_typed(
             }
             _ => {
                 // float / int / bool / unknown: 4 bytes, align 4
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 4);
                 push_f32(&mut bytes, v[0]);
             }
@@ -4253,6 +4367,34 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
     // for any older call sites below that still pass the long form.
     fn get(vals: &ShaderVals, key: &str, default: f32) -> f32 {
         if let Some(v) = vals.get(key) {
+            return *v;
+        }
+        // Scenes key a value by the annotation's material key ("amount") or by
+        // its UI label ("ui_editor_properties_pulse_amount", normalized to
+        // "pulseamount") — and the label is not always the material key with a
+        // prefix chopped off. LABEL_ALIASES covers the pairs the corpus
+        // actually uses; the translated-effect packer gets this from the
+        // shader annotation itself (see make_params_from_translated_typed).
+        const LABEL_ALIASES: &[(&str, &[&str])] = &[
+            ("amount", &["pulseamount"]),
+            ("speed", &["pulsespeed"]),
+            ("phase", &["pulsephase", "timeoffset"]),
+            ("bounds", &["pulsebounds"]),
+            ("scale", &["ripplescale"]),
+        ];
+        // Vector params arrive here already split ("bounds_r"), so match on the
+        // stem and carry the suffix over.
+        let (stem, suffix) = match key.rfind('_') {
+            Some(i) if key.len() - i <= 2 => (&key[..i], &key[i..]),
+            _ => (key, ""),
+        };
+        if let Some(v) = LABEL_ALIASES
+            .iter()
+            .find(|(k, _)| *k == stem)
+            .into_iter()
+            .flat_map(|(_, aliases)| aliases.iter())
+            .find_map(|a| vals.get(&format!("{a}{suffix}")))
+        {
             return *v;
         }
         key.strip_prefix("ui_editor_properties_")
@@ -4286,6 +4428,16 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "combo_PULSEALPHA", 0.0),
             get(vals, "noisespeed", 0.5),
             get(vals, "noiseamount", 0.0),
+            get(vals, "combo_AUDIOPROCESSING", 0.0),
+            get(vals, "frequencymin", 0.0),
+            get(vals, "frequencymax", 1.0),
+            get(vals, "audiobounds_x", 0.5),
+            get(vals, "audiobounds_y", 1.0),
+            get(vals, "audioexponent", 1.0),
+            get(vals, "audioamount", 1.0),
+            // PulseParams rounds up to 112 bytes (vec3 members force a
+            // 16-byte struct alignment) — pad or wgpu rejects the bind group.
+            0.0,
             0.0,
             0.0,
         ]),
@@ -4367,5 +4519,62 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             0.0,
         ]),
         _ => vec![0u8; 32],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WGSL rounds every uniform-address-space struct up to a 16-byte
+    /// multiple, so a param buffer that isn't one can never match its shader
+    /// struct — wgpu rejects the bind group at draw time ("Buffer is bound
+    /// with size N where the shader expects M") and the wallpaper dies.
+    #[test]
+    fn hardcoded_effect_params_are_uniform_sized() {
+        let vals = ShaderVals::new();
+        for name in HARDCODED_EFFECTS {
+            let n = make_effect_params(name, 0.0, &vals).len();
+            assert_eq!(n % 16, 0, "{name} params are {n} bytes, not a 16-multiple");
+        }
+    }
+
+    /// Hardcoded kernels must find a value the scene keyed by UI label
+    /// ("ui_editor_properties_pulse_amount") as well as by material key.
+    #[test]
+    fn hardcoded_params_resolve_label_keyed_values() {
+        let mut vals = ShaderVals::new();
+        insert_value_components(
+            &mut vals,
+            "ui_editor_properties_pulse_amount",
+            &serde_json::json!(0.25),
+        );
+        insert_value_components(
+            &mut vals,
+            "ui_editor_properties_pulse_bounds",
+            &serde_json::json!("0.2 0.8"),
+        );
+        let bytes = make_effect_params("pulse", 0.0, &vals);
+        let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(f(2), 0.25, "amount");
+        assert_eq!(f(5), 0.2, "bounds low");
+        assert_eq!(f(6), 0.8, "bounds high");
+    }
+
+    /// vec2 constants (audiobounds, texture scales, ...) must expose their
+    /// components like vec3 colors do, or the packer silently falls back to
+    /// the shader default and the artist's tuning is lost.
+    #[test]
+    fn vector_constants_expose_components_at_every_width() {
+        let mut map = ShaderVals::new();
+        insert_value_components(&mut map, "audiobounds", &serde_json::json!("0.25 0.75"));
+        assert_eq!(map.get("audiobounds_x"), Some(&0.25));
+        assert_eq!(map.get("audiobounds_y"), Some(&0.75));
+        assert_eq!(map.get("audiobounds_r"), Some(&0.25));
+
+        insert_value_components(&mut map, "tintlow", &serde_json::json!("1 0 0"));
+        assert_eq!(map.get("tintlow_b"), Some(&0.0));
+        // vec3s keep their implicit opaque alpha.
+        assert_eq!(map.get("tintlow_a"), Some(&1.0));
     }
 }

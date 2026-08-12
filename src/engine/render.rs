@@ -184,6 +184,10 @@ pub struct Layer {
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
+    /// The scene object's own `id`. Effects reference another object's
+    /// rendered output as `_rt_imageLayerComposite_<id>_a`, so the live path
+    /// needs to know which layer each id belongs to.
+    pub object_id: Option<i64>,
     /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
     /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
     pub transform_scripts: TransformScripts,
@@ -374,7 +378,11 @@ impl ResolvedScene {
                     LoadedImage::single(placeholder_for(obj))
                 }
                 Some(path) if is_solid_layer_path(path) => {
-                    solid_indices.push(layers.len());
+                    // Scene-size expansion is for effect chains only — see
+                    // fill_solid_layer_sizes.
+                    if !obj.effects.is_empty() {
+                        solid_indices.push(layers.len());
+                    }
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
@@ -400,7 +408,12 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers, &mut mesh3d_layers);
+        apply_parent_transforms(
+            &scene,
+            &mut layers,
+            &mut particle_layers,
+            &mut mesh3d_layers,
+        );
         Ok(Self {
             width,
             height,
@@ -465,7 +478,11 @@ impl ResolvedScene {
                     LoadedImage::single(placeholder_for(obj))
                 }
                 Some(path) if is_solid_layer_path(path) => {
-                    solid_indices.push(layers.len());
+                    // Scene-size expansion is for effect chains only — see
+                    // fill_solid_layer_sizes.
+                    if !obj.effects.is_empty() {
+                        solid_indices.push(layers.len());
+                    }
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
@@ -494,7 +511,12 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers, &mut mesh3d_layers);
+        apply_parent_transforms(
+            &scene,
+            &mut layers,
+            &mut particle_layers,
+            &mut mesh3d_layers,
+        );
         Ok(Self {
             width,
             height,
@@ -560,7 +582,11 @@ impl ResolvedScene {
                     LoadedImage::single(placeholder_for(obj))
                 }
                 Some(path) if is_solid_layer_path(path) => {
-                    solid_indices.push(layers.len());
+                    // Scene-size expansion is for effect chains only — see
+                    // fill_solid_layer_sizes.
+                    if !obj.effects.is_empty() {
+                        solid_indices.push(layers.len());
+                    }
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
@@ -585,7 +611,12 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers, &mut mesh3d_layers);
+        apply_parent_transforms(
+            &scene,
+            &mut layers,
+            &mut particle_layers,
+            &mut mesh3d_layers,
+        );
         Ok(Self {
             width,
             height,
@@ -860,18 +891,26 @@ fn layer_from_object(
                     .enumerate()
                     .filter(|(_, e)| e.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
                     .map(|(i, e)| {
-                        // The `animation` id doesn't map to an MDLA index (no
-                        // ids parsed), so resolve it as an index if in range,
-                        // else by declaration order — clamped to what exists.
+                        // `animation` is the MDLA record's own id (2321732083's
+                        // samurai layers name 60/63/80/105). Match it; fall back
+                        // to index-then-declaration-order for files whose ids we
+                        // failed to read.
                         let raw = e
                             .get("animation")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(i as u64);
-                        let anim_idx = if (raw as usize) < n {
-                            raw as usize
-                        } else {
-                            i.min(n - 1)
-                        };
+                        let anim_idx = rt
+                            .model
+                            .animations
+                            .iter()
+                            .position(|a| a.id as u64 == raw)
+                            .unwrap_or_else(|| {
+                                if (raw as usize) < n {
+                                    raw as usize
+                                } else {
+                                    i.min(n - 1)
+                                }
+                            });
                         crate::engine::puppet::AnimLayer {
                             anim_idx,
                             additive: e.get("additive").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -1028,6 +1067,7 @@ fn layer_from_object(
         video: loaded.video,
         text_dynamic: None,
         order_index: 0,
+        object_id: obj.id,
         transform_scripts,
         visible_base: obj.is_visible(),
     }
@@ -1910,12 +1950,32 @@ fn chain_has_spritesheet(json_path: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>
         .is_some_and(|passes| {
             passes.iter().any(|pass| {
                 pass.get("combos")
-                    .and_then(|c| c.get("SPRITESHEET"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(|c| c.as_object())
+                    // Materials spell it both "SPRITESHEET" and "spritesheet".
+                    .and_then(|c| {
+                        c.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("spritesheet"))
+                            .and_then(|(_, v)| v.as_i64())
+                    })
                     .unwrap_or(0)
                     != 0
             })
         })
+}
+
+/// A model chain's texture, as a layer image. An animated `.tex` (TEXS frame
+/// table + the IsGif flag) keeps its frames so the layer plays them —
+/// otherwise the whole atlas gets squeezed into the one-cell quad, which is
+/// how 2325500626's bonfire rendered as a 16-up contact sheet.
+fn loaded_from_chain_tex(
+    tex: &TexFile,
+    json_path: &str,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<LoadedImage> {
+    if tex.is_animated() {
+        return LoadedImage::from_tex(tex);
+    }
+    Ok(apply_puppet_mesh(tex.to_rgba()?, json_path, read))
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
@@ -1925,13 +1985,12 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage
         // an embedded-video texture — stream it instead of puppet handling.
         return video_tex_to_loaded(&tex, bytes);
     }
-    let atlas = tex.to_rgba()?;
     let read = |rel: &str| {
         pkg.get(rel)
             .map(|d| d.to_vec())
             .or_else(|| read_from_global_assets(rel))
     };
-    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    let mut loaded = loaded_from_chain_tex(&tex, json_path, &read)?;
     if chain_has_spritesheet(json_path, &read) {
         loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
     }
@@ -1943,13 +2002,12 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
     if let Some(bytes) = tex.video_bytes() {
         return video_tex_to_loaded(&tex, bytes);
     }
-    let atlas = tex.to_rgba()?;
     let read = |rel: &str| {
         std::fs::read(dir.join(rel))
             .ok()
             .or_else(|| read_from_global_assets(rel))
     };
-    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    let mut loaded = loaded_from_chain_tex(&tex, json_path, &read)?;
     if chain_has_spritesheet(json_path, &read) {
         loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
     }
@@ -2237,10 +2295,7 @@ impl TransformGraph {
     /// 189 of 197 real scenes answer `false` and skip the whole thing.
     pub fn needs_per_frame(&self) -> bool {
         self.parent.iter().any(Option::is_some)
-            && self
-                .scripts
-                .iter()
-                .any(|s| s.iter().any(Option::is_some))
+            && self.scripts.iter().any(|s| s.iter().any(Option::is_some))
     }
 
     /// World transform per object, composing `locals` up each parent chain.
@@ -2264,9 +2319,9 @@ impl TransformGraph {
         // Same 64-deep guard as the load-time walker: a malformed scene must
         // not blow the stack.
         let w = match self.parent[idx] {
-            Some(p) if p != idx && depth < 64 => {
-                self.world_of(p, locals, memo, depth + 1).compose(&locals[idx])
-            }
+            Some(p) if p != idx && depth < 64 => self
+                .world_of(p, locals, memo, depth + 1)
+                .compose(&locals[idx]),
             _ => locals[idx],
         };
         memo[idx] = Some(w);
@@ -2486,7 +2541,11 @@ fn white_pixel() -> RgbaImage {
 }
 
 /// WE sizes a solid layer to the full scene when it has no explicit size
-/// (`CImage::setupUniforms`: `if (solidlayer && size == 0) size = sceneSize`).
+/// (`CImage.cpp:199`: `if (solidlayer && size == 0) size = sceneSize`) — but
+/// only to give an effect chain a dummy target. A size-less solid layer with
+/// no effects is a script/cursor holder ("Player Options" in 2988724897);
+/// stretching its opaque white over the scene hides the whole wallpaper, so
+/// callers only register those that carry effects.
 fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: u32, height: u32) {
     for &i in solid_indices {
         if layers[i].size[0] == 0.0 && layers[i].size[1] == 0.0 {
@@ -2516,8 +2575,11 @@ mod tests {
                 {"id": 3, "origin": "1 0 0", "parent": 1, "disablepropagation": true}]"#,
         )
         .expect("valid objects");
-        let id_to_idx: HashMap<i64, usize> =
-            objs.iter().enumerate().filter_map(|(i, o)| o.id.map(|d| (d, i))).collect();
+        let id_to_idx: HashMap<i64, usize> = objs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.id.map(|d| (d, i)))
+            .collect();
         let name_to_idx: HashMap<&str, usize> = HashMap::new();
         assert_eq!(parent_index(&objs[1], &id_to_idx, &name_to_idx), Some(0));
         assert_eq!(
@@ -2539,8 +2601,7 @@ mod tests {
                 .unwrap_or(true)
         };
         let plain: SceneObject = serde_json::from_str("{}").expect("valid");
-        let off: SceneObject =
-            serde_json::from_str(r#"{"depthtest": "disabled"}"#).expect("valid");
+        let off: SceneObject = serde_json::from_str(r#"{"depthtest": "disabled"}"#).expect("valid");
         assert!(read(&plain, None), "default is depth-tested");
         assert!(!read(&plain, Some("disabled")), "material pass applies");
         assert!(!read(&off, Some("enabled")), "object wins over material");
@@ -2638,6 +2699,7 @@ mod tests {
             video: None,
             text_dynamic: None,
             order_index: 1,
+            object_id: None,
             transform_scripts: TransformScripts::default(),
             visible_base: true,
         }];

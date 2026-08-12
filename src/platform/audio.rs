@@ -344,8 +344,10 @@ mod tests {
     /// neither reliably (a case-sensitive check found 0 of 197 scenes).
     #[test]
     fn audio_detection_is_case_insensitive() {
-        let dir = tempdir_with(r#"{"general":{},"objects":[
-            {"effects":[{"passes":[{"combos":{"AUDIOPROCESSING":3}}]}]}]}"#);
+        let dir = tempdir_with(
+            r#"{"general":{},"objects":[
+            {"effects":[{"passes":[{"combos":{"AUDIOPROCESSING":3}}]}]}]}"#,
+        );
         assert!(wallpaper_uses_audio(dir.path()));
     }
 

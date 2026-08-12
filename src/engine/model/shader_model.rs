@@ -101,6 +101,10 @@ impl UniformDefault {
 pub struct ValueUniform {
     pub glsl_name: String,
     pub material_key: String,
+    /// The annotation's `label` (`ui_editor_properties_outline_background`).
+    /// Scenes key `constantshadervalues` by EITHER this or `material_key`, and
+    /// the two are unrelated strings often enough to matter.
+    pub label: Option<String>,
     pub kind: UniformKind,
     pub default: UniformDefault,
 }
@@ -247,6 +251,7 @@ impl ShaderModel {
                             .material_key
                             .clone()
                             .unwrap_or_else(|| meta.uniform_name.clone()),
+                        label: meta.label.clone(),
                         kind,
                         default,
                     });

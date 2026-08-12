@@ -417,10 +417,12 @@ impl WpApp {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let can_apply = matches!(
+        let can_apply = (matches!(
             wtype,
             WallpaperType::Video | WallpaperType::Scene | WallpaperType::Unknown
-        ) && (file_exists || matches!(wtype, WallpaperType::Scene));
+        ) || (matches!(wtype, WallpaperType::Web)
+            && crate::render::web::is_supported()))
+            && (file_exists || matches!(wtype, WallpaperType::Scene));
         let thumb = self.thumbnails.get(&workshop_id).cloned();
 
         // ── Render ────────────────────────────────────────────────────────────
@@ -571,7 +573,11 @@ impl WpApp {
                     self.status =
                         StatusMsg::ok("Audio source set — re-apply the wallpaper to use it");
                 }
-                ui.label(egui::RichText::new("🔊  React to sound from").size(11.0).weak());
+                ui.label(
+                    egui::RichText::new("🔊  React to sound from")
+                        .size(11.0)
+                        .weak(),
+                );
                 ui.add_space(2.0);
             }
 
@@ -590,7 +596,7 @@ impl WpApp {
                 }
             } else {
                 let reason = match wtype {
-                    WallpaperType::Web => "Web format not supported",
+                    WallpaperType::Web => "Web wallpapers need a build with --features web",
                     WallpaperType::Application => "Windows-only",
                     _ => "File missing",
                 };

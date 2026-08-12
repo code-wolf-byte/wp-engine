@@ -1,8 +1,12 @@
 # wp-engine
 
-`wp-engine` is a Rust/Wayland Wallpaper Engine client. The scene-wallpaper
-renderer is being ported from `linux-wallpaperengine` to a `wgpu` backend while
-keeping the existing CPU RGBA compositor as a fallback.
+`wp-engine` is a Rust Wallpaper Engine client. The scene-wallpaper renderer is
+ported from `linux-wallpaperengine` to a `wgpu` backend, keeping a CPU RGBA
+compositor as a fallback.
+
+It presents on Wayland (wlr-layer-shell), X11 (root pixmap), and macOS, and
+renders scene, video, image, and web wallpapers. Windows is out of scope — see
+**Current Port Status**.
 
 ## Engine Pipeline
 
@@ -14,8 +18,9 @@ OpenGL pass model can be rebuilt incrementally in Rust.
 The app starts from either a Steam Workshop item or a direct file path.
 
 - `src/workshop` scans Wallpaper Engine Workshop projects.
-- `src/render/content.rs` classifies content as static image, video, or scene.
-- Static and video wallpapers still flow through the frame-source path.
+- `src/render/content.rs` classifies content as static image, video, scene, or
+  web.
+- Static, video, and web wallpapers flow through the frame-source path.
 - Scene wallpapers are handed to the engine pipeline below.
 
 ### 2. Asset Store
@@ -71,93 +76,64 @@ scene object
 
 `src/engine/graph.rs` builds a resolved scene graph.
 
-For each visible image object it records:
+For each visible object it records:
 
 - the source scene object
 - resolved model, if the object references one
 - resolved base texture
 - resolved effects
 - render-target/fullscreen hints
+- parent chain and transforms
+- the draw order (`order_index`) both render paths share, so images, particles,
+  and meshes interleave in true scene z-order rather than by category
 
-The scene graph is still backend-neutral. It is useful for both diagnostics and
+The scene graph is backend-neutral, and useful for both diagnostics and
 rendering.
 
-### 6. Frame Context
+### 6. Shader Translation Layer
 
-`src/engine/frame_context.rs` creates the per-frame state shared by renderer
-passes.
+`src/engine/shaders/transpiler.rs` turns Wallpaper Engine's GLSL into WGSL:
+resolve `shaders/<name>.vert|frag`, expand includes and combo `#define`s,
+compile to SPIR-V with shaderc, then translate to WGSL with Naga.
 
-It currently tracks:
+Real workshop shaders lean on legacy NVIDIA GLSL leniency, so the translator
+also repairs them: vector-width coercion, `for`-loop unrolling ahead of array
+varying expansion, `%` to `mod`, int literals to floats in `min`/`max`/`clamp`,
+and float-to-int assignment casts. Engine uniforms (`g_Time`,
+`g_PointerPosition`, the `g_AudioSpectrum*` arrays, …) are packed to std140 and
+bound alongside.
 
-- frame index
-- time and delta time
-- output resolution
-- camera state
-- object transforms
-- future effect uniform storage
+`WP_DEBUG_DUMP_GLSL=1` writes the generated GLSL of any shader that fails to
+compile — shaderc's line numbers refer to that text and nothing else prints it.
+`WP_DEBUG_DUMP_WGSL=1` dumps each pass's translated WGSL.
 
-Particles, audio reactivity, parallax, mouse input, and effect uniforms should
-all feed through this context instead of being threaded through unrelated code.
+### 7. GPU Scene Renderer
 
-### 7. Render Graph
+`src/engine/gpu_renderer.rs` is the production renderer — `GpuSceneInstance` and
+`gpu_scene_render_loop`, used by `set`, `set-file`, and `test-scene`.
 
-`src/engine/render_graph.rs` converts the scene graph into a Wallpaper
-Engine-style render plan.
+It owns the full pass model: per-object composite buffers, ping-pong FBOs,
+named effect targets (`target`/`bind`), multi-pass effects, the reference's
+bloom chain, particle systems, puppet skinning, 3D meshes for perspective
+scenes, text layers, and SceneScript-driven properties ticked per frame.
 
-It records:
+`WP_DEBUG_DUMP_FBOS=1` dumps every pooled render target per frame;
+`WP_ENGINE_SKIP_EFFECTS=name,name` disables effects by name;
+`WP_DEBUG_DUMP_FRAME=path` saves the last GPU frame headlessly, which is the
+only way to inspect the live path off-screen.
 
-- renderable scene objects
-- material passes
-- effect passes
-- texture bindings
-- render target/FBO descriptors
-- copy/swap/effect pass commands
-- final composite metadata
-- missing-feature diagnostics
+### 8. Web Wallpapers
 
-This is the bridge between Wallpaper Engine's pass model and `wgpu` execution.
+`src/render/web.rs` renders HTML wallpapers with an embedded Chromium through
+CEF, off-screen: each painted frame becomes an `RgbaImage` on the same channel
+video and CPU scene rendering use, so every presentation path works unchanged.
 
-### 8. Shader Translation Layer
+It also injects the Wallpaper Engine browser API that pages expect —
+`wallpaperPropertyListener.applyUserProperties` fed from `project.json`, and
+`wallpaperRegisterAudioListener` fed from live capture as 64 left plus 64 right
+bands. Behind the off-by-default `web` feature; see **Building**.
 
-`src/engine/shader.rs` owns shader compatibility work.
-
-The current strategy is:
-
-- resolve material shader names using the original convention:
-  `shaders/<name>.vert` and `shaders/<name>.frag`
-- run GLSL/WGSL sources through Naga
-- emit WGSL when translation succeeds
-- record diagnostics when translation fails
-- use handwritten WGSL fallbacks for known/common passes
-
-The translator is only one part of compatibility. Wallpaper Engine shaders also
-need engine-provided uniforms, texture/sampler bindings, render targets,
-preprocessor defines, and include handling.
-
-### 9. WGPU Scene Renderer
-
-`src/render/wgpu_scene.rs` is the first GPU vertical slice.
-
-It currently:
-
-- builds the scene graph and render graph
-- selects the first model-backed image layer
-- loads its resolved base texture
-- probes the material shader through the Naga translator
-- creates a `wgpu` pipeline using a built-in textured-quad WGSL fallback
-- draws into an offscreen `wgpu::Texture`
-- reads the texture back to RGBA for CLI PNG output
-
-This path is intentionally separate from the live wallpaper frame loop while the
-port is still young.
-
-Run it with:
-
-```bash
-cargo run -- render-scene <workshop-id-or-directory> --gpu --output gpu_scene.png
-```
-
-### 10. CPU Fallback Renderer
+### 9. CPU Fallback Renderer
 
 `src/engine/render.rs` keeps the older CPU compositor alive.
 
@@ -177,18 +153,30 @@ cargo run -- render-scene <workshop-id-or-directory> --output scene_output.png
 The CPU path is not feature-equivalent to Wallpaper Engine, but it remains useful
 for smoke tests and as a stable fallback while the `wgpu` renderer grows.
 
-### 11. Live Output
+### 10. Live Output
 
-Scene wallpapers render on the GPU and present **directly into the Wayland
-layer-shell surface** through a `wgpu::Surface` — no CPU readback, no SHM
+`src/platform/display.rs` picks a backend at runtime: Wayland when
+`WAYLAND_DISPLAY`/`WAYLAND_SOCKET` is set, else X11 when `DISPLAY` is, else
+macOS. `WP_ENGINE_FORCE_X11=1` takes the X11 path even under a Wayland session.
+
+On **Wayland**, scene wallpapers render on the GPU and present *directly into
+the layer-shell surface* through a `wgpu::Surface` — no CPU readback, no SHM
 copy. `src/platform/wayland` creates the surface from the `wl_surface` raw
-handle; if surface creation fails (or `WP_ENGINE_FORCE_SHM` is set) the
-renderer falls back to RGBA readback + SHM buffers.
+handle; if that fails (or `WP_ENGINE_FORCE_SHM` is set) it falls back to RGBA
+readback + SHM buffers. The same module feeds the real cursor position into
+camera parallax and `g_PointerPosition`.
 
-Static images and videos flow through `src/render/frame.rs` frame sources and
-the SHM path.
+On **X11**, `src/platform/x11` draws into the root window's background pixmap
+and publishes `_XROOTPMAP_ID`/`ESETROOT_PMAP_ID`, the convention every WM and
+compositor honours (it is what `feh --bg` sets). There is no direct-presentation
+equivalent, so every frame is read back and pushed with `PutImage`. X11 gets
+better parallax for free: `QueryPointer` reports the global cursor regardless of
+which window has focus.
 
-### 12. Application Lifecycle
+Static images, videos, and web wallpapers flow through `src/render/frame.rs`
+frame sources.
+
+### 11. Application Lifecycle
 
 `src/application` owns the run flow (the Rust counterpart of the C++
 `WallpaperApplication`): `ApplicationContext` carries the background path,
@@ -197,7 +185,7 @@ the SHM path.
 renderer, and block until SIGINT/SIGTERM. `main.rs` `set`/`set-file`
 delegate to it.
 
-### 13. User Properties
+### 12. User Properties
 
 `src/engine/properties.rs` loads `project.json` `general.properties`,
 applies `--set-property NAME=VALUE` overrides, and rewrites `{"user": ...}`
@@ -205,7 +193,7 @@ references inside `scene.json` before parsing — the Rust counterpart of the
 reference `PropertyParser`/`UserSettingParser`. `wp-engine list-properties
 <id>` lists what a wallpaper exposes.
 
-### 14. Camera Dynamics
+### 13. Camera Dynamics
 
 `src/engine/camera_dynamics.rs` implements scene-level `camerashake`,
 `camerafade`, and `cameraparallax` from the resolved general settings. Shake
@@ -219,36 +207,65 @@ Implemented:
 - asset store for loose files and PKG archives
 - tolerant `scene.json` parsing with user-property resolution
 - model/material/effect parsing
-- backend-neutral scene graph + render graph
-- GLSL→WGSL shader translation (shaderc + naga) with std140 uniform packing
-- full effect pass chaining: ping-pong FBOs, named effect FBOs
-  (`target`/`bind`), multi-pass effects, quarter/eighth-res bloom chain
-- per-object quad placement (WE scene coordinates, Y-up)
-- camera shake / fade / parallax
-- direct GPU presentation to Wayland (wgpu surface on layer-shell)
+- GLSL→WGSL shader translation (shaderc + Naga) with std140 uniform packing and
+  the legacy-GLSL repair passes real workshop shaders need
+- full effect pass chaining: ping-pong FBOs, named effect FBOs (`target`/`bind`),
+  multi-pass effects, per-object composite buffers, reference bloom chain
+- per-object quad placement (WE scene coordinates, Y-up), layer alignment,
+  parent-chain transforms, true z-order interleaving
+- particles: every emitter/initializer/operator/renderer type the corpus uses,
+  including rope/trail renderers, textured sprites, child systems, and
+  audio-reactive emission
+- puppet `.mdl` mesh loading with bones, skinning, and animation layers
+- text objects: system + bundled fonts, wrapping, alignment, backgrounds
+- light and sound objects
+- SceneScript property scripting (text, alpha, visible, scale, origin, angles)
+- audio reactivity: desktop capture → FFT → `g_AudioSpectrum*` uniforms
+- camera shake / fade / parallax, driven by the real cursor
+- 3D perspective scenes with meshes
+- video wallpapers, and embedded-video `.tex` layers, streamed with FFmpeg
+- web (HTML) wallpapers via CEF, with the WE browser API bridge
+  (`wallpaperPropertyListener`, `wallpaperRegisterAudioListener`)
+- presentation: Wayland layer-shell (direct `wgpu::Surface`, no readback),
+  X11 root pixmap, macOS desktop window, CPU/SHM fallback everywhere
 - application lifecycle (`WallpaperApplication`, `--set-property`, signals)
-- CPU fallback compositor + SHM fallback path
 
 Still pending:
 
-- real model/puppet mesh loading (bones, skinning)
-- particle simulation + rendering
-- text objects, lighting/shadow atlas
-- mouse input → parallax/pointer uniforms (parallax rests at center for now)
-- audio-reactive uniforms (FFT), sound playback
-- JavaScript scene scripting (current evaluator handles simple `update()` returns)
-- web (CEF) wallpapers, MPRIS media integration, X11 backend
 - **screen-space backdrop capture** for refraction/distortion effects
   (waterripple/waterflow): their hidden `g_Texture0` is meant to sample the scene
   behind the layer, but we default it to the layer's own base texture, so water
-  effects distort themselves. Currently softened with a brightness band-aid — see
-  PROGRESS.md "Ripple / water refraction".
+  effects distort themselves. Currently softened with a brightness band-aid.
+- MPRIS media integration, and the media/plugin halves of the web JS bridge
+- mouse/keyboard input forwarding into web wallpapers (they render, but do not
+  respond to the cursor); web wallpapers also render at a fixed 1080p
+- per-object cameras (3 wallpapers in the local corpus)
+- normal-mapped lighting, shadows, volumetrics, GPU instancing, and a true depth
+  buffer — all measured against the corpus and found to have zero or near-zero
+  reach, so they are deliberately not planned rather than merely missing
+
+Out of scope:
+
+- **Windows.** The renderer is portable (wgpu), but there is no `WorkerW`
+  platform module and no way to test one from the Linux/macOS development
+  environment. `application` (Windows-only `.exe`) wallpapers likewise.
 
 Debugging aids:
 
-- `wp-engine test-scene <id>` — headless animation check, dumps frames to /tmp
-- `WP_ENGINE_SKIP_EFFECTS=name1,name2` — disable specific effects
+- `wp-engine test-scene <id>` — headless animation check
+- `WP_DEBUG_DUMP_FRAME=path` — save the last GPU frame (the only way to inspect
+  the live path off-screen)
+- `WP_DEBUG_DUMP_FBOS=1` — dump every pooled render target per frame
+- `WP_DEBUG_DUMP_WGSL=1` / `WP_DEBUG_DUMP_GLSL=1` — dump translated WGSL, or the
+  generated GLSL of any shader that fails to compile
+- `WP_DEBUG_TEX_SLOTS=1` — dump effect texture-slot resolution
+- `WP_DEBUG_PARTICLE_TIMING=1` — per-system particle cost, for "why is this slow"
+- `WP_ENGINE_SKIP_EFFECTS=name1,name2` — disable specific effects. Note the
+  hardcoded kernels (pulse/scroll/shake/tint/opacity/waterripple/waterwaves/spin)
+  never log a load line, so read the object's effect list from `scene.json`
+  rather than trusting the log when bisecting.
 - `WP_ENGINE_FORCE_SHM=1` — force the CPU/SHM presentation path
+- `WP_ENGINE_FORCE_X11=1` — take the X11 path even under a Wayland session
 
 ## Building
 
@@ -264,7 +281,26 @@ can't fetch them like a crate:
     `.cargo/config.toml` `[env]` block. Keep that file out of version control —
     a committed global path would break Linux builds.
 - **FFmpeg** — video-wallpaper decoding: `apt install ffmpeg` / `brew install
-  ffmpeg`.
+  ffmpeg`. Version 9 or newer; `ffmpeg-next` is pinned to match, and older
+  system FFmpeg will fail to build the bindings.
+
+### Web wallpapers (optional)
+
+Web (HTML) wallpapers need an embedded Chromium and are behind an off-by-default
+cargo feature:
+
+```bash
+cargo build --features web
+```
+
+The first such build downloads the CEF binary distribution (~400 MB extracted)
+and places `libcef.so`, Chromium's `.pak` resource blobs, and `locales/` beside
+the built binary; `build.rs` adds an `$ORIGIN` rpath so it finds them. Set
+`CEF_PATH` to reuse an existing CEF distribution instead of downloading one.
+
+Keep the feature off unless you need web wallpapers — the default build touches
+none of this. Without it, web wallpapers report that the binary lacks web
+support rather than failing obscurely.
 
 ## Development Checks
 

@@ -57,13 +57,25 @@ pub trait DisplayPlatform {
 
 /// Detect the current display platform at runtime and return a boxed implementation.
 ///
-/// On Linux, checks `WAYLAND_DISPLAY` or `WAYLAND_SOCKET` and returns a
-/// `WaylandPlatform`. Returns an error if no supported platform is found.
+/// On Linux, prefers Wayland (`WAYLAND_DISPLAY` / `WAYLAND_SOCKET`) and falls
+/// back to X11 (`DISPLAY`). Wayland wins when both are set, which is the normal
+/// state under XWayland — the native path presents without a CPU readback.
+/// Set `WP_ENGINE_FORCE_X11=1` to take the X11 path anyway.
 pub fn detect_platform() -> Box<dyn DisplayPlatform> {
     #[cfg(target_os = "linux")]
-    if std::env::var("WAYLAND_DISPLAY").is_ok() || std::env::var("WAYLAND_SOCKET").is_ok() {
-        tracing::debug!(target: "platform", "detected Wayland display platform");
-        return Box::new(super::wayland::WaylandPlatform);
+    {
+        let force_x11 = std::env::var_os("WP_ENGINE_FORCE_X11").is_some();
+        let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_SOCKET").is_some();
+
+        if has_wayland && !force_x11 {
+            tracing::debug!(target: "platform", "detected Wayland display platform");
+            return Box::new(super::wayland::WaylandPlatform);
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            tracing::debug!(target: "platform", "detected X11 display platform");
+            return Box::new(super::x11::X11Platform);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -74,14 +86,14 @@ pub fn detect_platform() -> Box<dyn DisplayPlatform> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        tracing::error!(target: "platform", "no supported display platform detected (WAYLAND_DISPLAY/WAYLAND_SOCKET unset)");
+        tracing::error!(target: "platform", "no supported display platform detected (WAYLAND_DISPLAY/WAYLAND_SOCKET/DISPLAY unset)");
         eprintln!(
             "error: no supported display platform detected.\n\
-             wp-engine requires a Wayland compositor with wlr-layer-shell support.\n\
-             (WAYLAND_DISPLAY and WAYLAND_SOCKET are both unset)\n\
+             wp-engine needs either a Wayland compositor with wlr-layer-shell\n\
+             support, or an X11 display.\n\
+             (WAYLAND_DISPLAY, WAYLAND_SOCKET and DISPLAY are all unset)\n\
              \n\
-             Supported compositors: Sway, Hyprland, river, labwc, wayfire, etc.\n\
-             X11 is not yet supported."
+             Wayland compositors: Sway, Hyprland, river, labwc, wayfire, etc."
         );
         std::process::exit(1);
     }

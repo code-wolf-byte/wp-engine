@@ -101,6 +101,14 @@ enum Command {
 }
 
 fn main() {
+    // CEF launches its renderer/GPU/utility processes by re-executing THIS
+    // binary with `--type=...`. That must be handled before anything else —
+    // before clap, which would reject the flag, and before any thread starts.
+    // Returns `Some` only in a child process, which must then exit at once.
+    if let Some(code) = wp_engine::render::web::subprocess_main() {
+        std::process::exit(code);
+    }
+
     let cli = Cli::parse();
     wp_engine::logging::init(cli.verbose);
     tracing::debug!(target: "cli", verbosity = cli.verbose, "wp-engine starting");
@@ -367,6 +375,11 @@ fn cmd_tex_info(path: &std::path::Path, save: Option<&std::path::Path>) -> Resul
     println!("Image size:   {}x{}", tex.image_width, tex.image_height);
     println!("Texture size: {}x{}", tex.texture_width, tex.texture_height);
     println!("Flags:        0x{:x}", tex.flags());
+    println!(
+        "Frames:       {} (animated: {})",
+        tex.frames().len(),
+        tex.is_animated()
+    );
     if let Some(out) = save {
         let img = tex.to_rgba()?;
         img.save(out)?;

@@ -17,8 +17,10 @@ pub enum WallpaperContent {
     Video { path: PathBuf },
     /// A scene wallpaper — rendered by compositing decoded .tex layers.
     Scene { dir: PathBuf },
+    /// A web wallpaper — an HTML entry point rendered off-screen by CEF.
+    /// Only renderable when built with the `web` feature.
+    Web { html: PathBuf },
     // Future variants (not yet implemented):
-    // Web   { html: PathBuf },
     // Application { exe: PathBuf },
 }
 
@@ -41,7 +43,18 @@ impl WallpaperContent {
                     ))
                 }
             }
-            WallpaperType::Web => Err(anyhow!("web wallpapers are not yet supported")),
+            WallpaperType::Web => {
+                let html = w
+                    .wallpaper_file()
+                    .ok_or_else(|| anyhow!("web wallpaper has no file field in project.json"))?;
+                if !html.exists() {
+                    return Err(anyhow!(
+                        "web wallpaper entry point not found: {}",
+                        html.display()
+                    ));
+                }
+                Ok(WallpaperContent::Web { html })
+            }
             WallpaperType::Application => Err(anyhow!("application wallpapers are Windows-only")),
             WallpaperType::Video | WallpaperType::Unknown => {
                 let path = w
@@ -100,6 +113,12 @@ impl WallpaperContent {
                 tracing::debug!(target: "content", %ext, "resolved as video wallpaper");
                 Ok(WallpaperContent::Video {
                     path: path.to_owned(),
+                })
+            }
+            "html" | "htm" => {
+                tracing::debug!(target: "content", %ext, "resolved as web wallpaper");
+                Ok(WallpaperContent::Web {
+                    html: path.to_owned(),
                 })
             }
             _ => {

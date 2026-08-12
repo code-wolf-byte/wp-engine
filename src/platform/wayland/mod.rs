@@ -6,10 +6,15 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
     shell::wlr_layer::{
         Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
     },
@@ -22,7 +27,7 @@ use std::sync::{mpsc::SyncSender, Arc, Mutex};
 use std::thread;
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, Proxy, QueueHandle,
 };
 
@@ -136,9 +141,13 @@ struct WallpaperSurface {
 struct WallpaperState {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
     compositor_state: CompositorState,
     shm: Shm,
     layer_shell: LayerShell,
+    /// Pointer for the first seat that advertises one — drives camera parallax
+    /// and `g_PointerPosition`.
+    pointer: Option<wl_pointer::WlPointer>,
     surfaces: Vec<WallpaperSurface>,
     renderer: ContentRenderer,
     gpu_scaler: platform::GpuScaler,
@@ -476,13 +485,16 @@ fn wallpaper_loop(
         anyhow!("compositor does not support zwlr_layer_shell_v1 (wlr-layer-shell)")
     })?;
     let registry_state = RegistryState::new(&globals);
+    let seat_state = SeatState::new(&globals, &qh);
 
     let mut state = WallpaperState {
         registry_state,
         output_state,
+        seat_state,
         compositor_state,
         shm,
         layer_shell,
+        pointer: None,
         surfaces: Vec::new(),
         renderer,
         gpu_scaler,
@@ -638,15 +650,140 @@ impl ShmHandler for WallpaperState {
     }
 }
 
+impl SeatHandler for WallpaperState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        // ponytail: one pointer, first seat that offers one. Multi-seat setups
+        // would need a pointer per seat; nobody runs a wallpaper on two.
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(e) => {
+                    tracing::warn!(target: "wallpaper", "cannot get wl_pointer ({e}); parallax stays centered")
+                }
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for WallpaperState {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            // Leave keeps the last position rather than snapping back to
+            // centre — the cursor moving onto a window shouldn't yank the
+            // parallax. Presses/axis aren't wired to anything yet.
+            if !matches!(
+                event.kind,
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
+            ) {
+                continue;
+            }
+            let Some(surface) = self
+                .surfaces
+                .iter()
+                .find(|s| s.layer.wl_surface() == &event.surface)
+            else {
+                continue;
+            };
+            if surface.width == 0 || surface.height == 0 {
+                continue;
+            }
+
+            let norm = pointer_norm(event.position, surface.width, surface.height);
+
+            // ponytail: only tracks while the cursor is over our own layer
+            // surface. The reference additionally queries Hyprland's IPC socket
+            // for a global cursor when another window has it; add that (or the
+            // equivalent per-compositor call) if parallax-under-windows matters.
+            if let ContentRenderer::Scene(scene) = &mut self.renderer {
+                scene.set_mouse(norm);
+            }
+        }
+    }
+}
+
+/// Surface-local pointer coordinates → the `[0,1]²` pair the engine wants for
+/// `g_PointerPosition` and camera parallax.
+///
+/// Top-origin, i.e. y=0 is the top edge. That matches the reference by way of a
+/// double negative: `WaylandMouseInput::update` stores `size.y - localY`
+/// (bottom-origin) and `CScene::updateMouse` then computes
+/// `mouseY = 1.0 - normalizedMouseY`, putting it back. Only
+/// `m_mousePositionNormalized` (particles, the scripting `input` object) stays
+/// bottom-origin — `m_mousePosition`, which feeds both uniforms we care about
+/// here, does not.
+fn pointer_norm(position: (f64, f64), width: u32, height: u32) -> [f32; 2] {
+    [
+        (position.0 as f32 / width as f32).clamp(0.0, 1.0),
+        (position.1 as f32 / height as f32).clamp(0.0, 1.0),
+    ]
+}
+
 impl ProvidesRegistryState for WallpaperState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers!(OutputState);
+    registry_handlers!(OutputState, SeatState);
 }
 
 delegate_compositor!(WallpaperState);
 delegate_output!(WallpaperState);
 delegate_shm!(WallpaperState);
 delegate_layer!(WallpaperState);
+delegate_seat!(WallpaperState);
+delegate_pointer!(WallpaperState);
 delegate_registry!(WallpaperState);
+
+#[cfg(test)]
+mod tests {
+    use super::pointer_norm;
+
+    #[test]
+    fn pointer_norm_is_top_origin_and_clamped() {
+        // Top-left of the surface maps to (0,0), bottom-right to (1,1).
+        // If someone "fixes" the Y axis to bottom-origin, this flips and
+        // every parallax wallpaper drifts the wrong way vertically.
+        assert_eq!(pointer_norm((0.0, 0.0), 1920, 1080), [0.0, 0.0]);
+        assert_eq!(pointer_norm((1920.0, 1080.0), 1920, 1080), [1.0, 1.0]);
+        assert_eq!(pointer_norm((960.0, 540.0), 1920, 1080), [0.5, 0.5]);
+
+        // A quarter of the way down is 0.25, not 0.75.
+        assert_eq!(pointer_norm((0.0, 270.0), 1920, 1080), [0.0, 0.25]);
+
+        // Compositors can report positions outside the surface during drags.
+        assert_eq!(pointer_norm((-40.0, 5000.0), 1920, 1080), [0.0, 1.0]);
+    }
+}

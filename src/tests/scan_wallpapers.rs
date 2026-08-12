@@ -83,7 +83,7 @@ fn run_with_timeout(binary: &str, wp_path: &str, timeout: Duration) -> String {
 fn classify(output: &str) -> Status {
     if output.contains("PASS:") {
         Status::Pass
-    } else if output.contains("not animating") {
+    } else if output.contains("not animating") || output.contains("appears static") {
         Status::Static
     } else {
         Status::Fail

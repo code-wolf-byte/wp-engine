@@ -2,6 +2,7 @@ pub mod content;
 pub mod ffmpeg;
 pub mod frame;
 pub mod settings;
+pub mod web;
 
 pub use content::WallpaperContent;
 pub use frame::FrameSource;

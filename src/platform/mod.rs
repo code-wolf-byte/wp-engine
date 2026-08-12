@@ -8,6 +8,8 @@ pub mod platform_info;
 pub mod scaler;
 #[cfg(target_os = "linux")]
 pub mod wayland;
+#[cfg(target_os = "linux")]
+pub mod x11;
 
 pub use device::GpuDevice;
 pub use display::{detect_platform, WallpaperHandle};
