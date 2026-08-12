@@ -1,5 +1,31 @@
 # wp-engine
 
+<p>
+  <a href="LICENSE"><img alt="Licence: GPL-3.0-only" src="https://img.shields.io/badge/licence-GPL--3.0--only-blue?style=flat-square"></a>
+  <img alt="Written in Rust, 2021 edition" src="https://img.shields.io/badge/Rust-2021_edition-CE422B?style=flat-square&logo=rust&logoColor=white">
+  <img alt="Top language" src="https://img.shields.io/github/languages/top/code-wolf-byte/wp-engine?style=flat-square">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/code-wolf-byte/wp-engine?style=flat-square">
+</p>
+
+**Renders**&nbsp;
+<img alt="Scene wallpapers" src="https://img.shields.io/badge/scene-8A2BE2?style=flat-square">
+<img alt="Video wallpapers" src="https://img.shields.io/badge/video-1E6FD9?style=flat-square">
+<img alt="Image wallpapers" src="https://img.shields.io/badge/image-2E8B57?style=flat-square">
+<img alt="Web wallpapers, optional feature" src="https://img.shields.io/badge/web-optional-4285F4?style=flat-square&logo=googlechrome&logoColor=white">
+
+**Presents on**&nbsp;
+<img alt="Wayland via wlr-layer-shell" src="https://img.shields.io/badge/Wayland-layer--shell-FFBC00?style=flat-square">
+<img alt="X11 via root pixmap" src="https://img.shields.io/badge/X11-root_pixmap-F28834?style=flat-square">
+<img alt="macOS desktop window" src="https://img.shields.io/badge/macOS-desktop_window-333333?style=flat-square&logo=apple&logoColor=white">
+
+**Built on**&nbsp;
+<img alt="wgpu 27" src="https://img.shields.io/badge/wgpu-27-4A5568?style=flat-square">
+<img alt="Vulkan backend" src="https://img.shields.io/badge/Vulkan-A41E22?style=flat-square&logo=vulkan&logoColor=white">
+<img alt="Metal backend" src="https://img.shields.io/badge/Metal-333333?style=flat-square&logo=apple&logoColor=white">
+<img alt="shaderc and Naga for shader translation" src="https://img.shields.io/badge/shaderc_%2B_Naga-GLSL_%E2%86%92_WGSL-5C6BC0?style=flat-square">
+<img alt="FFmpeg 9" src="https://img.shields.io/badge/FFmpeg-9-007808?style=flat-square&logo=ffmpeg&logoColor=white">
+<img alt="egui for the GUI" src="https://img.shields.io/badge/egui-0.33-1A1A1A?style=flat-square">
+
 `wp-engine` is a Rust Wallpaper Engine client. The scene-wallpaper renderer is
 ported from [linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine)
 to a `wgpu` backend, keeping a CPU RGBA compositor as a fallback.
