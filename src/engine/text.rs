@@ -135,6 +135,7 @@ pub fn wrap_text(
     point_size: f32,
     max_width: f32,
     max_rows: usize,
+    ellipsis: bool,
 ) -> String {
     let Some(font) = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).ok()
     else {
@@ -165,6 +166,12 @@ pub fn wrap_text(
     }
     if max_rows > 0 && out.len() > max_rows {
         out.truncate(max_rows);
+        // `limituseellipsis`: mark the clip instead of cutting mid-thought.
+        if ellipsis {
+            if let Some(last) = out.last_mut() {
+                last.push('…');
+            }
+        }
     }
     out.join("\n")
 }
@@ -264,6 +271,19 @@ fn find_system_font() -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `limituseellipsis` marks a row-clipped block instead of cutting it
+    /// silently; without the gate the text is hard-truncated.
+    #[test]
+    fn ellipsis_marks_clipped_text() {
+        let f = test_font();
+        let long = "aaa bbb ccc ddd eee fff ggg hhh";
+        let clipped = wrap_text(&f, long, 24.0, 60.0, 1, false);
+        let ellipsed = wrap_text(&f, long, 24.0, 60.0, 1, true);
+        assert!(!clipped.ends_with('…'), "gate off: no ellipsis");
+        assert!(ellipsed.ends_with('…'), "gate on: ellipsis appended");
+        assert_eq!(clipped.lines().count(), 1, "maxrows still clips to 1 row");
+    }
 
     fn test_font() -> Vec<u8> {
         find_system_font().expect("a system font must be available to test rasterization")

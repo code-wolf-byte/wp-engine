@@ -36,6 +36,9 @@ pub struct ResolvedScene {
     /// Static 3D mesh objects (`model` → `.mdl`) — only genuine perspective
     /// scenes have these; the 2D compositor ignores them.
     pub mesh3d_layers: Vec<Mesh3dLayer>,
+    /// Parent chain + transform scripts per object, for the live path's
+    /// per-frame recompose. See [`TransformGraph`].
+    pub transform_graph: TransformGraph,
     pub scene: Scene,
 }
 
@@ -51,10 +54,20 @@ pub struct Mesh3dLayer {
     pub origin: [f32; 3],
     pub scale: [f32; 3],
     pub angles: [f32; 3],
+    /// The same three before `apply_parent_transforms` composed the parent
+    /// chain in. A script-driven parent moves per frame, so the live path
+    /// recomposes from these rather than trying to invert the baked world value.
+    pub local_origin: [f32; 3],
+    pub local_scale: [f32; 3],
+    pub local_angles: [f32; 3],
     /// The material's `"cullmode": "nocull"` — draw both faces. Everything
     /// else culls back faces, which is what lets a skybox's near hemisphere
     /// drop out instead of hiding the whole scene inside it.
     pub nocull: bool,
+    /// `depthtest: "disabled"` on the object (or its material pass) — draw
+    /// without depth comparison. Real content always leaves it enabled; this
+    /// exists so content that disables it isn't silently depth-culled.
+    pub depthtest: bool,
     pub order_index: usize,
 }
 
@@ -68,6 +81,8 @@ pub struct ParticleLayer {
     /// same convention as `Layer::origin`; callers convert to pixel space at
     /// render time (`px = origin.x`, `py = height - origin.y`).
     pub origin: [f64; 3],
+    /// `origin` before the parent chain was composed in (see `Layer`).
+    pub local_origin: [f64; 3],
     pub parallax_depth: [f64; 2],
     pub config: particle::ParticleConfig,
     pub overrides: Option<particle::InstanceOverride>,
@@ -132,6 +147,12 @@ pub struct Layer {
     pub origin: [f64; 3],
     pub size: [f64; 3],
     pub scale: [f64; 3], // WE scale multiplier (default 1.0), separate from size
+    /// `origin`/`scale`/`angles` before `apply_parent_transforms` composed the
+    /// parent chain in — the live path recomposes from these each frame when a
+    /// parent is script-driven. See `ResolvedScene::transform_graph`.
+    pub local_origin: [f64; 3],
+    pub local_scale: [f64; 3],
+    pub local_angles: [f32; 3],
     pub parallax_depth: [f64; 2],
     /// z-rotation in radians (WE `angles.z`; the JSON value is already in radians).
     pub angle: f32,
@@ -163,6 +184,10 @@ pub struct Layer {
     /// This object's raw index in `scene.objects` — see
     /// `ParticleLayer::order_index`.
     pub order_index: usize,
+    /// The scene object's own `id`. Effects reference another object's
+    /// rendered output as `_rt_imageLayerComposite_<id>_a`, so the live path
+    /// needs to know which layer each id belongs to.
+    pub object_id: Option<i64>,
     /// Inline SceneScripts driving `visible`/`scale`/`origin`/`angles`, if any.
     /// Evaluated per frame by the live GPU path (see `GpuSceneInstance::render`).
     pub transform_scripts: TransformScripts,
@@ -353,7 +378,11 @@ impl ResolvedScene {
                     LoadedImage::single(placeholder_for(obj))
                 }
                 Some(path) if is_solid_layer_path(path) => {
-                    solid_indices.push(layers.len());
+                    // Scene-size expansion is for effect chains only — see
+                    // fill_solid_layer_sizes.
+                    if !obj.effects.is_empty() {
+                        solid_indices.push(layers.len());
+                    }
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
@@ -379,13 +408,19 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
+        apply_parent_transforms(
+            &scene,
+            &mut layers,
+            &mut particle_layers,
+            &mut mesh3d_layers,
+        );
         Ok(Self {
             width,
             height,
             layers,
             particle_layers,
             mesh3d_layers,
+            transform_graph: build_transform_graph(&scene),
             scene,
         })
     }
@@ -443,7 +478,11 @@ impl ResolvedScene {
                     LoadedImage::single(placeholder_for(obj))
                 }
                 Some(path) if is_solid_layer_path(path) => {
-                    solid_indices.push(layers.len());
+                    // Scene-size expansion is for effect chains only — see
+                    // fill_solid_layer_sizes.
+                    if !obj.effects.is_empty() {
+                        solid_indices.push(layers.len());
+                    }
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
@@ -472,13 +511,19 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
+        apply_parent_transforms(
+            &scene,
+            &mut layers,
+            &mut particle_layers,
+            &mut mesh3d_layers,
+        );
         Ok(Self {
             width,
             height,
             layers,
             particle_layers,
             mesh3d_layers,
+            transform_graph: build_transform_graph(&scene),
             scene,
         })
     }
@@ -537,7 +582,11 @@ impl ResolvedScene {
                     LoadedImage::single(placeholder_for(obj))
                 }
                 Some(path) if is_solid_layer_path(path) => {
-                    solid_indices.push(layers.len());
+                    // Scene-size expansion is for effect chains only — see
+                    // fill_solid_layer_sizes.
+                    if !obj.effects.is_empty() {
+                        solid_indices.push(layers.len());
+                    }
                     LoadedImage::single(white_pixel())
                 }
                 Some(path) => {
@@ -562,13 +611,19 @@ impl ResolvedScene {
 
         let (width, height) = guess_scene_dimensions(&scene, &layers);
         fill_solid_layer_sizes(&mut layers, &solid_indices, width, height);
-        apply_parent_transforms(&scene, &mut layers, &mut particle_layers);
+        apply_parent_transforms(
+            &scene,
+            &mut layers,
+            &mut particle_layers,
+            &mut mesh3d_layers,
+        );
         Ok(Self {
             width,
             height,
             layers,
             particle_layers,
             mesh3d_layers,
+            transform_graph: build_transform_graph(&scene),
             scene,
         })
     }
@@ -836,18 +891,26 @@ fn layer_from_object(
                     .enumerate()
                     .filter(|(_, e)| e.get("visible").and_then(|v| v.as_bool()).unwrap_or(true))
                     .map(|(i, e)| {
-                        // The `animation` id doesn't map to an MDLA index (no
-                        // ids parsed), so resolve it as an index if in range,
-                        // else by declaration order — clamped to what exists.
+                        // `animation` is the MDLA record's own id (2321732083's
+                        // samurai layers name 60/63/80/105). Match it; fall back
+                        // to index-then-declaration-order for files whose ids we
+                        // failed to read.
                         let raw = e
                             .get("animation")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(i as u64);
-                        let anim_idx = if (raw as usize) < n {
-                            raw as usize
-                        } else {
-                            i.min(n - 1)
-                        };
+                        let anim_idx = rt
+                            .model
+                            .animations
+                            .iter()
+                            .position(|a| a.id as u64 == raw)
+                            .unwrap_or_else(|| {
+                                if (raw as usize) < n {
+                                    raw as usize
+                                } else {
+                                    i.min(n - 1)
+                                }
+                            });
                         crate::engine::puppet::AnimLayer {
                             anim_idx,
                             additive: e.get("additive").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -977,6 +1040,9 @@ fn layer_from_object(
             obj.parsed_size()
         },
         scale,
+        local_origin: origin,
+        local_scale: scale,
+        local_angles: angles3,
         parallax_depth: parallax,
         angle,
         angles: angles3,
@@ -1001,6 +1067,7 @@ fn layer_from_object(
         video: loaded.video,
         text_dynamic: None,
         order_index: 0,
+        object_id: obj.id,
         transform_scripts,
         visible_base: obj.is_visible(),
     }
@@ -1187,6 +1254,7 @@ fn particle_layer_from_object(
     Some(ParticleLayer {
         name: obj.name.clone().unwrap_or_default(),
         origin: obj.parsed_origin(),
+        local_origin: obj.parsed_origin(),
         parallax_depth,
         config,
         overrides,
@@ -1282,20 +1350,34 @@ fn text_layer_from_object(
     let font_data = super::text::resolve_font_data(obj.font.as_deref(), dir, pkg)?;
     // Word-wrap to `maxwidth` (scene px == bitmap px at our raster resolution)
     // and cap at `maxrows`, if authored.
+    let gate = |v: &Option<serde_json::Value>| {
+        v.as_ref()
+            .and_then(crate::engine::scene::parse_value_bool)
+            .unwrap_or(false)
+    };
     let text_str = match obj
         .maxwidth
         .as_ref()
         .and_then(crate::engine::scene::parse_value_f32)
         .filter(|w| *w > 0.0)
+        .filter(|_| gate(&obj.limitwidth))
     {
         Some(mw) => {
             let rows = obj
                 .maxrows
                 .as_ref()
                 .and_then(crate::engine::scene::parse_value_f32)
+                .filter(|_| gate(&obj.limitrows))
                 .unwrap_or(0.0)
                 .max(0.0) as usize;
-            super::text::wrap_text(&font_data, &text_str, raster_px, mw, rows)
+            super::text::wrap_text(
+                &font_data,
+                &text_str,
+                raster_px,
+                mw,
+                rows,
+                gate(&obj.limituseellipsis),
+            )
         }
         None => text_str,
     };
@@ -1434,6 +1516,14 @@ fn mesh3d_layer_from_object(
         .as_ref()
         .and_then(|p| p.get("cullmode")?.as_str())
         .is_some_and(|m| m == "nocull");
+    // The object's own `depthtest` wins over the material pass's.
+    let depthtest = obj
+        .depthtest
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .or_else(|| pass.as_ref().and_then(|p| p.get("depthtest")?.as_str()))
+        .map(|m| m != "disabled")
+        .unwrap_or(true);
 
     let scale = obj
         .scale
@@ -1461,7 +1551,11 @@ fn mesh3d_layer_from_object(
         origin: [o[0] as f32, o[1] as f32, o[2] as f32],
         scale,
         angles,
+        local_origin: [o[0] as f32, o[1] as f32, o[2] as f32],
+        local_scale: scale,
+        local_angles: angles,
         nocull,
+        depthtest,
         order_index: 0,
     })
 }
@@ -1856,12 +1950,32 @@ fn chain_has_spritesheet(json_path: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>
         .is_some_and(|passes| {
             passes.iter().any(|pass| {
                 pass.get("combos")
-                    .and_then(|c| c.get("SPRITESHEET"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(|c| c.as_object())
+                    // Materials spell it both "SPRITESHEET" and "spritesheet".
+                    .and_then(|c| {
+                        c.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("spritesheet"))
+                            .and_then(|(_, v)| v.as_i64())
+                    })
                     .unwrap_or(0)
                     != 0
             })
         })
+}
+
+/// A model chain's texture, as a layer image. An animated `.tex` (TEXS frame
+/// table + the IsGif flag) keeps its frames so the layer plays them —
+/// otherwise the whole atlas gets squeezed into the one-cell quad, which is
+/// how 2325500626's bonfire rendered as a 16-up contact sheet.
+fn loaded_from_chain_tex(
+    tex: &TexFile,
+    json_path: &str,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<LoadedImage> {
+    if tex.is_animated() {
+        return LoadedImage::from_tex(tex);
+    }
+    Ok(apply_puppet_mesh(tex.to_rgba()?, json_path, read))
 }
 
 fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage> {
@@ -1871,13 +1985,12 @@ fn resolve_model_chain_pkg(pkg: &Package, json_path: &str) -> Result<LoadedImage
         // an embedded-video texture — stream it instead of puppet handling.
         return video_tex_to_loaded(&tex, bytes);
     }
-    let atlas = tex.to_rgba()?;
     let read = |rel: &str| {
         pkg.get(rel)
             .map(|d| d.to_vec())
             .or_else(|| read_from_global_assets(rel))
     };
-    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    let mut loaded = loaded_from_chain_tex(&tex, json_path, &read)?;
     if chain_has_spritesheet(json_path, &read) {
         loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
     }
@@ -1889,13 +2002,12 @@ fn resolve_model_chain_dir(dir: &Path, json_path: &str) -> Result<LoadedImage> {
     if let Some(bytes) = tex.video_bytes() {
         return video_tex_to_loaded(&tex, bytes);
     }
-    let atlas = tex.to_rgba()?;
     let read = |rel: &str| {
         std::fs::read(dir.join(rel))
             .ok()
             .or_else(|| read_from_global_assets(rel))
     };
-    let mut loaded = apply_puppet_mesh(atlas, json_path, &read);
+    let mut loaded = loaded_from_chain_tex(&tex, json_path, &read)?;
     if chain_has_spritesheet(json_path, &read) {
         loaded.sprite_frames = tex.to_rgba_frames().unwrap_or_default();
     }
@@ -2029,33 +2141,33 @@ fn resolve_particle_sprite_dir(
 /// An affine transform in WE scene space (Y-up), kept as decomposed
 /// translation / Euler-rotation (radians, un-negated) / scale.
 #[derive(Clone, Copy)]
-struct Xform {
-    t: [f64; 3],
-    r: [f64; 3],
-    s: [f64; 3],
+pub struct Xform {
+    pub t: [f64; 3],
+    pub r: [f64; 3],
+    pub s: [f64; 3],
 }
 
 impl Xform {
-    const IDENTITY: Xform = Xform {
+    pub const IDENTITY: Xform = Xform {
         t: [0.0; 3],
         r: [0.0; 3],
         s: [1.0, 1.0, 1.0],
     };
 
-    fn is_identity(&self) -> bool {
+    pub fn is_identity(&self) -> bool {
         self.t == [0.0; 3] && self.r == [0.0; 3] && self.s == [1.0, 1.0, 1.0]
     }
 
     /// Map a point living in a child frame into the frame this Xform is
     /// expressed in: `p' = t + R · (s ⊙ p)`.
-    fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
+    pub fn apply_point(&self, p: [f64; 3]) -> [f64; 3] {
         let scaled = [p[0] * self.s[0], p[1] * self.s[1], p[2] * self.s[2]];
         let rot = rotate_euler_f64(scaled, self.r);
         [rot[0] + self.t[0], rot[1] + self.t[1], rot[2] + self.t[2]]
     }
 
     /// `world = self (parent world) ∘ local`.
-    fn compose(&self, local: &Xform) -> Xform {
+    pub fn compose(&self, local: &Xform) -> Xform {
         Xform {
             t: self.apply_point(local.t),
             r: [
@@ -2110,6 +2222,18 @@ fn parent_index(
     id_to_idx: &HashMap<i64, usize>,
     name_to_idx: &HashMap<&str, usize>,
 ) -> Option<usize> {
+    // `disablepropagation` severs the link: the object keeps its parent for
+    // grouping/visibility but stops inheriting its transform. Every occurrence
+    // in the 197 installed scenes is `false`, so this changes nothing today —
+    // it's here so authored content that does set it behaves correctly.
+    if obj
+        .disablepropagation
+        .as_ref()
+        .and_then(crate::engine::scene::parse_value_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let p = obj.parent.as_ref()?;
     if let Some(id) = p.as_i64() {
         return id_to_idx.get(&id).copied();
@@ -2149,6 +2273,97 @@ fn world_xform(
     world
 }
 
+/// Per-object transform data the live path needs to recompose the parent chain
+/// every frame.
+///
+/// `apply_parent_transforms` bakes the chain once at load, which is right for a
+/// static parent but wrong for a scripted one: a parent node's transform can
+/// change every frame, and those nodes are usually image-less (no `Layer` at
+/// all), so their scripts never run from the layer list. This carries them.
+pub struct TransformGraph {
+    /// Resolved parent index per object (`None` = root).
+    pub parent: Vec<Option<usize>>,
+    /// Authored local transform per object — the base a script updates from.
+    pub local: Vec<Xform>,
+    /// `(origin, angles, scale)` SceneScript sources per object.
+    pub scripts: Vec<[Option<String>; 3]>,
+}
+
+impl TransformGraph {
+    /// True when at least one object's transform is script-driven AND at least
+    /// one object is parented — the only case the per-frame pass is needed for.
+    /// 189 of 197 real scenes answer `false` and skip the whole thing.
+    pub fn needs_per_frame(&self) -> bool {
+        self.parent.iter().any(Option::is_some)
+            && self.scripts.iter().any(|s| s.iter().any(Option::is_some))
+    }
+
+    /// World transform per object, composing `locals` up each parent chain.
+    pub fn world(&self, locals: &[Xform]) -> Vec<Xform> {
+        let mut memo: Vec<Option<Xform>> = vec![None; self.parent.len()];
+        (0..self.parent.len())
+            .map(|i| self.world_of(i, locals, &mut memo, 0))
+            .collect()
+    }
+
+    fn world_of(
+        &self,
+        idx: usize,
+        locals: &[Xform],
+        memo: &mut Vec<Option<Xform>>,
+        depth: u32,
+    ) -> Xform {
+        if let Some(x) = memo[idx] {
+            return x;
+        }
+        // Same 64-deep guard as the load-time walker: a malformed scene must
+        // not blow the stack.
+        let w = match self.parent[idx] {
+            Some(p) if p != idx && depth < 64 => self
+                .world_of(p, locals, memo, depth + 1)
+                .compose(&locals[idx]),
+            _ => locals[idx],
+        };
+        memo[idx] = Some(w);
+        w
+    }
+}
+
+fn build_transform_graph(scene: &Scene) -> TransformGraph {
+    let objects = &scene.objects;
+    let id_to_idx: HashMap<i64, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.id.map(|id| (id, i)))
+        .collect();
+    let name_to_idx: HashMap<&str, usize> = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| o.name.as_deref().map(|n| (n, i)))
+        .collect();
+    let script_of = |v: Option<&serde_json::Value>| {
+        v.map(crate::engine::model::json_to_animated)
+            .and_then(|a| a.script)
+    };
+    TransformGraph {
+        parent: objects
+            .iter()
+            .map(|o| parent_index(o, &id_to_idx, &name_to_idx))
+            .collect(),
+        local: objects.iter().map(obj_local_xform).collect(),
+        scripts: objects
+            .iter()
+            .map(|o| {
+                [
+                    script_of(o.origin.as_ref()),
+                    script_of(o.angles.as_ref()),
+                    script_of(o.scale.as_ref()),
+                ]
+            })
+            .collect(),
+    }
+}
+
 /// Parent world transform for object `idx` (identity if it has no parent). This
 /// is what gets applied to a layer, whose OWN local transform is already baked
 /// in by `layer_from_object`.
@@ -2172,6 +2387,7 @@ fn apply_parent_transforms(
     scene: &Scene,
     layers: &mut [Layer],
     particle_layers: &mut [ParticleLayer],
+    mesh3d_layers: &mut [Mesh3dLayer],
 ) {
     let objects = &scene.objects;
     if objects.is_empty() {
@@ -2224,6 +2440,26 @@ fn apply_parent_transforms(
             continue;
         }
         pl.origin = pw.apply_point(pl.origin);
+    }
+
+    // Meshes take the same treatment as image layers — they're ordinary scene
+    // objects that happen to carry geometry. Without this a parented skybox
+    // stays at the origin while the camera moves out of it.
+    for m in mesh3d_layers.iter_mut() {
+        let idx = m.order_index;
+        if idx >= objects.len() {
+            continue;
+        }
+        let pw = parent_world_xform(idx, objects, &id_to_idx, &name_to_idx, &mut memo);
+        if pw.is_identity() {
+            continue;
+        }
+        let o = pw.apply_point([m.origin[0] as f64, m.origin[1] as f64, m.origin[2] as f64]);
+        m.origin = [o[0] as f32, o[1] as f32, o[2] as f32];
+        for i in 0..3 {
+            m.scale[i] *= pw.s[i] as f32;
+            m.angles[i] += pw.r[i] as f32;
+        }
     }
 }
 
@@ -2305,7 +2541,11 @@ fn white_pixel() -> RgbaImage {
 }
 
 /// WE sizes a solid layer to the full scene when it has no explicit size
-/// (`CImage::setupUniforms`: `if (solidlayer && size == 0) size = sceneSize`).
+/// (`CImage.cpp:199`: `if (solidlayer && size == 0) size = sceneSize`) — but
+/// only to give an effect chain a dummy target. A size-less solid layer with
+/// no effects is a script/cursor holder ("Player Options" in 2988724897);
+/// stretching its opaque white over the scene hides the whole wallpaper, so
+/// callers only register those that carry effects.
 fn fill_solid_layer_sizes(layers: &mut [Layer], solid_indices: &[usize], width: u32, height: u32) {
     for &i in solid_indices {
         if layers[i].size[0] == 0.0 && layers[i].size[1] == 0.0 {
@@ -2321,6 +2561,78 @@ mod tests {
     /// Untextured mesh materials are common in real content
     /// (`"textures": [null,null,null]`), and their flat `color` is the only
     /// thing that keeps the mesh from drawing plain white.
+    /// `maxwidth`/`maxrows` are only active when their `limit*` checkbox is
+    /// on. WE keeps the numbers around while the box is unchecked, so applying
+    /// them unconditionally wrapped text that should run free — 3091474852's
+    /// day label wrapped at 500px despite `limitwidth: false`.
+    /// `disablepropagation` severs transform inheritance while leaving the
+    /// `parent` link intact for grouping/visibility.
+    #[test]
+    fn disablepropagation_severs_transform_inheritance() {
+        let objs: Vec<SceneObject> = serde_json::from_str(
+            r#"[{"id": 1, "origin": "10 0 0"},
+                {"id": 2, "origin": "1 0 0", "parent": 1},
+                {"id": 3, "origin": "1 0 0", "parent": 1, "disablepropagation": true}]"#,
+        )
+        .expect("valid objects");
+        let id_to_idx: HashMap<i64, usize> = objs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| o.id.map(|d| (d, i)))
+            .collect();
+        let name_to_idx: HashMap<&str, usize> = HashMap::new();
+        assert_eq!(parent_index(&objs[1], &id_to_idx, &name_to_idx), Some(0));
+        assert_eq!(
+            parent_index(&objs[2], &id_to_idx, &name_to_idx),
+            None,
+            "disablepropagation must stop transform inheritance"
+        );
+    }
+
+    /// `depthtest: "disabled"` on the object overrides the material pass.
+    #[test]
+    fn object_depthtest_overrides_material() {
+        let read = |o: &SceneObject, mat: Option<&str>| -> bool {
+            o.depthtest
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .or(mat)
+                .map(|m| m != "disabled")
+                .unwrap_or(true)
+        };
+        let plain: SceneObject = serde_json::from_str("{}").expect("valid");
+        let off: SceneObject = serde_json::from_str(r#"{"depthtest": "disabled"}"#).expect("valid");
+        assert!(read(&plain, None), "default is depth-tested");
+        assert!(!read(&plain, Some("disabled")), "material pass applies");
+        assert!(!read(&off, Some("enabled")), "object wins over material");
+    }
+
+    #[test]
+    fn wrap_limits_respect_their_gates() {
+        let obj = |lw: bool| -> SceneObject {
+            serde_json::from_value(serde_json::json!({
+                "text": "SUNDAY", "maxwidth": 500.0, "maxrows": 1,
+                "limitwidth": lw, "limitrows": lw,
+            }))
+            .expect("valid object")
+        };
+        let active = |o: &SceneObject| {
+            o.maxwidth
+                .as_ref()
+                .and_then(crate::engine::scene::parse_value_f32)
+                .filter(|w| *w > 0.0)
+                .filter(|_| {
+                    o.limitwidth
+                        .as_ref()
+                        .and_then(crate::engine::scene::parse_value_bool)
+                        .unwrap_or(false)
+                })
+                .is_some()
+        };
+        assert!(active(&obj(true)), "gate on: maxwidth applies");
+        assert!(!active(&obj(false)), "gate off: maxwidth must be ignored");
+    }
+
     #[test]
     fn material_constant_color_reads_flat_color() {
         // `color` wins over the separate (usually white) `Color` tint.
@@ -2362,6 +2674,9 @@ mod tests {
         let red_image = RgbaImage::from_pixel(100, 100, image::Rgba([255, 0, 0, 255]));
 
         let layers = vec![Layer {
+            local_origin: [0.0; 3],
+            local_scale: [1.0; 3],
+            local_angles: [0.0; 3],
             name: "red".to_string(),
             image: red_image,
             extra_frames: Vec::new(),
@@ -2384,12 +2699,14 @@ mod tests {
             video: None,
             text_dynamic: None,
             order_index: 1,
+            object_id: None,
             transform_scripts: TransformScripts::default(),
             visible_base: true,
         }];
 
         let particle_layers = vec![
             ParticleLayer {
+                local_origin: [0.0; 3],
                 name: "blue_particles".to_string(),
                 origin: [50.0, 50.0, 0.0],
                 parallax_depth: [0.0, 0.0],
@@ -2401,6 +2718,7 @@ mod tests {
                 children: Vec::new(),
             },
             ParticleLayer {
+                local_origin: [0.0; 3],
                 name: "green_particles".to_string(),
                 origin: [50.0, 50.0, 0.0],
                 parallax_depth: [0.0, 0.0],
@@ -2414,6 +2732,7 @@ mod tests {
         ];
 
         let resolved = ResolvedScene {
+            transform_graph: build_transform_graph(&scene),
             width: 100,
             height: 100,
             layers,

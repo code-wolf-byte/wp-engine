@@ -53,6 +53,17 @@ impl AnimatedValue {
         }
     }
 
+    /// The value's components, whatever its width — vec2 params (audiobounds,
+    /// texture scales, ...) are just as real as vec3 colors.
+    pub fn components(&self) -> Option<Vec<f32>> {
+        match &self.value {
+            DynamicValue::Vec2(v) => Some(v.to_vec()),
+            DynamicValue::Vec3(v) => Some(v.to_vec()),
+            DynamicValue::Vec4(v) => Some(v.to_vec()),
+            _ => None,
+        }
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match &self.value {
             DynamicValue::Bool(b) => Some(*b),

@@ -23,7 +23,7 @@ pub struct ParticleConfig {
     /// Real JSON key is singular `"controlpoint"` (an array), referenced by
     /// index (not `id`-keyed lookup at use-site) from operators/emitters like
     /// `controlpointattract` (CParticle.cpp/ObjectParser.cpp).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_entries_as_default")]
     pub controlpoint: Vec<ControlPointConfig>,
     /// Delay in seconds before this system begins emitting. Present on nearly
     /// every real preset (610/610) so a burst ramps in instead of all
@@ -110,6 +110,20 @@ impl AnimationMode {
             _ => Self::Loop,
         }
     }
+}
+
+/// Real presets pad their `controlpoint` array with literal `null`s (unused
+/// slots). Serde rejects the whole preset over one, so nulls become defaults —
+/// the array is indexed positionally, so the padding has to stay in place.
+fn null_entries_as_default<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Vec::<Option<T>>::deserialize(d)?
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect())
 }
 
 #[derive(Default, Debug, Clone, Deserialize)]
@@ -4330,6 +4344,52 @@ mod tests {
                 (-1201.0..=-199.0).contains(&p.vy),
                 "vy {} out of remapped y-range",
                 p.vy
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod colorn_probe {
+    use super::*;
+
+    #[test]
+    fn colorn_override_tints_the_spawn_color() {
+        let preset = r#"{
+            "maxcount": 8,
+            "emitter": [{"name": "sphererandom", "id": 1, "rate": 100, "distancemax": "1 1 1"}],
+            "initializer": [
+                {"id": 4, "max": "255 255 255", "min": "255 255 255", "name": "colorrandom"},
+                {"id": 3, "max": 10, "min": 10, "name": "sizerandom"},
+                {"id": 2, "max": 1, "min": 1, "name": "lifetimerandom"}
+            ],
+            "operator": []
+        }"#;
+        let cfg: ParticleConfig = serde_json::from_str(preset).expect("preset parses");
+        let ov: InstanceOverride =
+            serde_json::from_str(r#"{"colorn": "0.180 0.408 0.773", "id": null, "lifetime": 2.0}"#)
+                .expect("override parses");
+        assert_eq!(
+            ov.colorn.as_ref().and_then(value_as_vec3_pub),
+            Some([0.18, 0.408, 0.773])
+        );
+        let mut sys = ParticleSystem::from_config(&cfg, [0.0, 0.0], Some(&ov));
+        for _ in 0..20 {
+            sys.step(0.05);
+        }
+        let p = sys.particles.first().expect("something spawned");
+        // `colorrandom` is pinned to white (min == max) so the tint is the only
+        // thing acting on the colour, and every spawned particle is identical.
+        // With a random base this assertion was only true for most samples: a
+        // blue draw near the low end of [47,255] tints to ~36, which is *below*
+        // the fixed red of 255*0.180 ≈ 46, so the suite failed at random.
+        let expected = [255.0 * 0.180, 255.0 * 0.408, 255.0 * 0.773];
+        for (channel, want) in expected.iter().enumerate() {
+            let got = p.color[channel] as f32;
+            assert!(
+                (got - want).abs() <= 2.0,
+                "channel {channel} is {got}, expected ~{want}: {:?}",
+                p.color
             );
         }
     }

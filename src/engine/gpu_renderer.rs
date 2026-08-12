@@ -102,7 +102,7 @@ pub struct GpuSceneRenderer {
     /// skybox work (its near hemisphere culls away instead of hiding the
     /// scene inside it), while `"cullmode": "nocull"` materials — hollow
     /// shells meant to be seen from both sides — must keep every face.
-    mesh3d_pipelines: [wgpu::RenderPipeline; 2],
+    mesh3d_pipelines: [wgpu::RenderPipeline; 4],
 }
 
 /// Depth format for the 3D mesh pass. Depth32Float is guaranteed everywhere
@@ -180,13 +180,15 @@ impl GpuSceneRenderer {
                     },
                     count: None,
                 },
-                // Extra texture slots for multi-texture effects (g_Texture1..6)
+                // Extra texture slots for multi-texture effects (g_Texture1..7,
+                // bound at N+2 — 7 is the highest the workshop corpus uses).
                 tex_entry(3),
                 tex_entry(4),
                 tex_entry(5),
                 tex_entry(6),
                 tex_entry(7),
                 tex_entry(8),
+                tex_entry(9),
             ],
         });
 
@@ -490,7 +492,7 @@ impl GpuSceneRenderer {
             bind_group_layouts: &[&mesh3d_bgl],
             push_constant_ranges: &[],
         });
-        let make_mesh3d_pipeline = |cull: Option<wgpu::Face>, label: &str| {
+        let make_mesh3d_pipeline = |cull: Option<wgpu::Face>, depth: bool, label: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&mesh3d_layout),
@@ -521,8 +523,12 @@ impl GpuSceneRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: MESH3D_DEPTH_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: depth,
+                    depth_compare: if depth {
+                        wgpu::CompareFunction::Less
+                    } else {
+                        wgpu::CompareFunction::Always
+                    },
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -531,9 +537,12 @@ impl GpuSceneRenderer {
                 cache: None,
             })
         };
+        // Indexed by `nocull as usize | (!depthtest as usize) << 1`.
         let mesh3d_pipelines = [
-            make_mesh3d_pipeline(Some(wgpu::Face::Back), "mesh3d"),
-            make_mesh3d_pipeline(None, "mesh3d_nocull"),
+            make_mesh3d_pipeline(Some(wgpu::Face::Back), true, "mesh3d"),
+            make_mesh3d_pipeline(None, true, "mesh3d_nocull"),
+            make_mesh3d_pipeline(Some(wgpu::Face::Back), false, "mesh3d_nodepth"),
+            make_mesh3d_pipeline(None, false, "mesh3d_nocull_nodepth"),
         ];
 
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
@@ -879,6 +888,21 @@ impl GpuSceneRenderer {
     }
 
     pub fn upload_texture(&self, img: &RgbaImage) -> wgpu::Texture {
+        let (fw, fh) =
+            crate::engine::fbo::fit_texture_limit(&self.device, img.width(), img.height());
+        let downscaled;
+        let img = if (fw, fh) != img.dimensions() {
+            tracing::warn!(
+                "layer texture {}x{} exceeds the GPU limit — downscaling to {fw}x{fh}",
+                img.width(),
+                img.height()
+            );
+            downscaled =
+                image::imageops::resize(img, fw, fh, image::imageops::FilterType::Triangle);
+            &downscaled
+        } else {
+            img
+        };
         let (w, h) = img.dimensions();
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("layer_tex"),
@@ -1074,6 +1098,10 @@ impl GpuSceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(slot(5)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(slot(6)),
                 },
             ],
         })
@@ -1424,6 +1452,12 @@ struct SceneLayerGpu {
     origin_base: [f64; 3],
     scale_base: [f32; 3],
     angles_base: [f32; 3],
+    /// Pre-parent transform, for the per-frame parent recompose (see
+    /// `update_parent_transforms`). Distinct from `*_base`, which are the
+    /// post-parent values a per-object script updates from.
+    local_origin: [f64; 3],
+    local_scale: [f64; 3],
+    local_angles: [f32; 3],
     no_interpolation: bool,
     clamp_uvs: bool,
     /// Unscaled object size in pixels — matches the reference's `CImage::m_size`
@@ -1434,6 +1468,8 @@ struct SceneLayerGpu {
     /// This layer's position in `scene.visible_objects()` — lets `render()`
     /// interleave with particle systems in true scene z-order.
     order_index: usize,
+    /// The scene object's `id`, for `_rt_imageLayerComposite_<id>_*` binds.
+    object_id: Option<i64>,
     /// Perspective scenes only: view-space distance of the quad center from
     /// the camera, for painter's-algorithm back-to-front sorting. Negative =
     /// behind the camera (culled). Always 0.0 in orthographic scenes.
@@ -1530,16 +1566,86 @@ pub struct GpuSceneInstance {
     /// Depth buffer for `mesh3d`; `None` when there are no meshes. The 2D
     /// layers never touch it — they keep their painter's ordering.
     mesh3d_depth: Option<wgpu::TextureView>,
+    /// Retained for the per-frame parent recompose, which has to rebuild each
+    /// mesh's MVP and each layer's projected rect.
+    camera3d: Option<crate::engine::camera3d::PerspectiveCamera>,
+    /// Parent chain + transform scripts. Only consulted when
+    /// `TransformGraph::needs_per_frame()` — 189 of 197 scenes skip it.
+    transform_graph: crate::engine::render::TransformGraph,
+    /// `general.zoom`, retained because the per-frame parent recompose rebuilds
+    /// orthographic rects and has to apply the same scene-wide scale the build
+    /// path does.
+    zoom: f32,
+    /// Live per-object local transforms, carried across frames. WE's
+    /// `update(value)` is handed the CURRENT value, so a script written as
+    /// `value.y += ...` accumulates — resetting to the authored value each
+    /// frame turns continuous rotation into jitter in place.
+    current_locals: Vec<crate::engine::render::Xform>,
 }
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
 /// baked at load because these objects don't animate in real content.
+/// Project a world-space quad through the perspective camera into an NDC rect.
+///
+/// Returns `(rect, depth)`; a negative depth means the quad was culled (some
+/// corner sat at or behind the eye plane). Shared by the build path and the
+/// per-frame parent recompose so the two can't drift apart.
+///
+/// Approximation: no in-quad perspective warp — the four projected corners
+/// collapse to their axis-aligned bounding box, which is fine for the mostly
+/// camera-facing layers these scenes use.
+fn project_quad_ndc(
+    cam: &crate::engine::camera3d::PerspectiveCamera,
+    center: [f32; 3],
+    angles: [f32; 3],
+    size_px: [f64; 2],
+) -> ([f32; 4], f32) {
+    let hx = (size_px[0] / 2.0) as f32;
+    let hy = (size_px[1] / 2.0) as f32;
+    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
+        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], angles);
+        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
+    });
+    let ndc: Vec<[f32; 2]> = corners.iter().filter_map(|c| cam.project(*c)).collect();
+    if ndc.len() < 4 {
+        return ([-10.0, -10.0, 0.0, 0.0], -1.0);
+    }
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    for p in &ndc {
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    }
+    (
+        [
+            (min_x + max_x) / 2.0,
+            (min_y + max_y) / 2.0,
+            (max_x - min_x) / 2.0,
+            (max_y - min_y) / 2.0,
+        ],
+        cam.view_depth(center),
+    )
+}
+
 struct Mesh3dGpu {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     index_count: u32,
     bind_group: wgpu::BindGroup,
     nocull: bool,
+    depthtest: bool,
+    /// Kept so a script-driven parent can rewrite the MVP each frame.
+    ubo: wgpu::Buffer,
+    /// Pre-parent transform + which scene object this is, so the per-frame
+    /// pass can recompose the chain (see `render::TransformGraph`).
+    local: ([f32; 3], [f32; 3], [f32; 3]),
+    order_index: usize,
+    /// View depth of the mesh centre, for the perspective back-to-front sort.
+    /// Meshes are never culled on it (a skybox legitimately surrounds the
+    /// camera); it only orders them against the 2D layers.
+    depth: f32,
 }
 
 impl GpuSceneInstance {
@@ -1699,44 +1805,9 @@ impl GpuSceneInstance {
                     effective_size[1] * l.scale[1],
                 ];
                 let (rect, angle, depth) = if let Some(cam) = &camera3d {
-                    // 3D scene: the quad lives at a world-space origin with
-                    // world-space extents (size × scale). Rotate its corner
-                    // offsets, project all four through the camera, and
-                    // composite the NDC bounding box. Approximation: no
-                    // in-quad perspective warp (corners collapse to an
-                    // axis-aligned rect) — fine for the mostly camera-facing
-                    // layers these scenes use.
                     let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
-                    let ang = l.angles;
-                    let hx = (size_px[0] / 2.0) as f32;
-                    let hy = (size_px[1] / 2.0) as f32;
-                    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
-                        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], ang);
-                        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
-                    });
-                    let ndc: Vec<[f32; 2]> =
-                        corners.iter().filter_map(|c| cam.project(*c)).collect();
-                    if ndc.len() < 4 {
-                        // Any corner at/behind the eye plane: cull the whole
-                        // quad rather than composite a blown-up projection.
-                        ([-10.0, -10.0, 0.0, 0.0], 0.0, -1.0)
-                    } else {
-                        let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
-                        let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
-                        for p in &ndc {
-                            min_x = min_x.min(p[0]);
-                            min_y = min_y.min(p[1]);
-                            max_x = max_x.max(p[0]);
-                            max_y = max_y.max(p[1]);
-                        }
-                        let rect = [
-                            (min_x + max_x) / 2.0,
-                            (min_y + max_y) / 2.0,
-                            (max_x - min_x) / 2.0,
-                            (max_y - min_y) / 2.0,
-                        ];
-                        (rect, 0.0, cam.view_depth(center))
-                    }
+                    let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
+                    (rect, 0.0, depth)
                 } else {
                     // `general.zoom` scales the whole scene about its center;
                     // NDC (0,0) is the scene center, so a uniform rect scale
@@ -1771,6 +1842,7 @@ impl GpuSceneInstance {
                     no_interpolation: l.no_interpolation,
                     clamp_uvs: l.clamp_uvs,
                     order_index: l.order_index,
+                    object_id: l.object_id,
                     visible: l.visible_base,
                     visible_base: l.visible_base,
                     transform_scripts: l.transform_scripts.clone(),
@@ -1778,6 +1850,9 @@ impl GpuSceneInstance {
                     origin_base: l.origin,
                     scale_base: [l.scale[0] as f32, l.scale[1] as f32, l.scale[2] as f32],
                     angles_base: l.angles,
+                    local_origin: l.local_origin,
+                    local_scale: l.local_scale,
+                    local_angles: l.local_angles,
                 }
             })
             .collect();
@@ -1881,6 +1956,28 @@ impl GpuSceneInstance {
                 }
             }
         }
+        // `_rt_imageLayerComposite_<objectId>_<a|b>`: WE's per-object composite
+        // buffer, referenced by effects on *other* objects (2321732083's
+        // samurai adds 5x object 101's buffer). Create one scene-sized target
+        // per referenced name; each is filled right after its owning layer
+        // composites. Aliasing these to the whole-scene snapshot instead —
+        // which is what we used to do — meant `blend` added 5x the entire lit
+        // city onto the samurai and blew it out to white.
+        let layer_composite_names: Vec<String> = scene_effects
+            .iter()
+            .flat_map(|inst| inst.pass_overrides.iter())
+            .flat_map(|over| {
+                over.textures
+                    .iter()
+                    .filter_map(|t| t.clone())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|n| n.starts_with("_rt_imageLayerComposite"))
+            .collect();
+        for name in &layer_composite_names {
+            fbo_pool.get_or_create(renderer.device(), name, w, h);
+        }
+
         if bloom.enabled {
             // Matches the reference's three-buffer chain exactly (CScene.cpp):
             // no ping-pong needed since each stage writes a *different* buffer.
@@ -2002,10 +2099,19 @@ impl GpuSceneInstance {
 
         // Static 3D meshes: upload geometry + bake each MVP. Only reachable
         // when the scene has a perspective camera to draw them through.
+        // Draw only meshes whose name contains this — the way to tell "not
+        // drawn" apart from "drawn but occluded" in a scene the camera sits
+        // inside of (same role as WP_DEBUG_DUMP_FRAME).
+        let mesh_filter = std::env::var("WP_MESH_FILTER").ok();
         let mesh3d: Vec<Mesh3dGpu> = match &camera3d {
             Some(cam) => resolved
                 .mesh3d_layers
                 .iter()
+                .filter(|m| {
+                    mesh_filter
+                        .as_ref()
+                        .is_none_or(|f| m.name.contains(f.as_str()))
+                })
                 .map(|m| Self::build_mesh3d(&renderer, cam, m))
                 .collect(),
             None => Vec::new(),
@@ -2057,6 +2163,10 @@ impl GpuSceneInstance {
             perspective: camera3d.is_some(),
             mesh3d,
             mesh3d_depth,
+            camera3d,
+            current_locals: resolved.transform_graph.local.clone(),
+            transform_graph: resolved.transform_graph,
+            zoom,
         })
     }
 
@@ -2141,6 +2251,140 @@ impl GpuSceneInstance {
             index_count: layer.mesh.indices.len() as u32,
             bind_group,
             nocull: layer.nocull,
+            depthtest: layer.depthtest,
+            ubo,
+            local: (layer.local_origin, layer.local_angles, layer.local_scale),
+            order_index: layer.order_index,
+            depth: cam.view_depth(layer.origin),
+        }
+    }
+
+    /// Recompose parent chains for this frame.
+    ///
+    /// `apply_parent_transforms` bakes the chain at load, which is correct only
+    /// while the chain is static. A scripted parent moves every frame, and
+    /// those parent nodes are usually image-less — they have no `Layer`, so the
+    /// per-layer script loop never touches them. This evaluates every object's
+    /// transform scripts (parents included), recomposes each chain, and pushes
+    /// the result into whatever the object actually draws as.
+    ///
+    /// Skipped entirely unless the scene both parents something and scripts a
+    /// transform — true for 8 of 197 real scenes.
+    fn update_parent_transforms(&mut self) {
+        if !self.transform_graph.needs_per_frame() {
+            return;
+        }
+        use crate::engine::render::Xform;
+
+        // Evaluate in declaration order: these scripts talk to each other
+        // through the shared `shared` object (one writes `shared.gjz`, another
+        // reads it), and declaration order is the only ordering WE implies.
+        let mut locals = self.current_locals.clone();
+        for (i, scripts) in self.transform_graph.scripts.iter().enumerate() {
+            // Previous frame's value, not the authored one — see `current_locals`.
+            let base = self.current_locals[i];
+            let eval = |ctx: &mut crate::engine::script::ScriptContext,
+                        src: &Option<String>,
+                        b: [f64; 3]| match src {
+                Some(src) => ctx
+                    .eval_update_vec3(src, [b[0] as f32, b[1] as f32, b[2] as f32])
+                    .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
+                    .unwrap_or(b),
+                None => b,
+            };
+            locals[i] = Xform {
+                t: eval(&mut self.script_ctx, &scripts[0], base.t),
+                r: eval(&mut self.script_ctx, &scripts[1], base.r),
+                s: eval(&mut self.script_ctx, &scripts[2], base.s),
+            };
+        }
+        self.current_locals.clone_from(&locals);
+        let worlds = self.transform_graph.world(&locals);
+        // The PARENT's world transform, not the object's own — `worlds[i]`
+        // already folds in object i's local transform, and the layer/mesh
+        // values we apply it to are pre-parent locals. Applying the full world
+        // would compose i's own transform twice. This mirrors exactly what
+        // `apply_parent_transforms` does at load.
+        let parent_world = |i: usize| -> crate::engine::render::Xform {
+            match self.transform_graph.parent.get(i).copied().flatten() {
+                Some(p) if p != i => worlds[p],
+                _ => Xform::IDENTITY,
+            }
+        };
+
+        // 3D meshes: rebuild the MVP from the recomposed world transform.
+        // Computed up front so the write-back can borrow `self.mesh3d` mutably.
+        let mesh_updates: Vec<(Vec<u8>, f32)> = match &self.camera3d {
+            Some(cam) => self
+                .mesh3d
+                .iter()
+                .map(|m| {
+                    let w = parent_world(m.order_index);
+                    let (lo, la, ls) = m.local;
+                    let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
+                    let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
+                    let mvp = cam.mvp(
+                        centre,
+                        std::array::from_fn(|i| la[i] + w.r[i] as f32),
+                        std::array::from_fn(|i| ls[i] * w.s[i] as f32),
+                    );
+                    let mut bytes: Vec<u8> = Vec::with_capacity(64);
+                    for col in mvp.iter() {
+                        for f in col {
+                            bytes.extend_from_slice(&f.to_le_bytes());
+                        }
+                    }
+                    (bytes, cam.view_depth(centre))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        for (m, (bytes, depth)) in self.mesh3d.iter_mut().zip(mesh_updates) {
+            self.renderer.queue.write_buffer(&m.ubo, 0, &bytes);
+            m.depth = depth;
+        }
+
+        // 2D layers, both projections. The rect derivations differ (the
+        // perspective one projects the quad's corners through the camera) but
+        // both start from the same recomposed world transform.
+        let (w_px, h_px) = (self.width as f64, self.height as f64);
+        for layer in &mut self.layers {
+            let w = parent_world(layer.order_index);
+            if w.is_identity() {
+                continue;
+            }
+            let o = w.apply_point(layer.local_origin);
+            let size_px = [
+                layer.effective_size[0] * layer.local_scale[0] * w.s[0],
+                layer.effective_size[1] * layer.local_scale[1] * w.s[1],
+            ];
+            match &self.camera3d {
+                Some(cam) => {
+                    let angles: [f32; 3] =
+                        std::array::from_fn(|i| layer.local_angles[i] + w.r[i] as f32);
+                    let (rect, depth) = project_quad_ndc(
+                        cam,
+                        [o[0] as f32, o[1] as f32, o[2] as f32],
+                        angles,
+                        size_px,
+                    );
+                    layer.rect = rect;
+                    // Feeds the painter's-algorithm sort in `render()`; a
+                    // negative depth culls the quad, same as at build.
+                    layer.depth = depth;
+                }
+                None => {
+                    // Same `general.zoom` scene-wide scale the build path uses.
+                    let z = self.zoom;
+                    layer.rect = [
+                        (2.0 * o[0] / w_px - 1.0) as f32 * z,
+                        (2.0 * o[1] / h_px - 1.0) as f32 * z,
+                        (size_px[0] / w_px) as f32 * z,
+                        (size_px[1] / h_px) as f32 * z,
+                    ];
+                    layer.angle = -(layer.local_angles[2] + w.r[2] as f32);
+                }
+            }
         }
     }
 
@@ -2151,8 +2395,22 @@ impl GpuSceneInstance {
     /// interleaving by `order_index` — real mesh scenes put their 2D content on
     /// top (overlays/UI) so it hasn't mattered. Interleaving needs the depth
     /// buffer shared with the composite pipeline.
-    fn draw_mesh3d(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
-        let Some(depth) = &self.mesh3d_depth else {
+    /// Draw one mesh, depth-tested, into the scene target.
+    ///
+    /// Per-mesh rather than one batched pass because meshes interleave with 2D
+    /// layers by `order_index` — a scene's background layers sort *before* its
+    /// meshes and must not paint over them (3453730450's moon sits at order 10
+    /// behind nine full-screen fills). `clear_depth` is set for the first mesh
+    /// of a frame; later ones load the existing buffer so they still occlude
+    /// each other correctly.
+    fn draw_one_mesh3d(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        idx: usize,
+        clear_depth: bool,
+    ) {
+        let (Some(depth), Some(m)) = (&self.mesh3d_depth, self.mesh3d.get(idx)) else {
             return;
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2169,20 +2427,24 @@ impl GpuSceneInstance {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: if clear_depth {
+                        wgpu::LoadOp::Clear(1.0)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
             ..Default::default()
         });
-        for m in &self.mesh3d {
-            pass.set_pipeline(&self.renderer.mesh3d_pipelines[m.nocull as usize]);
-            pass.set_bind_group(0, &m.bind_group, &[]);
-            pass.set_vertex_buffer(0, m.vbuf.slice(..));
-            pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..m.index_count, 0, 0..1);
-        }
+        pass.set_pipeline(
+            &self.renderer.mesh3d_pipelines[m.nocull as usize | ((!m.depthtest as usize) << 1)],
+        );
+        pass.set_bind_group(0, &m.bind_group, &[]);
+        pass.set_vertex_buffer(0, m.vbuf.slice(..));
+        pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..m.index_count, 0, 0..1);
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -2220,7 +2482,10 @@ impl GpuSceneInstance {
             let time_of_day = secs_into_day as f32 / 3600.0;
             let (w, h, persp) = (self.width, self.height, self.perspective);
             let ctx = &mut self.script_ctx;
-            ctx.set_time(time, time_of_day, (time - self.last_time).max(0.0));
+            // `delta`, not `time - self.last_time`: last_time was already
+            // advanced to `time` above, so that expression is always exactly 0
+            // and every `engine.frametime` script silently multiplied by zero.
+            ctx.set_time(time, time_of_day, delta);
             for layer in &mut self.layers {
                 if let Some(script) = &layer.alpha_script {
                     layer.alpha = ctx
@@ -2315,6 +2580,10 @@ impl GpuSceneInstance {
             }
         }
 
+        // Recompose parent chains now that this frame's scripts have run —
+        // a scripted parent moves its whole subtree.
+        self.update_parent_transforms();
+
         // Refresh the g_AudioSpectrum* UBO from the latest captured window, and
         // drive audio-reactive particle emitters from the overall loudness.
         if let Some(cap) = &self.audio_capture {
@@ -2360,9 +2629,6 @@ impl GpuSceneInstance {
             });
         }
 
-        // 1b. Static 3D meshes, depth-tested, under everything 2D.
-        self.draw_mesh3d(&mut encoder, &target_view);
-
         // Re-pose animated puppet layers at a capped rate: skin the mesh at
         // the current animation time and re-upload frames[0]. CPU skinning +
         // rasterization runs ~30ms at 4K, so this ticks at
@@ -2405,6 +2671,7 @@ impl GpuSceneInstance {
         enum DrawItem {
             Image(usize),
             Particle(usize),
+            Mesh(usize),
         }
         let mut items: Vec<(usize, DrawItem)> = self
             .layers
@@ -2419,6 +2686,14 @@ impl GpuSceneInstance {
                     .enumerate()
                     .map(|(i, _)| (self.particle_order[i], DrawItem::Particle(i))),
             )
+            // Meshes interleave by scene order like everything else: a scene's
+            // background layers can sort before its meshes.
+            .chain(
+                self.mesh3d
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (m.order_index, DrawItem::Mesh(i))),
+            )
             .collect();
         items.sort_by_key(|(order, _)| *order);
 
@@ -2430,10 +2705,15 @@ impl GpuSceneInstance {
             items.retain(|(_, item)| match item {
                 DrawItem::Image(i) => self.layers[*i].depth >= 0.0,
                 DrawItem::Particle(_) => true,
+                // Never culled on centre depth — a skybox surrounds the camera.
+                DrawItem::Mesh(_) => true,
             });
             items.sort_by(|(oa, a), (ob, b)| {
                 let key = |it: &DrawItem, order: usize| match it {
                     DrawItem::Image(i) => (0, -self.layers[*i].depth, order),
+                    // Meshes share the images' back-to-front ordering so a
+                    // distant backdrop layer still draws behind them.
+                    DrawItem::Mesh(i) => (0, -self.mesh3d[*i].depth, order),
                     DrawItem::Particle(_) => (1, 0.0, order),
                 };
                 key(a, *oa)
@@ -2442,8 +2722,15 @@ impl GpuSceneInstance {
             });
         }
 
+        // The depth buffer is cleared by the frame's first mesh; later meshes
+        // load it so they still occlude one another.
+        let mut mesh_depth_cleared = false;
         for (_, item) in items {
             match item {
+                DrawItem::Mesh(idx) => {
+                    self.draw_one_mesh3d(&mut encoder, &target_view, idx, !mesh_depth_cleared);
+                    mesh_depth_cleared = true;
+                }
                 DrawItem::Image(layer_idx) => {
                     self.draw_image_layer_gpu(
                         &mut encoder,
@@ -2602,9 +2889,9 @@ impl GpuSceneInstance {
 
                     // Extra texture slots: shader/material textures first,
                     // FBO binds override.
-                    let mut extra: Vec<Option<wgpu::TextureView>> = vec![None; 6];
+                    let mut extra: Vec<Option<wgpu::TextureView>> = vec![None; 7];
                     if let Some(texs) = self.renderer.dynamic_textures.get(&pass.tex_key) {
-                        for (i, tex) in texs.iter().enumerate().take(6) {
+                        for (i, tex) in texs.iter().enumerate().take(7) {
                             extra[i] = Some(tex.create_view(&Default::default()));
                             engine.resolutions[i + 1] = tex_res(tex);
                         }
@@ -2614,8 +2901,25 @@ impl GpuSceneInstance {
                         // A bind named "previous" is the chain input itself.
                         let (view, res) = if fbo_name == "previous" {
                             (chain_view.clone(), chain_res)
+                        } else if let Some(rt) = fbo_name
+                            .starts_with("_rt_imageLayerComposite")
+                            .then(|| self.fbo_pool.get(fbo_name.as_str()))
+                            .flatten()
+                        {
+                            // The owning layer's own composite, captured when it
+                            // drew (see draw_image_layer_gpu). Transparent when
+                            // that layer hasn't drawn yet this frame, which adds
+                            // nothing — the safe direction.
+                            (rt.view(), tex_res(&rt.texture))
                         } else if fbo_name == "_rt_FullFrameBuffer"
                             || fbo_name == "_rt_MipMappedFrameBuffer"
+                            // A per-layer composite we never captured falls back
+                            // to the scene-so-far snapshot: effects run before
+                            // their layer composites, so the scene target holds
+                            // "everything behind this layer". Without any bind
+                            // the sampler keeps its `util/white` default — which
+                            // is what blended 2821407073's mountains to white.
+                            || fbo_name.starts_with("_rt_imageLayerComposite")
                         {
                             // The wallpaper-global scene buffer (CWallpaper.cpp
                             // creates it at scene size; MipMapped is an alias).
@@ -2651,7 +2955,7 @@ impl GpuSceneInstance {
                         if *slot == 0 {
                             src_view = view;
                             engine.resolutions[0] = res;
-                        } else if (*slot as usize) <= 6 {
+                        } else if (*slot as usize) <= 7 {
                             extra[(*slot - 1) as usize] = Some(view);
                             engine.resolutions[*slot as usize] = res;
                         }
@@ -2793,6 +3097,29 @@ impl GpuSceneInstance {
                 6,
                 &[],
             );
+
+            // Capture this layer's own composite for effects on other objects
+            // that bind `_rt_imageLayerComposite_<thisId>_*` (WE keeps one
+            // buffer per object; ours is filled with the same draw, on a
+            // cleared scene-sized target so only this layer is in it).
+            if let Some(id) = layer.object_id {
+                for suffix in ['a', 'b'] {
+                    let name = format!("_rt_imageLayerComposite_{id}_{suffix}");
+                    if let Some(rt) = self.fbo_pool.get(name.as_str()) {
+                        self.renderer.run_pass(
+                            encoder,
+                            pipeline,
+                            &base_bg,
+                            None,
+                            &rt.view(),
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            "layer_composite_capture",
+                            6,
+                            &[],
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3406,6 +3733,13 @@ fn load_effect_instance(
                 image::Rgba([127, 127, 127, 255]),
             )));
         }
+        if std::env::var("WP_DEBUG_TEX_SLOTS").is_ok() {
+            eprintln!(
+                "[texslots] {effect_name} (hardcoded, instance {instance_idx}): overrides={:?} loaded={}",
+                inst.pass_overrides.first().map(|o| o.textures.clone()),
+                textures.len()
+            );
+        }
         if !textures.is_empty() {
             renderer.dynamic_textures.insert(tex_key.clone(), textures);
         }
@@ -3682,6 +4016,22 @@ fn load_effect_instance(
             .iter_mut()
             .filter(|n| n.as_deref().is_some_and(|n| n.starts_with("_rt_")))
             .for_each(|n| *n = None);
+        if std::env::var("WP_DEBUG_TEX_SLOTS").is_ok() {
+            eprintln!(
+                "[texslots] {effect_name} pass{pass_idx}: merged={:?} names={:?} slots={:?}",
+                merged_textures,
+                texture_names,
+                model
+                    .texture_slots
+                    .iter()
+                    .map(|s| (
+                        s.glsl_name.clone(),
+                        s.default_path.clone(),
+                        s.is_framebuffer
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         for name in &texture_names {
             let path = name.as_deref().unwrap_or("");
@@ -3719,11 +4069,19 @@ fn load_effect_instance(
             key,
             hardcoded: false,
             target: pass.target.clone(),
-            binds: pass
-                .bind
-                .iter()
-                .filter_map(|b| b.name.as_ref().map(|n| (b.index.unwrap_or(0), n.clone())))
-                .chain(fbo_ref_binds)
+            // Draw-time binding applies these in order, so the effect's own
+            // `bind` entries must come LAST — CPass.cpp:809 "binds are set
+            // last as they're the most important to be set". With the
+            // material's texture-list _rt_ refs winning instead, godrays'
+            // combine pass read the (still empty) scene snapshot as its
+            // albedo and washed the whole layer to the clear colour.
+            binds: fbo_ref_binds
+                .into_iter()
+                .chain(
+                    pass.bind
+                        .iter()
+                        .filter_map(|b| b.name.as_ref().map(|n| (b.index.unwrap_or(0), n.clone()))),
+                )
                 .collect(),
             values,
             vertex_buffers,
@@ -3804,13 +4162,19 @@ fn insert_animated_components(
         map.insert(key.to_string(), f);
         map.insert(alias.to_string(), f);
     }
-    if let Some([r, g, b]) = v.as_vec3() {
-        for (name, val) in [("r", r), ("g", g), ("b", b)] {
-            map.insert(format!("{key}_{name}"), val);
-            map.insert(format!("{alias}_{name}"), val);
+    if let Some(comps) = v.components() {
+        // Both spellings: colors are read as _r/_g/_b/_a, geometry as
+        // _x/_y/_z/_w. A vec3 keeps its historical implicit _w/_a of 1.0.
+        let mut named: Vec<(&str, f32)> = Vec::new();
+        for (i, val) in comps.iter().enumerate() {
+            named.push((["r", "g", "b", "a"][i.min(3)], *val));
+            named.push((["x", "y", "z", "w"][i.min(3)], *val));
         }
-        // Vec2/vec4 lookups use _x/_y/_z/_w suffixes.
-        for (name, val) in [("x", r), ("y", g), ("z", b), ("w", 1.0)] {
+        if comps.len() == 3 {
+            named.push(("a", 1.0));
+            named.push(("w", 1.0));
+        }
+        for (name, val) in named {
             map.insert(format!("{key}_{name}"), val);
             map.insert(format!("{alias}_{name}"), val);
         }
@@ -3890,13 +4254,18 @@ fn make_params_from_translated_typed(
 ) -> Vec<u8> {
     let mut bytes: Vec<u8> = Vec::new();
 
-    // Resolve one uniform into up to 4 components.
-    let resolve = |key: &str, default: &[f32; 4]| -> [f32; 4] {
+    // Resolve one uniform into up to 4 components. A scene may key the value
+    // by the annotation's material key ("alpha") or by its UI label
+    // ("ui_editor_properties_outline_background") — and those two are not
+    // always spellings of each other, so both are tried.
+    let resolve = |entry: &transpiler::UniformEntry, default: &[f32; 4]| -> [f32; 4] {
+        let key = entry.key.as_str();
         if let Some(v) = engine.get(key) {
             return v;
         }
+        let names = || std::iter::once(key).chain(entry.label.as_deref());
         let mut out = *default;
-        if let Some(f) = vals.get(key) {
+        if let Some(f) = names().find_map(|k| vals.get(k)) {
             out = [*f; 4];
         }
         // Per-component spellings win over the scalar broadcast.
@@ -3909,11 +4278,12 @@ fn make_params_from_translated_typed(
         .iter()
         .enumerate()
         {
-            for s in suffixes.iter() {
-                if let Some(f) = vals.get(&format!("{key}{s}")) {
-                    out[i] = *f;
-                    break;
-                }
+            if let Some(f) = suffixes
+                .iter()
+                .flat_map(|s| names().map(move |k| format!("{k}{s}")))
+                .find_map(|k| vals.get(&k))
+            {
+                out[i] = *f;
             }
         }
         out
@@ -3930,16 +4300,15 @@ fn make_params_from_translated_typed(
     }
 
     for entry in keys {
-        let key = entry.key.as_str();
         match entry.glsl_type.as_str() {
             "vec2" => {
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 8);
                 push_f32(&mut bytes, v[0]);
                 push_f32(&mut bytes, v[1]);
             }
             "vec3" => {
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 16);
                 push_f32(&mut bytes, v[0]);
                 push_f32(&mut bytes, v[1]);
@@ -3948,7 +4317,7 @@ fn make_params_from_translated_typed(
                 // tail 4 bytes, so do NOT pad here.
             }
             "vec4" => {
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 16);
                 for f in v {
                     push_f32(&mut bytes, f);
@@ -3976,7 +4345,7 @@ fn make_params_from_translated_typed(
             }
             _ => {
                 // float / int / bool / unknown: 4 bytes, align 4
-                let v = resolve(key, &entry.default);
+                let v = resolve(entry, &entry.default);
                 align_to(&mut bytes, 4);
                 push_f32(&mut bytes, v[0]);
             }
@@ -3998,6 +4367,34 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
     // for any older call sites below that still pass the long form.
     fn get(vals: &ShaderVals, key: &str, default: f32) -> f32 {
         if let Some(v) = vals.get(key) {
+            return *v;
+        }
+        // Scenes key a value by the annotation's material key ("amount") or by
+        // its UI label ("ui_editor_properties_pulse_amount", normalized to
+        // "pulseamount") — and the label is not always the material key with a
+        // prefix chopped off. LABEL_ALIASES covers the pairs the corpus
+        // actually uses; the translated-effect packer gets this from the
+        // shader annotation itself (see make_params_from_translated_typed).
+        const LABEL_ALIASES: &[(&str, &[&str])] = &[
+            ("amount", &["pulseamount"]),
+            ("speed", &["pulsespeed"]),
+            ("phase", &["pulsephase", "timeoffset"]),
+            ("bounds", &["pulsebounds"]),
+            ("scale", &["ripplescale"]),
+        ];
+        // Vector params arrive here already split ("bounds_r"), so match on the
+        // stem and carry the suffix over.
+        let (stem, suffix) = match key.rfind('_') {
+            Some(i) if key.len() - i <= 2 => (&key[..i], &key[i..]),
+            _ => (key, ""),
+        };
+        if let Some(v) = LABEL_ALIASES
+            .iter()
+            .find(|(k, _)| *k == stem)
+            .into_iter()
+            .flat_map(|(_, aliases)| aliases.iter())
+            .find_map(|a| vals.get(&format!("{a}{suffix}")))
+        {
             return *v;
         }
         key.strip_prefix("ui_editor_properties_")
@@ -4031,6 +4428,16 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             get(vals, "combo_PULSEALPHA", 0.0),
             get(vals, "noisespeed", 0.5),
             get(vals, "noiseamount", 0.0),
+            get(vals, "combo_AUDIOPROCESSING", 0.0),
+            get(vals, "frequencymin", 0.0),
+            get(vals, "frequencymax", 1.0),
+            get(vals, "audiobounds_x", 0.5),
+            get(vals, "audiobounds_y", 1.0),
+            get(vals, "audioexponent", 1.0),
+            get(vals, "audioamount", 1.0),
+            // PulseParams rounds up to 112 bytes (vec3 members force a
+            // 16-byte struct alignment) — pad or wgpu rejects the bind group.
+            0.0,
             0.0,
             0.0,
         ]),
@@ -4112,5 +4519,62 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
             0.0,
         ]),
         _ => vec![0u8; 32],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WGSL rounds every uniform-address-space struct up to a 16-byte
+    /// multiple, so a param buffer that isn't one can never match its shader
+    /// struct — wgpu rejects the bind group at draw time ("Buffer is bound
+    /// with size N where the shader expects M") and the wallpaper dies.
+    #[test]
+    fn hardcoded_effect_params_are_uniform_sized() {
+        let vals = ShaderVals::new();
+        for name in HARDCODED_EFFECTS {
+            let n = make_effect_params(name, 0.0, &vals).len();
+            assert_eq!(n % 16, 0, "{name} params are {n} bytes, not a 16-multiple");
+        }
+    }
+
+    /// Hardcoded kernels must find a value the scene keyed by UI label
+    /// ("ui_editor_properties_pulse_amount") as well as by material key.
+    #[test]
+    fn hardcoded_params_resolve_label_keyed_values() {
+        let mut vals = ShaderVals::new();
+        insert_value_components(
+            &mut vals,
+            "ui_editor_properties_pulse_amount",
+            &serde_json::json!(0.25),
+        );
+        insert_value_components(
+            &mut vals,
+            "ui_editor_properties_pulse_bounds",
+            &serde_json::json!("0.2 0.8"),
+        );
+        let bytes = make_effect_params("pulse", 0.0, &vals);
+        let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(f(2), 0.25, "amount");
+        assert_eq!(f(5), 0.2, "bounds low");
+        assert_eq!(f(6), 0.8, "bounds high");
+    }
+
+    /// vec2 constants (audiobounds, texture scales, ...) must expose their
+    /// components like vec3 colors do, or the packer silently falls back to
+    /// the shader default and the artist's tuning is lost.
+    #[test]
+    fn vector_constants_expose_components_at_every_width() {
+        let mut map = ShaderVals::new();
+        insert_value_components(&mut map, "audiobounds", &serde_json::json!("0.25 0.75"));
+        assert_eq!(map.get("audiobounds_x"), Some(&0.25));
+        assert_eq!(map.get("audiobounds_y"), Some(&0.75));
+        assert_eq!(map.get("audiobounds_r"), Some(&0.25));
+
+        insert_value_components(&mut map, "tintlow", &serde_json::json!("1 0 0"));
+        assert_eq!(map.get("tintlow_b"), Some(&0.0));
+        // vec3s keep their implicit opaque alpha.
+        assert_eq!(map.get("tintlow_a"), Some(&1.0));
     }
 }

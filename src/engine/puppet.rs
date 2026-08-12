@@ -31,8 +31,11 @@ const MESH_HEADER_SIZE: usize = 8;
 /// reference). MDLV0021/0023 use 80-byte vertices (UV at 72) — the only
 /// versions the reference accepts; MDLV0016 (older workshop content, e.g.
 /// 2952574984) uses 52-byte vertices (UV at 44), reverse-engineered from
-/// real data since the reference just rejects it.
-const LAYOUTS: [(usize, usize); 2] = [(80, 72), (52, 44)];
+/// real data since the reference just rejects it. Some MDLV0013 files
+/// (2349863384's "spaced out") carry no skinning at all: bare 20-byte
+/// `[x y z u v]` vertices. Widest strides first — the block scan validates
+/// itself, so the narrow layout only matches when nothing else does.
+const LAYOUTS: [(usize, usize); 3] = [(80, 72), (52, 44), (20, 12)];
 
 pub struct PuppetMesh {
     /// Rest-pose positions, centered: pixel = (w/2 + x, h/2 - y).
@@ -87,6 +90,11 @@ impl BoneFrame {
 }
 
 pub struct PuppetAnimation {
+    /// The id `scene.json`'s `animationlayers[].animation` references. Stored
+    /// as `[u32 id][u32 0]` just before each animation's name (the first one's
+    /// sits in the MDLA header), so layers can resolve by id instead of
+    /// guessing an index.
+    pub id: u32,
     pub name: String,
     /// `"loop"` observed; other modes treated as loop.
     pub mode: String,
@@ -243,8 +251,15 @@ pub fn parse_model(data: &[u8]) -> Option<PuppetModel> {
 }
 
 /// MDLS skeleton section: `"MDLS####\0"[u32 sectionEnd][u32 boneCount]`
-/// then per bone `[u8 flag][u32][i32 parent][u32 64][16xf32][json\0]`.
+/// then per bone `[name\0][u32 flag][i32 parent][u32 64][16xf32][json\0]`.
 /// Only the parent index is needed (see `PuppetBone`).
+///
+/// The leading name is usually empty, which is why reading the record as if
+/// it began at the flag worked at all: the name's lone NUL stood in for the
+/// flag's first byte. 2321732083's samurai rigs bones 15-16 ("strap end",
+/// "strap hand"), and there the offsets slid by the name's length, `matlen`
+/// read as 256, and the whole skeleton was dropped — leaving 0 bones, so the
+/// puppet fell back to rasterizing its raw UV atlas as a white blob.
 fn parse_mdls(data: &[u8]) -> Option<Vec<PuppetBone>> {
     let s = find_marker(data, b"MDLS")?;
     let count = u32_at(data, s + 13)? as usize;
@@ -254,21 +269,23 @@ fn parse_mdls(data: &[u8]) -> Option<Vec<PuppetBone>> {
     let mut off = s + 17;
     let mut bones = Vec::with_capacity(count);
     for _ in 0..count {
-        let parent = i32::from_le_bytes(data.get(off + 5..off + 9)?.try_into().ok()?);
-        let matlen = u32_at(data, off + 9)? as usize;
+        let name_end = data[off..].iter().position(|&b| b == 0)? + off;
+        let rec = name_end + 1;
+        let parent = i32::from_le_bytes(data.get(rec + 4..rec + 8)?.try_into().ok()?);
+        let matlen = u32_at(data, rec + 8)? as usize;
         if matlen != 64 {
             return None;
         }
         // Column-major 4x4 (translation at elements 12..14): convert to our
         // row-major 3x4.
-        let m = off + 13;
+        let m = rec + 12;
         let e = |i: usize| f32_at(data, m + i * 4);
         let bind_local: Affine = [
             [e(0)?, e(4)?, e(8)?, e(12)?],
             [e(1)?, e(5)?, e(9)?, e(13)?],
             [e(2)?, e(6)?, e(10)?, e(14)?],
         ];
-        let js_start = off + 13 + matlen;
+        let js_start = m + matlen;
         let js_end = data[js_start..].iter().position(|&b| b == 0)? + js_start;
         bones.push(PuppetBone { parent, bind_local });
         off = js_end + 1;
@@ -289,6 +306,8 @@ fn parse_mdla(data: &[u8], bone_count: usize) -> Option<Vec<PuppetAnimation>> {
         return None;
     }
     let mut p = s + 25;
+    // The header's third u32 is the first animation's id.
+    let mut id = u32_at(data, s + 17)?;
     let mut animations = Vec::with_capacity(anim_count);
     for a in 0..anim_count {
         let name_end = data[p..].iter().position(|&b| b == 0)? + p;
@@ -334,6 +353,7 @@ fn parse_mdla(data: &[u8], bone_count: usize) -> Option<Vec<PuppetAnimation>> {
         }
 
         animations.push(PuppetAnimation {
+            id,
             name,
             mode,
             fps,
@@ -341,11 +361,60 @@ fn parse_mdla(data: &[u8], bone_count: usize) -> Option<Vec<PuppetAnimation>> {
             tracks,
         });
         if a + 1 < anim_count {
-            // 13 bytes of flags/padding between animations.
-            p = q + 13;
+            // The padding between animations is not a fixed width (13 bytes in
+            // MDLA0001, 39 in MDLA0006's samurai rig), so find the next record
+            // by its shape instead of trusting a constant: `[u32 id][u32 0]`
+            // ahead of a printable name, followed by a mode and a plausible
+            // fps/frame/track header.
+            let (next, next_id) = find_next_animation(data, q, bone_count)?;
+            p = next;
+            id = next_id;
         }
     }
     Some(animations)
+}
+
+/// Locate the animation record following `from`, returning its name offset and
+/// id. Validates the whole `[id][0] name\0 mode\0 fps frames 0 boneCount 0`
+/// shape so a wrong guess is rejected rather than silently mis-parsed.
+fn find_next_animation(data: &[u8], from: usize, bone_count: usize) -> Option<(usize, u32)> {
+    for name_at in from..(from + 256).min(data.len()) {
+        if name_at < 8 {
+            continue;
+        }
+        if u32_at(data, name_at - 4) != Some(0) {
+            continue;
+        }
+        let Some(id) = u32_at(data, name_at - 8) else {
+            continue;
+        };
+        let Some(rel) = data[name_at..].iter().position(|&b| b == 0) else {
+            continue;
+        };
+        let name = &data[name_at..name_at + rel];
+        if name.is_empty() || !name.iter().all(|b| (0x20..0x7f).contains(b)) {
+            continue;
+        }
+        let mode_at = name_at + rel + 1;
+        let Some(mode_rel) = data.get(mode_at..)?.iter().position(|&b| b == 0) else {
+            continue;
+        };
+        if mode_rel == 0
+            || !data[mode_at..mode_at + mode_rel]
+                .iter()
+                .all(|b| (0x20..0x7f).contains(b))
+        {
+            continue;
+        }
+        let q = mode_at + mode_rel + 1;
+        let fps = f32_at(data, q)?;
+        let frames = u32_at(data, q + 4)?;
+        let tracks = u32_at(data, q + 12)? as usize;
+        if fps > 0.0 && frames > 0 && tracks == bone_count {
+            return Some((name_at, id));
+        }
+    }
+    None
 }
 
 fn find_marker(data: &[u8], marker: &[u8; 4]) -> Option<usize> {
@@ -820,6 +889,40 @@ mod tests {
         assert_eq!(mesh.uvs[2], [0.5, 0.0]);
     }
 
+    /// MDLS bone records start with a name string. It is usually empty, so
+    /// the old reader (which began at the flag byte) worked by accident until
+    /// a rig named a bone — 2321732083's "strap end" slid every field and the
+    /// whole skeleton was dropped.
+    #[test]
+    fn parses_named_bone_records() {
+        fn bone(name: &str, parent: i32) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(name.as_bytes());
+            b.push(0);
+            b.extend_from_slice(&1u32.to_le_bytes()); // flag
+            b.extend_from_slice(&parent.to_le_bytes());
+            b.extend_from_slice(&64u32.to_le_bytes()); // matrix length
+            for i in 0..16 {
+                // Column-major identity.
+                let v: f32 = if i % 5 == 0 { 1.0 } else { 0.0 };
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.push(0); // empty trailing json
+            b
+        }
+        let mut d = Vec::new();
+        d.extend_from_slice(b"MDLS0003\0");
+        d.extend_from_slice(&0u32.to_le_bytes()); // section end
+        d.extend_from_slice(&2u32.to_le_bytes()); // bone count
+        d.extend_from_slice(&bone("", -1));
+        d.extend_from_slice(&bone("strap end", 0));
+        let bones = parse_mdls(&d).expect("skeleton should parse");
+        assert_eq!(bones.len(), 2);
+        assert_eq!(bones[0].parent, -1);
+        assert_eq!(bones[1].parent, 0);
+        assert_eq!(bones[1].bind_local[0][0], 1.0);
+    }
+
     #[test]
     fn rejects_wrong_marker() {
         assert!(parse_mdl(b"NOTAMODEL blah blah blah").is_none());
@@ -888,6 +991,7 @@ mod tests {
                 bind_local: bone_frame_affine(&track[0]),
             }],
             animations: vec![PuppetAnimation {
+                id: 0,
                 name: "t".into(),
                 mode: "loop".into(),
                 fps: 30.0,
@@ -921,6 +1025,7 @@ mod tests {
                 bind_local: bone_frame_affine(&track[0]),
             }],
             animations: vec![PuppetAnimation {
+                id: 0,
                 name: "t".into(),
                 mode: "loop".into(),
                 fps: 1.0,
@@ -946,6 +1051,7 @@ mod tests {
         add[1].position = [0.0, 60.0, 0.0];
         add[2].position = [0.0, 60.0, 0.0];
         let anim = |name: &str, track: Vec<BoneFrame>| PuppetAnimation {
+            id: 0,
             name: name.into(),
             mode: "loop".into(),
             fps: 1.0,
@@ -1019,6 +1125,7 @@ mod tests {
                 },
             ],
             animations: vec![PuppetAnimation {
+                id: 0,
                 name: "t".into(),
                 mode: "loop".into(),
                 fps: 1.0,

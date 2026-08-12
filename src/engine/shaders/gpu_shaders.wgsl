@@ -390,6 +390,27 @@ fn fs_bloom_combine(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
 // ── Pulse ────────────────────────────────────────────────────────────────────
 
+// g_AudioSpectrum*: 16 left, 16 right, then the 32- and 64-band sets. Written
+// once per frame from the FFT; all zero when nothing is captured.
+@group(1) @binding(1) var<storage, read> audio_spectrum: array<f32>;
+
+/// pulse.vert's CreateAudioResponse: average the selected bands, shape by
+/// bounds/exponent, scale by amount. `mode` is the AUDIOPROCESSING combo —
+/// 1 = left, 2 = right, 3 = both.
+fn audio_response(mode: i32, fmin: f32, fmax: f32, bounds: vec2<f32>, power: f32, amount: f32) -> f32 {
+    let lo = i32(clamp(min(fmin, fmax), 0.0, 15.0));
+    let hi = i32(clamp(max(fmin, fmax), 0.0, 15.0));
+    var total = 0.0;
+    var n = 0.0;
+    for (var a = lo; a <= hi; a = a + 1) {
+        if (mode != 2) { total = total + audio_spectrum[a]; n = n + 1.0; }
+        if (mode != 1) { total = total + audio_spectrum[16 + a]; n = n + 1.0; }
+    }
+    let avg = total / max(n, 1.0);
+    let shaped = smoothstep(bounds.x, bounds.y, avg);
+    return clamp(pow(shaped, power), 0.0, 1.0) * amount;
+}
+
 struct PulseParams {
     time: f32,
     speed: f32,
@@ -408,8 +429,19 @@ struct PulseParams {
     pulse_alpha: f32,
     noise_speed: f32,
     noise_amount: f32,
+    // AUDIOPROCESSING combo: 0 = time-driven, 1 = left, 2 = right, 3 = both.
+    audio_mode: f32,
+    audio_fmin: f32,
+    audio_fmax: f32,
+    // Two scalars, not a vec2: std140 would align a vec2 to 8 bytes here and
+    // silently shift every field after it out from under the packer.
+    audio_bounds_lo: f32,
+    audio_bounds_hi: f32,
+    audio_power: f32,
+    audio_amount: f32,
     _p0: f32,
     _p1: f32,
+    _p2: f32,
 }
 @group(1) @binding(0) var<uniform> pulse: PulseParams;
 
@@ -424,12 +456,26 @@ fn fs_pulse(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     let s = textureSample(src_tex, src_sampler, uv);
     let mask = textureSample(extra_tex1, src_sampler, uv).r;
     let raw = sin(pulse.time * pulse.speed + pulse.phase - 1.5708) * 0.5 + 0.5;
+    // AUDIOPROCESSING != 0 replaces the time sine entirely (pulse.vert picks
+    // one or the other, never both) — without this an audio-reactive layer
+    // pulses on a timer and ignores what's playing.
+    let am = i32(pulse.audio_mode + 0.5);
     let noise_uv = vec2(pulse.time * 0.08333333, pulse.time * 0.02777777) * pulse.noise_speed;
     let noise = textureSample(dest_copy_tex, src_sampler, noise_uv).r * pulse.noise_amount;
-    let p = pow(
+    var p = pow(
         smoothstep(pulse.bounds_x, pulse.bounds_y, raw) * pulse.amount + noise,
         pulse.power,
     );
+    if (am != 0) {
+        p = audio_response(
+            am,
+            pulse.audio_fmin,
+            pulse.audio_fmax,
+            vec2(pulse.audio_bounds_lo, pulse.audio_bounds_hi),
+            pulse.audio_power,
+            pulse.audio_amount,
+        );
+    }
     var albedo = s;
     if pulse.pulse_color > 0.5 {
         let a = s.rgb * pulse.tint_low;

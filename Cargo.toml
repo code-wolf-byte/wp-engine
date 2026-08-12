@@ -11,6 +11,16 @@ path = "src/main.rs"
 name = "scan-wallpapers"
 path = "src/tests/scan_wallpapers.rs"
 
+[features]
+default = []
+# Web (HTML) wallpapers, rendered by an embedded Chromium via CEF.
+#
+# OFF by default on purpose: `cef-dll-sys`'s build script downloads the CEF
+# binary distribution (~400 MB extracted) on first build and the resulting
+# binary needs libcef.so plus Chromium's resource blobs beside it at runtime.
+# Set CEF_PATH to reuse an existing distribution instead of re-downloading.
+web = ["dep:cef"]
+
 [dependencies]
 # Structured logging (spans/targets); the subscriber is initialized in main.
 # Cross-platform raw handles for wgpu surface creation (Wayland today, Metal
@@ -34,7 +44,7 @@ serde_json = "1"
 image = { version = "0.24", default-features = false, features = ["jpeg", "png", "bmp", "gif", "tga", "tiff", "webp"] }
 
 # Video decoding (requires system FFmpeg: pacman -S ffmpeg / apt install ffmpeg)
-ffmpeg-next = "8"
+ffmpeg-next = "9"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -84,6 +94,16 @@ wayland-backend         = { version = "0.3", features = ["client_system"] }
 wayland-protocols-wlr   = "0.2"
 calloop                 = { version = "0.12", features = ["executor"] }
 calloop-wayland-source  = "0.2"
+# X11 display backend — root-window pixmap + RandR output discovery. Pure Rust
+# (no libX11 link), and already in the tree via winit, so declaring it direct
+# adds no build cost.
+x11rb                   = { version = "0.13", features = ["randr"] }
+
+# CEF (Chromium) for web wallpapers — optional, see the `web` feature. Pulled
+# in only when that feature is on, so the default build never downloads
+# Chromium. default-features off skips the crate's CLI/bundling helpers
+# (clap, plist, cargo_metadata) that we don't use.
+cef                     = { version = "151", default-features = false, optional = true }
 
 # macOS display backend — winit window pinned at desktop level, dropping to
 # objc2 / objc2-app-kit to reach the underlying NSWindow for wallpaper

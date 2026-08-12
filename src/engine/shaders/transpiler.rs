@@ -114,6 +114,10 @@ return m;}}\n\
 #[derive(Debug, Clone)]
 pub struct UniformEntry {
     pub key: String,
+    /// The annotation's UI label, when it differs from `key`. Scenes key their
+    /// `constantshadervalues` by either name (edgedetection's
+    /// `ui_editor_properties_outline_background` IS `outlinecolorbg`).
+    pub label: Option<String>,
     pub glsl_type: String,
     pub default: [f32; 4],
 }
@@ -133,6 +137,19 @@ pub struct TranslatedShader {
 }
 
 /// Collect non-sampler `uniform` declarations (type, name) in source order.
+/// The macro name of a `#define NAME ...` line, if this line is one.
+fn redefined_macro(trimmed_line: &str) -> Option<&str> {
+    let rest = trimmed_line.strip_prefix("#define")?;
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    let name = rest.trim_start();
+    let end = name
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(name.len());
+    (end > 0).then(|| &name[..end])
+}
+
 fn collect_scalar_uniforms(src: &str) -> Vec<(String, String)> {
     let mut scalars = Vec::new();
     for line in src.lines() {
@@ -740,14 +757,16 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
 
     // glsl_name → (material_key, typed default) from `// {"material": ...}`
     // annotations, collected from BOTH stages (fragment wins on conflicts).
-    let mut annotated: std::collections::HashMap<String, (String, [f32; 4])> =
+    let mut annotated: std::collections::HashMap<String, (String, Option<String>, [f32; 4])> =
         std::collections::HashMap::new();
     if let Some(v) = vert_glsl {
         for meta in crate::engine::shaders::uniform_meta::parse_uniform_metadata(v) {
             annotated.insert(
                 meta.uniform_name.clone(),
                 (
-                    meta.material_key.unwrap_or(meta.uniform_name),
+                    meta.material_key
+                        .unwrap_or_else(|| meta.uniform_name.clone()),
+                    meta.label.clone(),
                     meta.default_value
                         .as_ref()
                         .map(json_default_vec4)
@@ -759,7 +778,7 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
     for u in &model.value_uniforms {
         annotated.insert(
             u.glsl_name.clone(),
-            (u.material_key.clone(), u.default.as_vec4()),
+            (u.material_key.clone(), u.label.clone(), u.default.as_vec4()),
         );
     }
 
@@ -769,12 +788,13 @@ pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<Tr
         .iter()
         .chain(vert_only_scalars.iter())
         .map(|(ty, name)| {
-            let (key, default) = annotated
+            let (key, label, default) = annotated
                 .get(name)
                 .cloned()
-                .unwrap_or_else(|| (name.clone(), [0.0; 4]));
+                .unwrap_or_else(|| (name.clone(), None, [0.0; 4]));
             UniformEntry {
                 key,
+                label,
                 glsl_type: ty.clone(),
                 default,
             }
@@ -952,10 +972,31 @@ fn harmonize_varying_widths(vert: &str, frag: &str) -> String {
 /// fixes nothing or after a few rounds, so pathological shaders still fail
 /// cleanly instead of looping.
 fn glsl_to_spirv_with_repairs(glsl: &str, stage: naga::ShaderStage) -> Result<Vec<u8>> {
+    // shaderc reports line numbers in the *generated* source, which nothing
+    // else ever prints — WP_DEBUG_DUMP_GLSL=1 makes those numbers usable.
+    let dump = |src: &str| {
+        if std::env::var("WP_DEBUG_DUMP_GLSL").is_err() {
+            return;
+        }
+        let path = format!(
+            "/tmp/glsl_fail_{:x}.{}",
+            src.len() as u64 ^ src.as_bytes().iter().map(|b| *b as u64).sum::<u64>(),
+            if stage == naga::ShaderStage::Vertex {
+                "vert"
+            } else {
+                "frag"
+            }
+        );
+        let _ = std::fs::write(&path, src);
+        tracing::warn!("dumped failing GLSL to {path}");
+    };
     let mut src: Option<String> = None;
     let mut last_err = match glsl_to_spirv(glsl, stage) {
         Ok(spv) => return Ok(spv),
-        Err(e) => e,
+        Err(e) => {
+            dump(glsl);
+            e
+        }
     };
     for _ in 0..5 {
         let current = src.as_deref().unwrap_or(glsl);
@@ -964,9 +1005,18 @@ fn glsl_to_spirv_with_repairs(glsl: &str, stage: naga::ShaderStage) -> Result<Ve
         // `mod()` and HLSL-implicit assignment conversions get their casts.
         // Either may fix a different error the same round.
         let mut patched = repair_float_modulo(current, &err);
-        let after_mod = patched.as_deref().unwrap_or(current);
-        if let Some(p) = repair_assignment_conversions(after_mod, &err) {
-            patched = Some(p);
+        for repair in [
+            repair_assignment_conversions,
+            repair_bool_conditions,
+            repair_input_assignment,
+            repair_bool_operands,
+            repair_call_arg_widths,
+            repair_operand_widths,
+        ] {
+            let so_far = patched.as_deref().unwrap_or(current);
+            if let Some(p) = repair(so_far, &err) {
+                patched = Some(p);
+            }
         }
         let Some(patched) = patched else {
             return Err(last_err);
@@ -995,6 +1045,9 @@ fn parse_shaderc_type(desc: &str) -> Option<(&'static str, u8)> {
     }
     if desc.ends_with("int") {
         return Some(("int", 1));
+    }
+    if desc.ends_with("bool") {
+        return Some(("bool", 1));
     }
     None
 }
@@ -1190,7 +1243,14 @@ fn repair_assignment_conversions(glsl: &str, err_text: &str) -> Option<String> {
                 ("(".into(), format!(").{}", &"xyzw"[..n as usize]))
             }
             // scalar -> vecN: HLSL splats.
-            (("float", _) | ("int", _), ("vec", n)) => (format!("vec{n}("), ")".into()),
+            (("float", _) | ("int", _) | (("bool", _)), ("vec", n)) => {
+                (format!("vec{n}("), ")".into())
+            }
+            // bool -> number: HLSL's true/false are 1/0 (simple_audio_bars
+            // assigns a comparison straight into an int bar index).
+            (("bool", _), ("float", _)) => ("float(".into(), ")".into()),
+            (("bool", _), ("int", _)) => ("int(".into(), ")".into()),
+            (("bool", _), ("uint", _)) => ("uint(".into(), ")".into()),
             // float -> int/uint: HLSL truncates toward zero, same as GLSL's
             // explicit constructor.
             (("float", _), ("int", _)) => ("int(".into(), ")".into()),
@@ -1207,6 +1267,351 @@ fn repair_assignment_conversions(glsl: &str, err_text: &str) -> Option<String> {
         }
     }
 
+    repaired.then(|| lines.join("\n"))
+}
+
+/// Declared widths of everything named in a generated shader: input varyings,
+/// UBO members and plain local declarations. Feeds the error-driven repairs
+/// below, which run on the final GLSL text and so have no access to the
+/// preprocessor's own tracking.
+fn declared_widths(glsl: &str) -> HashMap<String, u8> {
+    let mut map = HashMap::new();
+    for line in glsl.lines() {
+        let t = line.trim_start();
+        // "layout(location=0) in vec4 v_TexCoord;" / "    vec2 u_rOffset;" /
+        // "	vec4 timer = texSample2D(...);"
+        let decl = t.rsplit(')').next().unwrap_or(t).trim();
+        let mut tok = decl.split_whitespace();
+        let (Some(first), Some(second)) = (tok.next(), tok.next()) else {
+            continue;
+        };
+        let (ty, name) = if first == "in" || first == "out" || first == "uniform" {
+            match tok.next() {
+                Some(n) => (second, n),
+                None => continue,
+            }
+        } else {
+            (first, second)
+        };
+        let Some(w) = vec_width(ty).or(matches!(ty, "float" | "int").then_some(1)) else {
+            continue;
+        };
+        let name = name
+            .trim_end_matches([';', ','])
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !name.is_empty() && name.chars().all(|c| is_word_char(c as u8)) {
+            map.insert(name.to_string(), w);
+        }
+    }
+    map
+}
+
+/// Line numbers shaderc reported for messages containing `needle`.
+fn error_lines(err_text: &str, needle: &str) -> Vec<usize> {
+    err_text
+        .lines()
+        .filter(|m| m.contains(needle))
+        .filter_map(|m| {
+            let rest = m
+                .split_once("shader.frag:")
+                .or_else(|| m.split_once("shader.vert:"))?
+                .1;
+            rest.split(':').next()?.trim().parse::<usize>().ok()
+        })
+        .collect()
+}
+
+/// `v_TexCoord += ...` — chromatic_aberration.frag writes to its own varying,
+/// which WE's compiler allows and GLSL does not ("l-value required ... can't
+/// modify shader input"). Rename the input and give `main()` a mutable copy
+/// under the original name, so the body compiles unchanged.
+fn repair_input_assignment(glsl: &str, err_text: &str) -> Option<String> {
+    let mut out = glsl.to_string();
+    let mut repaired = false;
+    for msg in err_text.lines() {
+        if !msg.contains("can't modify shader input") {
+            continue;
+        }
+        let Some(name) = msg
+            .split('"')
+            .nth(1)
+            .filter(|n| !n.is_empty() && n.chars().all(|c| is_word_char(c as u8)))
+        else {
+            continue;
+        };
+        let alias = format!("_wp_in_{name}");
+        if out.contains(&alias) {
+            continue;
+        }
+        // Find the input declaration to learn its type, and rename it there.
+        let Some(decl) = out.lines().find(|l| {
+            let t = l.trim_start();
+            t.starts_with("layout(") && t.contains(" in ") && t.ends_with(&format!(" {name};"))
+        }) else {
+            continue;
+        };
+        let ty = decl.split_whitespace().nth(2)?.to_string();
+        let renamed = decl.replace(&format!(" {name};"), &format!(" {alias};"));
+        out = out.replace(decl, &renamed);
+        // Shadow it with a local copy at the top of main().
+        let main_brace = out
+            .find("void main")
+            .and_then(|p| out[p..].find('{').map(|i| p + i + 1))?;
+        out.insert_str(main_brace, &format!("\n\t{ty} {name} = {alias};"));
+        repaired = true;
+    }
+    repaired.then_some(out)
+}
+
+/// `depth *= (depth < limit) * 6.0` — bokeh_blur.frag does arithmetic on a
+/// comparison. HLSL reads true as 1.0; GLSL refuses. Wrap the parenthesised
+/// comparison in `float(...)`.
+fn repair_bool_operands(glsl: &str, err_text: &str) -> Option<String> {
+    let mut lines: Vec<String> = glsl.lines().map(str::to_string).collect();
+    let mut repaired = false;
+    for line_no in error_lines(err_text, "operand of type ' temp bool'") {
+        let Some(line) = lines.get_mut(line_no.saturating_sub(1)) else {
+            continue;
+        };
+        let mut patched = line.clone();
+        let mut from = 0;
+        while let Some(rel) = patched[from..].find('(') {
+            let open = from + rel;
+            let Some((group, after)) = extract_balanced(&patched, open, b'(', b')') else {
+                break;
+            };
+            let inner = &group[1..group.len() - 1];
+            let is_comparison = ["<", ">", "<=", ">=", "==", "!="]
+                .iter()
+                .any(|op| inner.contains(op))
+                && !inner.contains("float(");
+            if is_comparison && !patched[..open].ends_with("float") {
+                let replacement = format!("float{group}");
+                patched = format!("{}{replacement}{}", &patched[..open], &patched[after..]);
+                from = open + replacement.len();
+                repaired = true;
+                continue;
+            }
+            from = open + 1;
+        }
+        *line = patched;
+    }
+    repaired.then(|| lines.join("\n"))
+}
+
+/// `rotateVec2(v_TexCoord, ...)` where the varying is a vec4 — usually because
+/// `harmonize_varying_widths` widened the fragment's declaration to match the
+/// vertex stage. Coerce each argument to the callee's declared parameter type.
+fn repair_call_arg_widths(glsl: &str, err_text: &str) -> Option<String> {
+    let widths = declared_widths(glsl);
+    let mut lines: Vec<String> = glsl.lines().map(str::to_string).collect();
+    let mut repaired = false;
+    for msg in err_text.lines() {
+        if !msg.contains("no matching overloaded function found") {
+            continue;
+        }
+        let Some(func) = msg.split('\'').nth(1) else {
+            continue;
+        };
+        let Some(line_no) = error_lines(msg, "no matching overloaded function")
+            .first()
+            .copied()
+        else {
+            continue;
+        };
+        // The callee's parameter widths, from its definition in this source.
+        let Some(params) = glsl.lines().find_map(|l| {
+            let t = l.trim_start();
+            let rest = t.split_once(&format!(" {func}("))?.1;
+            let end = rest.find(')')?;
+            Some(
+                rest[..end]
+                    .split(',')
+                    .filter_map(|p| {
+                        let ty = p.split_whitespace().next()?;
+                        vec_width(ty).or(matches!(ty, "float" | "int").then_some(1))
+                    })
+                    .collect::<Vec<u8>>(),
+            )
+        }) else {
+            continue;
+        };
+        let Some(line) = lines.get_mut(line_no.saturating_sub(1)) else {
+            continue;
+        };
+        let Some(call) = line.find(&format!("{func}(")) else {
+            continue;
+        };
+        let open = call + func.len();
+        let Some((group, after)) = extract_balanced(line, open, b'(', b')') else {
+            continue;
+        };
+        let args: Vec<String> = split_top_level_args(&group[1..group.len() - 1])
+            .iter()
+            .map(|(a, _)| a.trim().to_string())
+            .collect();
+        if args.len() != params.len() {
+            continue;
+        }
+        let coerced: Vec<String> = args
+            .iter()
+            .zip(&params)
+            .map(|(arg, &want)| match widths.get(arg.as_str()) {
+                Some(&have) if have > want && want >= 2 => {
+                    format!("{arg}{}", swizzle_prefix(want))
+                }
+                _ => arg.clone(),
+            })
+            .collect();
+        if coerced == args {
+            continue;
+        }
+        *line = format!(
+            "{}{func}({}){}",
+            &line[..call],
+            coerced.join(", "),
+            &line[after..]
+        );
+        repaired = true;
+    }
+    repaired.then(|| lines.join("\n"))
+}
+
+/// `u_rOffset * timer` where one is a vec2 and the other a vec4 — HLSL
+/// truncates the wider side, GLSL rejects the pair. Swizzle the wider
+/// identifiers on the offending line down to the narrower width.
+fn repair_operand_widths(glsl: &str, err_text: &str) -> Option<String> {
+    let widths = declared_widths(glsl);
+    let mut lines: Vec<String> = glsl.lines().map(str::to_string).collect();
+    let mut repaired = false;
+    for msg in err_text.lines() {
+        if !msg.contains("wrong operand types") {
+            continue;
+        }
+        let mut sides = msg.split("operand of type").skip(1).filter_map(|s| {
+            let desc = s.split('\'').nth(1)?;
+            parse_shaderc_type(desc.trim()).map(|(_, n)| n)
+        });
+        let (Some(a), Some(b)) = (sides.next(), sides.next()) else {
+            continue;
+        };
+        let (wide, narrow) = (a.max(b), a.min(b));
+        if wide == narrow || narrow < 2 {
+            continue;
+        }
+        let Some(line_no) = error_lines(msg, "wrong operand types").first().copied() else {
+            continue;
+        };
+        let Some(line) = lines.get_mut(line_no.saturating_sub(1)) else {
+            continue;
+        };
+        let patched = truncate_wide_identifiers_of(line, wide, narrow, &widths);
+        if patched != *line {
+            *line = patched;
+            repaired = true;
+        }
+    }
+    repaired.then(|| lines.join("\n"))
+}
+
+/// Swizzle every bare identifier of exactly `wide` components down to
+/// `narrow`. Unlike `truncate_wide_identifiers` this runs on a whole
+/// statement (call arguments included) and only when shaderc already
+/// rejected that line, so it cannot narrow a call that was fine.
+fn truncate_wide_identifiers_of(
+    line: &str,
+    wide: u8,
+    narrow: u8,
+    widths: &HashMap<String, u8>,
+) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut prev_word: Option<String> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word_char(bytes[i])
+            || (i > 0 && (is_word_char(bytes[i - 1]) || bytes[i - 1] == b'.'))
+        {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word_char(bytes[i]) {
+            i += 1;
+        }
+        let ident = &line[start..i];
+        out.push_str(ident);
+        let next = bytes.get(i).copied().unwrap_or(b' ');
+        // `vec4 rValue = ...` declares rValue — swizzling the declared name
+        // is a syntax error, and the declaration's own width is not the bug.
+        let is_declaration = matches!(
+            prev_word.as_deref(),
+            Some("vec2" | "vec3" | "vec4" | "float" | "int" | "uint" | "bool")
+        );
+        if !is_declaration
+            && next != b'.'
+            && next != b'('
+            && next != b'['
+            && widths.get(ident) == Some(&wide)
+        {
+            out.push_str(swizzle_prefix(narrow));
+        }
+        prev_word = Some(ident.to_string());
+    }
+    out
+}
+
+/// `if (u_userInvertDepthMap)` where the uniform is a float — HLSL treats
+/// nonzero as true, strict GLSL wants a bool ("boolean expression expected").
+/// Wrap the condition in `bool(...)`. Returns `None` when nothing was repaired.
+fn repair_bool_conditions(glsl: &str, err_text: &str) -> Option<String> {
+    let mut lines: Vec<String> = glsl.lines().map(str::to_string).collect();
+    let mut repaired = false;
+    for msg in err_text.lines() {
+        if !msg.contains("boolean expression expected") {
+            continue;
+        }
+        let Some(rest) = msg
+            .split_once("shader.frag:")
+            .or_else(|| msg.split_once("shader.vert:"))
+            .map(|(_, r)| r)
+        else {
+            continue;
+        };
+        let Ok(line_no) = rest.split(':').next().unwrap_or("").trim().parse::<usize>() else {
+            continue;
+        };
+        let Some(line) = lines.get_mut(line_no.saturating_sub(1)) else {
+            continue;
+        };
+        for kw in ["if", "while"] {
+            let Some(kw_pos) = line
+                .find(&format!("{kw}("))
+                .or_else(|| line.find(&format!("{kw} (")))
+            else {
+                continue;
+            };
+            let Some(open) = line[kw_pos..].find('(').map(|i| kw_pos + i) else {
+                continue;
+            };
+            // extract_balanced yields the parens too, and `after` is the index
+            // just past the closing one.
+            let Some((parens, after)) = extract_balanced(line, open, b'(', b')') else {
+                continue;
+            };
+            let cond = parens[1..parens.len() - 1].trim();
+            if cond.is_empty() || cond.contains("bool(") {
+                continue;
+            }
+            *line = format!("{}(bool({cond})){}", &line[..open], &line[after..]);
+            repaired = true;
+            break;
+        }
+    }
     repaired.then(|| lines.join("\n"))
 }
 
@@ -1252,6 +1657,14 @@ fn wrap_assignment_rhs(line: &str, prefix: &str, suffix: &str) -> Option<String>
     let rhs = line[rhs_start..rhs_end].trim();
     if rhs.is_empty() {
         return None;
+    }
+    if rhs.starts_with(prefix.trim_end_matches('(')) && rhs.ends_with(suffix) {
+        // Already wrapped on an earlier repair round — move on to the next
+        // assignment on this line. simple_audio_bars.frag puts two of them on
+        // one line ("barLeft *= isLeftChannel; barRight *= isRightChannel;")
+        // and both need the same cast.
+        let rest = wrap_assignment_rhs(&line[rhs_end..], prefix, suffix)?;
+        return Some(format!("{}{rest}", &line[..rhs_end]));
     }
     Some(format!(
         "{} {prefix}{rhs}{suffix}{}",
@@ -1359,6 +1772,142 @@ const TEX_SAMPLE_CALLS: &[&str] = &[
 /// tested on NVIDIA rely on this; naga/shaderc's stricter frontend rejects it
 /// outright. `var_width` is updated in place as declarations are seen so the
 /// caller can process a shader body line by line.
+/// Rename functions the shader defines under a name that is already a GLSL
+/// builtin or one of our HLSL-compat macros. `crt_scan_line.frag` ships its
+/// own `float mod(float, float)`, which glslang rejects (the builtin's
+/// parameters are `highp`, the shader's are not); `lerp`/`saturate` would
+/// expand through the macro into an even stranger error.
+fn rename_shadowed_builtins(src: &str) -> String {
+    const SHADOWABLE: &[&str] = &["mod", "lerp", "saturate", "frac", "mul", "atan2", "log10"];
+    let mut out = src.to_string();
+    for name in SHADOWABLE {
+        let defined = src.lines().any(|l| {
+            let t = l.trim_start();
+            let Some(rest) = t.split_once(&format!(" {name}(")) else {
+                return false;
+            };
+            // A definition starts the line with just a return type — `return
+            // frac(x);` also has one leading word, so match real types only.
+            matches!(
+                rest.0,
+                "float"
+                    | "vec2"
+                    | "vec3"
+                    | "vec4"
+                    | "int"
+                    | "uint"
+                    | "bool"
+                    | "void"
+                    | "mat2"
+                    | "mat3"
+                    | "mat4"
+            )
+        });
+        if defined {
+            out = rename_reserved_word(&out, name, &format!("_wp_{name}"));
+        }
+    }
+    out
+}
+
+/// Swizzle every bare identifier in `expr` that is known to be wider than
+/// `w` down to `w` components (`v_TexCoord` → `v_TexCoord.xy`). Identifiers
+/// that already carry a swizzle, are being called, or are struct/array
+/// accesses are left alone.
+fn truncate_wide_identifiers(expr: &str, w: u8, var_width: &HashMap<String, u8>) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let bytes = expr.as_bytes();
+    // A call's arguments are typed by its signature, not by the declaration
+    // being assigned to: narrowing `get_noise(v_TexCoord)` to `.xyz` breaks the
+    // call it was fine in. Only bare arithmetic operands get truncated.
+    let mut call_depth = 0usize;
+    let mut last_word_end: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word_char(bytes[i])
+            || (i > 0 && (is_word_char(bytes[i - 1]) || bytes[i - 1] == b'.'))
+        {
+            match bytes[i] {
+                b'(' => {
+                    let is_call = last_word_end == Some(i);
+                    if is_call || call_depth > 0 {
+                        call_depth += 1;
+                    }
+                }
+                b')' => call_depth = call_depth.saturating_sub(1),
+                _ => {}
+            }
+            if bytes[i] != b' ' {
+                last_word_end = None;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word_char(bytes[i]) {
+            i += 1;
+        }
+        let ident = &expr[start..i];
+        out.push_str(ident);
+        last_word_end = Some(i);
+        let next = bytes.get(i).copied().unwrap_or(b' ');
+        if call_depth == 0 && next != b'.' && next != b'(' && next != b'[' {
+            if let Some(&iw) = var_width.get(ident) {
+                if iw > w {
+                    out.push_str(swizzle_prefix(w));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `timer.xyz` where `timer` is a `float` — lens_flare_sun.frag does this and
+/// WE's compiler treats it as a splat. Strict GLSL calls it a swizzle out of
+/// range, so rewrite it to `vec3(timer)`.
+fn splat_scalar_swizzles(line: &str, var_width: &HashMap<String, u8>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word_char(bytes[i])
+            || (i > 0 && (is_word_char(bytes[i - 1]) || bytes[i - 1] == b'.'))
+        {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word_char(bytes[i]) {
+            i += 1;
+        }
+        let ident = &line[start..i];
+        // A swizzle of 2-4 components on something declared `float`.
+        let swz_start = i + 1;
+        let swz_end = if bytes.get(i) == Some(&b'.') {
+            let mut j = swz_start;
+            while j < bytes.len() && b"xyzwrgba".contains(&bytes[j]) {
+                j += 1;
+            }
+            j
+        } else {
+            swz_start
+        };
+        let n = swz_end.saturating_sub(swz_start);
+        if (2..=4).contains(&n)
+            && var_width.get(ident) == Some(&1)
+            && !bytes.get(swz_end).is_some_and(|b| is_word_char(*b))
+        {
+            out.push_str(&format!("vec{n}({ident})"));
+            i = swz_end;
+            continue;
+        }
+        out.push_str(ident);
+    }
+    out
+}
+
 fn coerce_vector_widths(line: &str, var_width: &mut HashMap<String, u8>) -> String {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
@@ -1367,6 +1916,15 @@ fn coerce_vector_widths(line: &str, var_width: &mut HashMap<String, u8>) -> Stri
 
     // `vecN name = <expr>;` — track the declared width, and if <expr> is an
     // unswizzled texture sample (always vec4) narrower than N, truncate it.
+    // Scalars are tracked too — only so a `.xyz` on one can be splatted below.
+    if let Some(rest) = trimmed.strip_prefix("float ") {
+        if let Some(eq) = rest.find('=') {
+            let name = rest[..eq].trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                var_width.insert(name.to_string(), 1);
+            }
+        }
+    }
     let mut declared: Option<(u8, &str)> = None;
     for w in [2u8, 3u8] {
         let prefix = format!("vec{w} ");
@@ -1390,6 +1948,15 @@ fn coerce_vector_widths(line: &str, var_width: &mut HashMap<String, u8>) -> Stri
                 {
                     let lhs = &body[..=eq_pos];
                     return format!("{indent}{lhs} {rhs}{};", swizzle_prefix(w));
+                }
+                // Wider operands inside a narrower declaration's expression:
+                // clipping_mask.frag computes `vec2 uv = (v_TexCoord * 2.0 -
+                // 1.0 - texScaleCenter) / ...` with a vec4 varying. HLSL
+                // truncates the wide side with a warning; GLSL rejects it.
+                let narrowed = truncate_wide_identifiers(rhs, w, var_width);
+                if narrowed != rhs {
+                    let lhs = &body[..=eq_pos];
+                    return format!("{indent}{lhs} {narrowed};");
                 }
             }
         }
@@ -1416,7 +1983,7 @@ fn coerce_vector_widths(line: &str, var_width: &mut HashMap<String, u8>) -> Stri
 
     // Binary arithmetic against a `CASTn(...)` broadcast: `wide_var - CASTn(x)` where
     // wide_var's known width exceeds n. Truncate wide_var's trailing components.
-    let mut out = trimmed.to_string();
+    let mut out = splat_scalar_swizzles(trimmed, var_width);
     for cast_w in [2u8, 3u8] {
         let marker = format!("CAST{cast_w}(");
         let mut search_from = 0;
@@ -1460,7 +2027,7 @@ fn coerce_vector_widths(line: &str, var_width: &mut HashMap<String, u8>) -> Stri
 }
 
 fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> String {
-    let src = &model.frag_glsl;
+    let src = &rename_shadowed_builtins(&model.frag_glsl);
 
     // First pass: collect declarations in order
     let mut sampler_names: Vec<String> = Vec::new(); // g_Texture0, g_Texture1, ...
@@ -1545,16 +2112,16 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
     out.push_str("#define CAST4(x) vec4(x)\n");
     // Use separate texture2D + sampler for all texture sample macros so naga sees
     // OpSampledImage (from constructor) rather than OpLoad of a combined sampler2D.
-    out.push_str("#define texSample2D(s, uv) texture(sampler2D(s, _wp_sampler), uv)\n");
+    out.push_str("#define texSample2D(s, uv) texture(sampler2D(s, _wp_sampler), (uv).xy)\n");
     out.push_str(
-        "#define texSample2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), uv, lod)\n",
+        "#define texSample2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), (uv).xy, lod)\n",
     );
-    out.push_str("#define textureSample2D(s, uv) texture(sampler2D(s, _wp_sampler), uv)\n");
-    out.push_str("#define texture2D(s, uv) texture(sampler2D(s, _wp_sampler), uv)\n");
+    out.push_str("#define textureSample2D(s, uv) texture(sampler2D(s, _wp_sampler), (uv).xy)\n");
+    out.push_str("#define texture2D(s, uv) texture(sampler2D(s, _wp_sampler), (uv).xy)\n");
     out.push_str(
-        "#define texture2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), uv, lod)\n",
+        "#define texture2DLod(s, uv, lod) textureLod(sampler2D(s, _wp_sampler), (uv).xy, lod)\n",
     );
-    out.push_str("#define textureCube(s, uv) texture(samplerCube(s, _wp_sampler), uv)\n");
+    out.push_str("#define textureCube(s, uv) texture(samplerCube(s, _wp_sampler), (uv).xyz)\n");
     out.push_str("#define lerp(a, b, t) mix(a, b, t)\n");
     out.push_str("#define mul(a, b) ((b) * (a))\n");
     out.push_str(&combo_defines(&model.effective_combos()));
@@ -1683,6 +2250,13 @@ fn preprocess_frag(model: &ShaderModel, extra_scalars: &[(String, String)]) -> S
             continue;
         }
 
+        // A shader that spells a prelude macro differently (M_PI as
+        // 3.1415926535897932384626433832795, say) is a hard glslang error, not
+        // a warning. Let the shader's own definition win, like HLSL does.
+        if let Some(name) = redefined_macro(t) {
+            out.push_str(&format!("#undef {name}\n"));
+        }
+
         // Replace #require LightingV1 with a no-op stub (same as linux-wallpaperengine).
         if t.starts_with("#require LightingV1") {
             out.push_str(
@@ -1780,6 +2354,10 @@ fn preprocess_vert_matched(
             || t.starts_with("#include ")
         {
             continue;
+        }
+        // Shader-local redefinition of a prelude macro wins (see frag stage).
+        if let Some(name) = redefined_macro(t) {
+            body.push_str(&format!("#undef {name}\n"));
         }
         let decl = t.split("//").next().unwrap_or(t).trim();
         let tok: Vec<&str> = decl.split_whitespace().collect();
@@ -2186,6 +2764,48 @@ mod tests {
     }
 
     #[test]
+    fn shadowed_builtin_definitions_are_renamed_but_calls_are_not() {
+        // crt_scan_line.frag defines its own mod(); glslang rejects the
+        // precision-qualifier clash with the builtin.
+        let src = "float mod(float x, float y) {\n return x - y * floor(x/y);\n}\nfloat f() { return mod(a, b); }\n";
+        let out = rename_shadowed_builtins(src);
+        assert!(out.contains("float _wp_mod(float x"), "{out}");
+        assert!(out.contains("return _wp_mod(a, b)"), "{out}");
+        // A shader that only CALLS frac keeps the macro name.
+        let call_only = "float f() {\n return frac(x);\n}\n";
+        assert_eq!(rename_shadowed_builtins(call_only), call_only);
+    }
+
+    #[test]
+    fn coerce_leaves_call_arguments_and_splats_scalar_swizzles() {
+        let mut w = HashMap::new();
+        w.insert("v_TexCoord".to_string(), 4u8);
+        // contrast_based_sharpness: get_noise(vec4) must keep its vec4 argument.
+        let out = coerce_vector_widths("vec3 noise_color = get_noise(v_TexCoord);", &mut w);
+        assert!(!out.contains("v_TexCoord."), "{out}");
+        // lens_flare_sun: `.xyz` on a float is a splat in WE's compiler.
+        let mut w2 = HashMap::new();
+        let _ = coerce_vector_widths("float timer = sin(g_Time);", &mut w2);
+        let out2 = coerce_vector_widths("vec3 c = rotation + timer.xyz;", &mut w2);
+        assert!(out2.contains("vec3(timer)"), "{out2}");
+    }
+
+    #[test]
+    fn coerce_truncates_wide_varying_inside_narrow_declaration() {
+        // clipping_mask.frag: vec4 varying driving vec2 math (HLSL truncates).
+        let mut w = HashMap::new();
+        w.insert("v_TexCoord".to_string(), 4u8);
+        let out = coerce_vector_widths(
+            "vec2 uvTex = ((v_TexCoord * 2.0 - 1.0 - texScaleCenter) / u_scale + 1.0) / 2.0;",
+            &mut w,
+        );
+        assert!(out.contains("v_TexCoord.xy"), "{out}");
+        // Already-swizzled and unknown identifiers stay untouched.
+        let out2 = coerce_vector_widths("vec2 b = v_TexCoord.zw + something;", &mut w);
+        assert!(!out2.contains(".zw.xy"), "{out2}");
+    }
+
+    #[test]
     fn coerce_truncates_unswizzled_texture_sample_to_declared_width() {
         let mut vw = HashMap::new();
         let out = coerce_vector_widths(
@@ -2326,6 +2946,22 @@ mod tests {
             \tfloat acc = 0.0;\n\
             \tfor (int i = -iterations; i <= iterations; i++) { acc += float(i) + pointer; }\n\
             \tfragColor = vec4(acc);\n\
+            }\n";
+        assert!(glsl_to_spirv(glsl, naga::ShaderStage::Fragment).is_err());
+        glsl_to_spirv_with_repairs(glsl, naga::ShaderStage::Fragment)
+            .expect("repair loop should make this compile");
+    }
+
+    /// depth_map.frag branches on a float uniform; HLSL calls nonzero true.
+    #[test]
+    fn bool_condition_repair_wraps_float_conditions() {
+        let glsl = "#version 450\n\
+            layout(location=0) out vec4 fragColor;\n\
+            void main() {\n\
+            \tfloat flag = 1.0;\n\
+            \tfloat d = 0.25;\n\
+            \tif(flag){ d = 1.0 - d; }\n\
+            \tfragColor = vec4(d);\n\
             }\n";
         assert!(glsl_to_spirv(glsl, naga::ShaderStage::Fragment).is_err());
         glsl_to_spirv_with_repairs(glsl, naga::ShaderStage::Fragment)

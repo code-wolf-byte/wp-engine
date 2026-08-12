@@ -38,6 +38,14 @@ impl SceneAnimState {
         let width = resolved.width;
         let height = resolved.height;
 
+        // ponytail: layers flatten to one image here, so an embedded-video
+        // layer's stream handle is dropped and this path shows its first frame
+        // forever. The live GPU path streams them properly
+        // (`gpu_renderer`'s per-frame `latest_frame` re-upload); this is only
+        // the fallback for when GPU init fails, and streaming here would mean a
+        // Lanczos3 resize of a 4K frame every tick on the CPU. Carry the
+        // `video` handle through and swap per frame if that fallback ever
+        // becomes a path people actually watch.
         let base_layers: Vec<(usize, Arc<RgbaImage>)> = resolved
             .layers
             .into_iter()
