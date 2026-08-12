@@ -9,7 +9,7 @@ use wp_engine::{engine, platform, ui};
 #[command(
     name = "wp-engine",
     about = "Wallpaper Engine client for Wayland",
-    long_about = "Browse and apply Steam Workshop wallpapers on Wayland desktops.\n\
+    long_about = "Browse and apply Steam Workshop wallpapers on Wayland, X11, and macOS.\n\
                   Run without arguments to open the graphical interface."
 )]
 struct Cli {
@@ -41,7 +41,7 @@ enum Command {
         #[arg(long = "set-property", value_name = "NAME=VALUE")]
         properties: Vec<String>,
     },
-    /// Apply any image file as wallpaper (CLI, blocks until Ctrl-C)
+    /// Apply a scene directory, video, image, or HTML file (CLI, blocks until Ctrl-C)
     SetFile {
         path: PathBuf,
         /// Override a user property: NAME=VALUE (repeatable; bare NAME = true)
