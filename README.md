@@ -39,6 +39,13 @@ The scene renderer is a port of
 great deal of the maths here is based on that project's work. See
 [Credits](#credits).
 
+![A Workshop wallpaper running live on the desktop](docs/images/desktop-cosmic.png)
+
+| | | |
+| --- | --- | --- |
+| ![Aurora Lake, a scene wallpaper](docs/images/scene-aurora-lake.png) | ![A black hole scene with SceneScript-driven clock text](docs/images/scene-black-hole.png) | ![An audio-reactive piano scene](docs/images/scene-astral-piano.png) |
+| Scene passes and effects | Scripted live text | Particles, audio reactive |
+
 ---
 
 ## Contents
@@ -146,6 +153,8 @@ Run with no arguments for the graphical browser:
 ```bash
 wp-engine
 ```
+
+![The wp-engine browser: a thumbnail grid of Workshop wallpapers with a detail panel and render settings](docs/images/gui-window.png)
 
 Or drive it from the command line:
 
