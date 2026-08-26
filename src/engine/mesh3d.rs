@@ -20,14 +20,19 @@
 //! ≤ 65536 vertices and `u32` above that (real content uses both: a 2143-vert
 //! star is u16, a 520192-vert sphere is u32).
 
-/// Bytes per vertex; UV sits at byte 40. Only this one layout appears in real
-/// content, unlike puppet meshes which have two.
+/// Bytes per vertex; UV sits at byte 40, normal at byte 12. Only this one
+/// layout appears in real content, unlike puppet meshes which have two.
 const STRIDE: usize = 48;
+const NORMAL_OFFSET: usize = 12;
 const UV_OFFSET: usize = 40;
 
 pub struct Mesh3d {
     /// Real 3D positions (the mesh's own object space, ≈ a unit cube).
     pub positions: Vec<[f32; 3]>,
+    /// Object-space vertex normals, parallel to `positions`. Used by the
+    /// mesh3d lighting pass; not validated to be unit-length (real content is,
+    /// but callers normalize defensively).
+    pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     /// Always widened to u32 so both index widths share one draw path.
     pub indices: Vec<u32>,
@@ -113,10 +118,16 @@ fn try_block(data: &[u8], off: usize, material: &str) -> Option<Mesh3d> {
     }
 
     let mut positions = Vec::with_capacity(vertex_count);
+    let mut normals = Vec::with_capacity(vertex_count);
     let mut uvs = Vec::with_capacity(vertex_count);
     for i in 0..vertex_count {
         let v = verts_off + i * STRIDE;
         positions.push([f32_at(data, v)?, f32_at(data, v + 4)?, f32_at(data, v + 8)?]);
+        normals.push([
+            f32_at(data, v + NORMAL_OFFSET)?,
+            f32_at(data, v + NORMAL_OFFSET + 4)?,
+            f32_at(data, v + NORMAL_OFFSET + 8)?,
+        ]);
         uvs.push([
             f32_at(data, v + UV_OFFSET)?,
             f32_at(data, v + UV_OFFSET + 4)?,
@@ -125,6 +136,7 @@ fn try_block(data: &[u8], off: usize, material: &str) -> Option<Mesh3d> {
 
     Some(Mesh3d {
         positions,
+        normals,
         uvs,
         indices,
         material: material.to_string(),
@@ -160,6 +172,11 @@ mod tests {
             v[0..4].copy_from_slice(&(i as f32).to_le_bytes());
             v[4..8].copy_from_slice(&1.0f32.to_le_bytes());
             v[8..12].copy_from_slice(&2.0f32.to_le_bytes());
+            // normal (arbitrary, distinct from position so the test can tell
+            // the parser read the right offset)
+            v[NORMAL_OFFSET..NORMAL_OFFSET + 4].copy_from_slice(&0.0f32.to_le_bytes());
+            v[NORMAL_OFFSET + 4..NORMAL_OFFSET + 8].copy_from_slice(&1.0f32.to_le_bytes());
+            v[NORMAL_OFFSET + 8..NORMAL_OFFSET + 12].copy_from_slice(&0.0f32.to_le_bytes());
             // uv
             v[UV_OFFSET..UV_OFFSET + 4].copy_from_slice(&0.25f32.to_le_bytes());
             v[UV_OFFSET + 4..UV_OFFSET + 8].copy_from_slice(&0.75f32.to_le_bytes());
@@ -182,6 +199,7 @@ mod tests {
         assert_eq!(m.positions.len(), 3);
         // z is read (the whole point — puppet parsing drops it).
         assert_eq!(m.positions[2], [2.0, 1.0, 2.0]);
+        assert_eq!(m.normals[0], [0.0, 1.0, 0.0]);
         assert_eq!(m.uvs[0], [0.25, 0.75]);
     }
 

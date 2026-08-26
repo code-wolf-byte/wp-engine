@@ -15,6 +15,7 @@ pub mod effect;
 pub mod fbo;
 pub mod gpu_renderer;
 pub mod graph;
+pub mod lighting;
 pub mod material;
 pub mod mesh3d;
 pub mod model;
@@ -29,6 +30,7 @@ pub mod resource;
 pub mod scene;
 pub mod script;
 pub mod shaders;
+pub mod shadow;
 pub mod tex;
 pub mod text;
 

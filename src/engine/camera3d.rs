@@ -47,8 +47,9 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
     [v[0] / len, v[1] / len, v[2] / len]
 }
 
-/// Right-handed lookAt, identical to `glm::lookAt`.
-fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
+/// Right-handed lookAt, identical to `glm::lookAt`. `pub(crate)` so
+/// `engine::shadow` can build light-space view matrices with the same math.
+pub(crate) fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
     let f = normalize(sub(center, eye));
     let s = normalize(cross(f, up));
     let u = cross(s, f);
@@ -61,8 +62,8 @@ fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> Mat4 {
 }
 
 /// Right-handed perspective projection, identical to `glm::perspective`
-/// (vertical FOV in radians, GL clip-space z).
-fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+/// (vertical FOV in radians, GL clip-space z). `pub(crate)` — see `look_at`.
+pub(crate) fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     let t = 1.0 / (fovy / 2.0).tan();
     let mut m = [[0.0f32; 4]; 4];
     m[0][0] = t / aspect;
@@ -142,10 +143,7 @@ impl PerspectiveCamera {
     /// column-major and ready to upload. [`project`](Self::project) reads only
     /// x/y so it never needed this; a depth buffer does.
     pub fn view_proj_gpu(&self) -> Mat4 {
-        let mut fix = identity();
-        fix[2][2] = 0.5;
-        fix[3][2] = 0.5;
-        mat4_mul(&fix, &self.view_proj)
+        gl_to_wgpu_depth(&self.view_proj)
     }
 
     /// Full model-view-projection for an object, column-major and ready to
@@ -153,6 +151,52 @@ impl PerspectiveCamera {
     pub fn mvp(&self, origin: [f32; 3], angles: [f32; 3], scale: [f32; 3]) -> Mat4 {
         mat4_mul(&self.view_proj_gpu(), &model_matrix(origin, angles, scale))
     }
+
+    /// Transform a world-space point into view space (camera at the origin
+    /// by construction). Used to place `light` objects for the mesh3d
+    /// lighting pass, which shades entirely in view space — see
+    /// `model_view`.
+    pub fn to_view_space(&self, p: [f32; 3]) -> [f32; 3] {
+        let m = &self.view;
+        [
+            m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0],
+            m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1],
+            m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2],
+        ]
+    }
+
+    /// Model-view (no projection) for an object — world→view space, ready to
+    /// upload as a `mat4x4<f32>` uniform. The lighting pass needs view-space
+    /// vertex positions separately from the clip-space `mvp` output.
+    pub fn model_view(&self, origin: [f32; 3], angles: [f32; 3], scale: [f32; 3]) -> Mat4 {
+        mat4_mul(&self.view, &model_matrix(origin, angles, scale))
+    }
+
+    /// View-space normal transform for an object: `view_rotation · object_rotation
+    /// · diag(1/scale)`, the standard inverse-transpose simplification for a
+    /// rotation-plus-scale model matrix (exact for any scale, uniform or not).
+    /// Translation is left at whatever `mat4_mul` produces from `view`'s own
+    /// translation column — callers multiply by `vec4(normal, 0.0)`, so the w=0
+    /// discards it; only the upper-left 3x3 is meaningful.
+    pub fn normal_view(&self, angles: [f32; 3], scale: [f32; 3]) -> Mat4 {
+        let inv_scale = [
+            1.0 / scale[0].max(1e-6),
+            1.0 / scale[1].max(1e-6),
+            1.0 / scale[2].max(1e-6),
+        ];
+        mat4_mul(&self.view, &model_matrix([0.0, 0.0, 0.0], angles, inv_scale))
+    }
+}
+
+/// Remaps GL's clip-space z range ([-1,1]) to wgpu's ([0,1]) by
+/// premultiplying with the standard `diag(1,1,0.5,1)`-plus-translation fix
+/// matrix. `pub(crate)` so `engine::shadow` can build shadow-map
+/// view-projections in the same depth convention as the main camera.
+pub(crate) fn gl_to_wgpu_depth(m: &Mat4) -> Mat4 {
+    let mut fix = identity();
+    fix[2][2] = 0.5;
+    fix[3][2] = 0.5;
+    mat4_mul(&fix, m)
 }
 
 pub fn identity() -> Mat4 {
@@ -267,6 +311,26 @@ mod tests {
         assert!((ndc[1] - 1.0).abs() < 1e-4, "got {ndc:?}");
         // Behind the camera → culled.
         assert!(cam.project([0.0, 0.0, 20.0]).is_none());
+    }
+
+    #[test]
+    fn normal_view_scales_by_inverse_not_forward() {
+        // test_scene's camera sits on +Z looking at the origin with up=+Y,
+        // which works out to an identity view rotation, so the object-space
+        // math is visible directly in the result. A non-uniform scale on X
+        // must divide the X-aligned normal's component by that scale, not
+        // multiply by it — that's the whole point of the inverse-transpose
+        // simplification `normal_view` relies on.
+        let cam = PerspectiveCamera::from_scene(&test_scene(), 1.0).unwrap();
+        let m = cam.normal_view([0.0, 0.0, 0.0], [2.0, 1.0, 1.0]);
+        let n = [1.0, 0.0, 0.0];
+        let got = [
+            m[0][0] * n[0] + m[1][0] * n[1] + m[2][0] * n[2],
+            m[0][1] * n[0] + m[1][1] * n[1] + m[2][1] * n[2],
+            m[0][2] * n[0] + m[1][2] * n[1] + m[2][2] * n[2],
+        ];
+        assert!((got[0] - 0.5).abs() < 1e-5, "expected 1/scale.x = 0.5, got {got:?}");
+        assert!(got[1].abs() < 1e-5 && got[2].abs() < 1e-5, "got {got:?}");
     }
 
     #[test]

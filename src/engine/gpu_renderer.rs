@@ -103,6 +103,11 @@ pub struct GpuSceneRenderer {
     /// scene inside it), while `"cullmode": "nocull"` materials — hollow
     /// shells meant to be seen from both sides — must keep every face.
     mesh3d_pipelines: [wgpu::RenderPipeline; 4],
+    // Shadow-caster depth pass: see `engine::shadow` and
+    // `GpuSceneInstance::build_shadow_atlas`.
+    shadow_pass_bgl: wgpu::BindGroupLayout,
+    mesh3d_shadow_pipeline: wgpu::RenderPipeline,
+    shadow_comparison_sampler: wgpu::Sampler,
 }
 
 /// Depth format for the 3D mesh pass. Depth32Float is guaranteed everywhere
@@ -485,6 +490,36 @@ impl GpuSceneRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Shared shadow atlas (one texture, every shadow-casting
+                // light's tile packed into it — see `engine::shadow`) plus
+                // its comparison sampler, for `textureSampleCompareLevel` PCF
+                // lookups in `fs_mesh3d`.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Depth,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
         let mesh3d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -500,9 +535,9 @@ impl GpuSceneRenderer {
                     module: &shader_module,
                     entry_point: Some("vs_mesh3d"),
                     buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: 20,
+                        array_stride: 32,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3],
                     }],
                     compilation_options: Default::default(),
                 },
@@ -545,6 +580,73 @@ impl GpuSceneRenderer {
             make_mesh3d_pipeline(None, false, "mesh3d_nocull_nodepth"),
         ];
 
+        // Shadow-caster depth pass: renders every mesh3d object's geometry,
+        // position-only, into one tile of the shared shadow atlas (see
+        // `engine::shadow` and `GpuSceneInstance::build_shadow_atlas`). No
+        // fragment stage — depth-only. No back-face culling: a caster should
+        // block light through any face, not just the ones the main camera
+        // would see.
+        let shadow_pass_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow_pass_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let shadow_pass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow_pass_layout"),
+            bind_group_layouts: &[&shadow_pass_bgl],
+            push_constant_ranges: &[],
+        });
+        let mesh3d_shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mesh3d_shadow"),
+            layout: Some(&shadow_pass_layout),
+            vertex: wgpu::VertexState {
+                module: &shader_module,
+                entry_point: Some("vs_shadow_depth"),
+                // Same buffer the main mesh3d pipeline uses (stride 32,
+                // pos+uv+normal) — only position is declared/read here, but
+                // the stride must still match the real per-vertex layout.
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 32,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: MESH3D_DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let shadow_comparison_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow_comparison_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
 
         Ok(Self {
@@ -572,6 +674,9 @@ impl GpuSceneRenderer {
             blit_pipelines: HashMap::new(),
             mesh3d_bgl,
             mesh3d_pipelines,
+            shadow_pass_bgl,
+            mesh3d_shadow_pipeline,
+            shadow_comparison_sampler,
             particle_bgl,
             particle_pipeline_add,
             particle_pipeline_over,
@@ -1566,6 +1671,24 @@ pub struct GpuSceneInstance {
     /// Depth buffer for `mesh3d`; `None` when there are no meshes. The 2D
     /// layers never touch it — they keep their painter's ordering.
     mesh3d_depth: Option<wgpu::TextureView>,
+    /// Scene-wide lighting/fog state, shared by every mesh3d draw call's
+    /// bind group (binding 3) rather than duplicated per mesh. Built once at
+    /// scene setup: `Scene::lights()`/`general.fog()` have no per-frame
+    /// animation path today, matching `build_mesh3d`'s own "static in real
+    /// content" assumption for MVP. Always allocated, even for scenes with no
+    /// meshes — the cost is one small buffer, and it keeps this field
+    /// unconditional rather than `Option`. Not read back after construction —
+    /// kept alive here (rather than as a `build_mesh3d`-local) so its
+    /// lifetime is explicit and it's in place for a future per-frame rebuild
+    /// if scripted-parent lights ever need one, matching how `Mesh3dGpu::ubo`
+    /// already gets rewritten for scripted-parent meshes.
+    #[allow(dead_code)]
+    mesh3d_lighting_ubo: wgpu::Buffer,
+    /// Shared shadow atlas texture (see `build_shadow_atlas`) — kept alive
+    /// for the same reason as `mesh3d_lighting_ubo`: every mesh3d bind group
+    /// holds a view into it, built once here rather than per mesh.
+    #[allow(dead_code)]
+    shadow_atlas_tex: wgpu::Texture,
     /// Retained for the per-frame parent recompose, which has to rebuild each
     /// mesh's MVP and each layer's projected rect.
     camera3d: Option<crate::engine::camera3d::PerspectiveCamera>,
@@ -1646,6 +1769,140 @@ struct Mesh3dGpu {
     /// Meshes are never culled on it (a skybox legitimately surrounds the
     /// camera); it only orders them against the 2D layers.
     depth: f32,
+}
+
+/// Point-light cap for the mesh3d lighting pass. Must match
+/// `MESH3D_MAX_LIGHTS` in `gpu_shaders.wgsl` exactly — there's no shared
+/// constant across the Rust/WGSL boundary, so keep the two in sync by hand.
+const MESH3D_MAX_LIGHTS: usize = 8;
+
+/// Shadow-casting-light cap, mirrored from `engine::shadow::MAX_SHADOW_LIGHTS`
+/// — must also match `MESH3D_MAX_SHADOW_LIGHTS` in `gpu_shaders.wgsl` by
+/// hand, same caveat as `MESH3D_MAX_LIGHTS`.
+const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::shadow::MAX_SHADOW_LIGHTS;
+
+/// Byte length of the `Mesh3dLighting` uniform buffer: 5 leading `vec4`s
+/// (flags, ambient, fog_distance, fog_height, fog_extra), two
+/// `MESH3D_MAX_LIGHTS`-length `vec4` arrays (positions, colors), then
+/// `MESH3D_MAX_SHADOW_LIGHTS` `mat4x4`s (shadow view-projections) and
+/// `MESH3D_MAX_SHADOW_LIGHTS` `vec4`s (their atlas UV sub-rects).
+const MESH3D_LIGHTING_BYTES_LEN: usize =
+    16 * 5 + 16 * MESH3D_MAX_LIGHTS * 2 + (64 + 16) * MESH3D_MAX_SHADOW_LIGHTS;
+
+/// Pack one mesh's `Mesh3dTransform` uniform (mvp, model_view, normal_view,
+/// model) — layout must match `Mesh3dTransform` in `gpu_shaders.wgsl`
+/// exactly. `model` (object→world, no view/projection) is what the shadow
+/// lookup in `fs_mesh3d` needs `world_pos` for — the light's view-projection
+/// is naturally built in world space, unlike everything else here which
+/// works in the main camera's view space.
+fn mesh3d_transform_bytes(
+    cam: &crate::engine::camera3d::PerspectiveCamera,
+    origin: [f32; 3],
+    angles: [f32; 3],
+    scale: [f32; 3],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(64 * 4);
+    for mat in [
+        cam.mvp(origin, angles, scale),
+        cam.model_view(origin, angles, scale),
+        cam.normal_view(angles, scale),
+        crate::engine::camera3d::model_matrix(origin, angles, scale),
+    ] {
+        for col in mat.iter() {
+            for f in col {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// Pack the scene-wide `Mesh3dLighting` uniform: ambient + fog (already
+/// resolved by `General::ambient_color`/`General::fog`), up to
+/// `MESH3D_MAX_LIGHTS` point lights from `Scene::lights` (positions in the
+/// camera's view space, matching everything else `fs_mesh3d` works in), and
+/// up to `MESH3D_MAX_SHADOW_LIGHTS` shadow view-projections + atlas UV
+/// rects (world space — see `mesh3d_transform_bytes`). Layout must match
+/// `Mesh3dLighting` in `gpu_shaders.wgsl` exactly.
+///
+/// `shadow_slots[i]` is the shadow-atlas slot index for `scene.lights()[i]`,
+/// or `None` when that light doesn't cast a shadow (unlit, or beyond
+/// `MESH3D_MAX_SHADOW_LIGHTS` — see `GpuSceneInstance::build_shadow_atlas`).
+/// A light's `light_pos[i].w` carries `(slot + 1) as f32` so the shader can
+/// tell "no shadow" (0.0) from "shadow slot 0" without a separate flags
+/// field — `light_color.a <= 0.0` (unused light slot) already uses the same
+/// "skip" convention.
+fn mesh3d_lighting_bytes(
+    scene: &crate::engine::scene::Scene,
+    cam: &crate::engine::camera3d::PerspectiveCamera,
+    shadow_slots: &[Option<usize>],
+    shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
+) -> Vec<u8> {
+    let lights = scene.lights();
+    let general = scene.general.as_ref();
+    let fog = general.and_then(|g| g.fog());
+    let ambient = general.and_then(|g| g.ambient_color()).unwrap_or([0.0; 3]);
+
+    let mut bytes = Vec::with_capacity(MESH3D_LIGHTING_BYTES_LEN);
+    let mut push4 = |v: [f32; 4]| {
+        for f in v {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+    };
+
+    push4([if lights.is_empty() { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0]);
+    push4([ambient[0], ambient[1], ambient[2], 0.0]);
+    match &fog {
+        Some(f) => {
+            push4([f.distance_color[0], f.distance_color[1], f.distance_color[2], f.distance_density]);
+            push4([f.height_color[0], f.height_color[1], f.height_color[2], f.height_density]);
+            push4([f.height_exponent, f.height_offset, 0.0, 0.0]);
+        }
+        None => {
+            push4([0.0; 4]);
+            push4([0.0; 4]);
+            push4([0.0; 4]);
+        }
+    }
+
+    let mut positions = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
+    let mut colors = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
+    for (i, ((pos_slot, color_slot), (light, _casts_shadow))) in positions
+        .iter_mut()
+        .zip(colors.iter_mut())
+        .zip(lights.iter())
+        .enumerate()
+    {
+        if let crate::engine::lighting::Light::Point { origin, color, intensity, .. } = light {
+            let vp = cam.to_view_space(*origin);
+            let shadow_w = shadow_slots
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|s| (s + 1) as f32)
+                .unwrap_or(0.0);
+            *pos_slot = [vp[0], vp[1], vp[2], shadow_w];
+            *color_slot = [color[0], color[1], color[2], *intensity];
+        }
+    }
+    for p in positions {
+        push4(p);
+    }
+    for c in colors {
+        push4(c);
+    }
+
+    for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
+        let (vp, uv_rect) = shadow_slot_data
+            .get(slot)
+            .copied()
+            .unwrap_or((crate::engine::camera3d::identity(), [0.0; 4]));
+        for col in vp.iter() {
+            push4(*col);
+        }
+        push4(uv_rect);
+    }
+    bytes
 }
 
 impl GpuSceneInstance {
@@ -2103,6 +2360,47 @@ impl GpuSceneInstance {
         // drawn" apart from "drawn but occluded" in a scene the camera sits
         // inside of (same role as WP_DEBUG_DUMP_FRAME).
         let mesh_filter = std::env::var("WP_MESH_FILTER").ok();
+        // Shadow atlas: one shared depth texture, packed with a tile per
+        // shadow-casting `light` object — see `build_shadow_atlas` and
+        // `engine::shadow`. Built before the lighting uniform and the final
+        // mesh3d draws because both need to bind its (by-then-final) view.
+        let lights = resolved.scene.lights();
+        let (shadow_atlas_tex, shadow_slots, shadow_slot_data) = if camera3d.is_some() {
+            Self::build_shadow_atlas(&renderer, &resolved.mesh3d_layers, &lights)
+        } else {
+            (
+                renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("shadow_atlas_dummy"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: MESH3D_DEPTH_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                }),
+                vec![None; lights.len()],
+                Vec::new(),
+            )
+        };
+        let shadow_atlas_view = shadow_atlas_tex.create_view(&Default::default());
+        // Scene-wide lighting/fog/shadow uniform, shared by every mesh3d
+        // bind group (binding 3) — see `mesh3d_lighting_bytes`. Zeroed (and
+        // thus read as "no lighting") when there's no perspective camera to
+        // place lights through, matching `mesh3d` staying empty in that case.
+        let mesh3d_lighting_bytes = camera3d
+            .as_ref()
+            .map(|cam| mesh3d_lighting_bytes(&resolved.scene, cam, &shadow_slots, &shadow_slot_data))
+            .unwrap_or_else(|| vec![0u8; MESH3D_LIGHTING_BYTES_LEN]);
+        let mesh3d_lighting_ubo = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mesh3d_lighting"),
+            size: mesh3d_lighting_bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        renderer
+            .queue
+            .write_buffer(&mesh3d_lighting_ubo, 0, &mesh3d_lighting_bytes);
         let mesh3d: Vec<Mesh3dGpu> = match &camera3d {
             Some(cam) => resolved
                 .mesh3d_layers
@@ -2112,7 +2410,7 @@ impl GpuSceneInstance {
                         .as_ref()
                         .is_none_or(|f| m.name.contains(f.as_str()))
                 })
-                .map(|m| Self::build_mesh3d(&renderer, cam, m))
+                .map(|m| Self::build_mesh3d(&renderer, cam, m, &mesh3d_lighting_ubo, &shadow_atlas_view))
                 .collect(),
             None => Vec::new(),
         };
@@ -2163,6 +2461,8 @@ impl GpuSceneInstance {
             perspective: camera3d.is_some(),
             mesh3d,
             mesh3d_depth,
+            mesh3d_lighting_ubo,
+            shadow_atlas_tex,
             camera3d,
             current_locals: resolved.transform_graph.local.clone(),
             transform_graph: resolved.transform_graph,
@@ -2170,17 +2470,185 @@ impl GpuSceneInstance {
         })
     }
 
-    /// Upload one mesh's geometry and bake its MVP. Geometry and transform are
-    /// both static in real content, so this runs once at load.
-    fn build_mesh3d(
+    /// Render the shadow atlas once at scene setup (shadow-casting lights
+    /// are treated as static, same precedent as mesh MVPs — see
+    /// `build_mesh3d`'s own doc comment). For every `light` object with
+    /// `castshadow: true` (capped at `engine::shadow::MAX_SHADOW_LIGHTS`),
+    /// depth-renders every mesh3d object into that light's tile of one
+    /// shared atlas texture — the architecture recovered from the original
+    /// binary's `_rt_shadowAtlas` (see the Ghidra report's shadow-mapping
+    /// follow-up), not a separate texture per light.
+    ///
+    /// Returns the atlas texture (a harmless 1×1 dummy when there are no
+    /// shadow-casting lights or no mesh3d geometry, so `build_mesh3d`'s bind
+    /// group always has a valid view to reference), a per-`scene.lights()`
+    /// shadow-slot index (`None` = doesn't cast a shadow, or capped out),
+    /// and the per-slot `(view_proj, uv_rect)` data for `mesh3d_lighting_bytes`.
+    fn build_shadow_atlas(
         renderer: &GpuSceneRenderer,
-        cam: &crate::engine::camera3d::PerspectiveCamera,
-        layer: &crate::engine::render::Mesh3dLayer,
-    ) -> Mesh3dGpu {
-        // Interleave position+uv into the vs_mesh3d vertex layout (stride 20).
-        let mut verts: Vec<u8> = Vec::with_capacity(layer.mesh.positions.len() * 20);
-        for (p, uv) in layer.mesh.positions.iter().zip(&layer.mesh.uvs) {
-            for f in [p[0], p[1], p[2], uv[0], uv[1]] {
+        mesh3d_layers: &[crate::engine::render::Mesh3dLayer],
+        lights: &[(crate::engine::lighting::Light, bool)],
+    ) -> (
+        wgpu::Texture,
+        Vec<Option<usize>>,
+        Vec<(crate::engine::camera3d::Mat4, [f32; 4])>,
+    ) {
+        use crate::engine::lighting::Light;
+        use crate::engine::shadow;
+
+        let shadow_casters: Vec<(usize, [f32; 3])> = lights
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (light, casts_shadow))| {
+                if !*casts_shadow {
+                    return None;
+                }
+                match light {
+                    Light::Point { origin, .. } => Some((i, *origin)),
+                    // Directional/spot/tube shadows aren't built yet — see
+                    // the Ghidra report's shadow-mapping follow-up. Not
+                    // reachable today anyway: `Scene::lights()` only ever
+                    // produces `Light::Point`.
+                    _ => None,
+                }
+            })
+            .take(shadow::MAX_SHADOW_LIGHTS)
+            .collect();
+
+        let mut shadow_slots: Vec<Option<usize>> = vec![None; lights.len()];
+
+        if shadow_casters.is_empty() || mesh3d_layers.is_empty() {
+            let dummy = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow_atlas_dummy"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: MESH3D_DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            return (dummy, shadow_slots, Vec::new());
+        }
+
+        let (center, radius) = shadow::scene_bounds(mesh3d_layers);
+        let (atlas_w, atlas_h, tiles) = shadow::pack_tiles(
+            shadow_casters.len(),
+            shadow::SHADOW_TILE_SIZE,
+            shadow::SHADOW_TILE_SIZE * 4,
+        );
+
+        let atlas = renderer.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow_atlas"),
+            size: wgpu::Extent3d {
+                width: atlas_w,
+                height: atlas_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: MESH3D_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let atlas_view = atlas.create_view(&Default::default());
+
+        // Geometry uploaded once, reused for every shadow-casting light's
+        // tile pass. Duplicates the upload `build_mesh3d` does later for the
+        // final draw — real content has ~0 shadow-casting lights (see the
+        // Ghidra report), so trading a little redundant GPU upload for a
+        // simple, independent setup path is the right side of that trade.
+        let geometry: Vec<(wgpu::Buffer, wgpu::Buffer, u32)> = mesh3d_layers
+            .iter()
+            .map(|m| Self::upload_mesh3d_geometry(renderer, &m.mesh))
+            .collect();
+
+        let mut slot_data = Vec::with_capacity(shadow_casters.len());
+        let mut encoder = renderer
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shadow_atlas_pass"),
+            });
+        for (slot, ((light_idx, origin), tile)) in shadow_casters.iter().zip(tiles.iter()).enumerate() {
+            let view_proj = shadow::point_light_view_proj(*origin, center, radius);
+            let uv_rect = shadow::tile_uv_rect(*tile, atlas_w, atlas_h);
+            shadow_slots[*light_idx] = Some(slot);
+            slot_data.push((view_proj, uv_rect));
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow_tile"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &atlas_view,
+                    depth_ops: Some(wgpu::Operations {
+                        // Only the first tile clears — clearing is a
+                        // whole-texture operation in wgpu, so clearing again
+                        // per tile would erase every tile drawn before it.
+                        // Every pixel outside every tile's scissor rect stays
+                        // at this initial 1.0 (far) regardless.
+                        load: if slot == 0 {
+                            wgpu::LoadOp::Clear(1.0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_viewport(tile.x as f32, tile.y as f32, tile.w as f32, tile.h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(tile.x, tile.y, tile.w, tile.h);
+            pass.set_pipeline(&renderer.mesh3d_shadow_pipeline);
+            for (layer, (vbuf, ibuf, index_count)) in mesh3d_layers.iter().zip(geometry.iter()) {
+                let model = crate::engine::camera3d::model_matrix(layer.origin, layer.angles, layer.scale);
+                let light_mvp = crate::engine::camera3d::mat4_mul(&view_proj, &model);
+                let mut mvp_bytes = Vec::with_capacity(64);
+                for col in light_mvp.iter() {
+                    for f in col {
+                        mvp_bytes.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+                let mvp_buf = renderer.make_uniform_buffer(&mvp_bytes, 64);
+                let bg = renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow_pass_bg"),
+                    layout: &renderer.shadow_pass_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: mvp_buf.as_entire_binding(),
+                    }],
+                });
+                pass.set_bind_group(0, &bg, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*index_count, 0, 0..1);
+            }
+        }
+        renderer.queue.submit(std::iter::once(encoder.finish()));
+
+        (atlas, shadow_slots, slot_data)
+    }
+
+    /// Interleave position+uv+normal into the vs_mesh3d vertex layout
+    /// (stride 32: 3 + 2 + 3 floats) and upload it plus the index buffer.
+    /// Shared by the final mesh3d draw (`build_mesh3d`) and the shadow-atlas
+    /// depth pass (`build_shadow_atlas`), which both need the same geometry
+    /// on the GPU but at different points in scene setup — the shadow atlas
+    /// has to exist before `build_mesh3d` can bind it, so its geometry
+    /// upload can't simply be reused from a `Mesh3dGpu` built later.
+    fn upload_mesh3d_geometry(
+        renderer: &GpuSceneRenderer,
+        mesh: &crate::engine::mesh3d::Mesh3d,
+    ) -> (wgpu::Buffer, wgpu::Buffer, u32) {
+        let mut verts: Vec<u8> = Vec::with_capacity(mesh.positions.len() * 32);
+        for ((p, uv), n) in mesh.positions.iter().zip(&mesh.uvs).zip(&mesh.normals) {
+            for f in [p[0], p[1], p[2], uv[0], uv[1], n[0], n[1], n[2]] {
                 verts.extend_from_slice(&f.to_le_bytes());
             }
         }
@@ -2192,12 +2660,7 @@ impl GpuSceneInstance {
         });
         renderer.queue.write_buffer(&vbuf, 0, &verts);
 
-        let idx: Vec<u8> = layer
-            .mesh
-            .indices
-            .iter()
-            .flat_map(|i| i.to_le_bytes())
-            .collect();
+        let idx: Vec<u8> = mesh.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
         let ibuf = renderer.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh3d_indices"),
             size: idx.len() as u64,
@@ -2205,16 +2668,23 @@ impl GpuSceneInstance {
             mapped_at_creation: false,
         });
         renderer.queue.write_buffer(&ibuf, 0, &idx);
+        (vbuf, ibuf, mesh.indices.len() as u32)
+    }
 
-        let mvp = cam.mvp(layer.origin, layer.angles, layer.scale);
-        let mut params: Vec<u8> = Vec::with_capacity(64);
-        for col in mvp.iter() {
-            for f in col {
-                params.extend_from_slice(&f.to_le_bytes());
-            }
-        }
+    /// Upload one mesh's geometry and bake its MVP. Geometry and transform are
+    /// both static in real content, so this runs once at load.
+    fn build_mesh3d(
+        renderer: &GpuSceneRenderer,
+        cam: &crate::engine::camera3d::PerspectiveCamera,
+        layer: &crate::engine::render::Mesh3dLayer,
+        lighting_ubo: &wgpu::Buffer,
+        shadow_atlas_view: &wgpu::TextureView,
+    ) -> Mesh3dGpu {
+        let (vbuf, ibuf, index_count) = Self::upload_mesh3d_geometry(renderer, &layer.mesh);
+
+        let params = mesh3d_transform_bytes(cam, layer.origin, layer.angles, layer.scale);
         let ubo = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mesh3d_mvp"),
+            label: Some("mesh3d_xform"),
             size: params.len() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -2242,13 +2712,27 @@ impl GpuSceneInstance {
                         // Meshes wrap their UVs (skyboxes/spheres tile).
                         resource: wgpu::BindingResource::Sampler(&renderer.samplers[0]),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: lighting_ubo.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(shadow_atlas_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(
+                            &renderer.shadow_comparison_sampler,
+                        ),
+                    },
                 ],
             });
 
         Mesh3dGpu {
             vbuf,
             ibuf,
-            index_count: layer.mesh.indices.len() as u32,
+            index_count,
             bind_group,
             nocull: layer.nocull,
             depthtest: layer.depthtest,
@@ -2323,17 +2807,9 @@ impl GpuSceneInstance {
                     let (lo, la, ls) = m.local;
                     let o = w.apply_point([lo[0] as f64, lo[1] as f64, lo[2] as f64]);
                     let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
-                    let mvp = cam.mvp(
-                        centre,
-                        std::array::from_fn(|i| la[i] + w.r[i] as f32),
-                        std::array::from_fn(|i| ls[i] * w.s[i] as f32),
-                    );
-                    let mut bytes: Vec<u8> = Vec::with_capacity(64);
-                    for col in mvp.iter() {
-                        for f in col {
-                            bytes.extend_from_slice(&f.to_le_bytes());
-                        }
-                    }
+                    let angles: [f32; 3] = std::array::from_fn(|i| la[i] + w.r[i] as f32);
+                    let scale: [f32; 3] = std::array::from_fn(|i| ls[i] * w.s[i] as f32);
+                    let bytes = mesh3d_transform_bytes(cam, centre, angles, scale);
                     (bytes, cam.view_depth(centre))
                 })
                 .collect(),
@@ -3749,7 +4225,22 @@ fn load_effect_instance(
                 tex_key,
                 hardcoded: true,
                 target: None,
-                binds: Vec::new(),
+                // waterripple/waterwaves distort-and-resample their primary
+                // color input (src_tex) to fake refraction — for that to look
+                // like real refraction it has to be the scene behind this
+                // layer, not the layer's own base texture. Binding slot 0 to
+                // the wallpaper-global scene buffer name reuses the exact
+                // snapshot-and-bind machinery the generic (non-hardcoded)
+                // per-pass loop already runs for any effect that declares
+                // this bind in its own JSON (see the `_rt_FullFrameBuffer`
+                // arm below) — these two hardcoded kernels just never asked
+                // for it, so they fell back to self-refracting their own
+                // base image instead of the real backdrop.
+                binds: if matches!(effect_name.as_str(), "waterripple" | "waterwaves") {
+                    vec![(0, "_rt_FullFrameBuffer".to_string())]
+                } else {
+                    Vec::new()
+                },
                 values: {
                     // Hardcoded kernels read combos (e.g. shake's DIRECTION/
                     // NOISE) as pseudo-values with a `combo_` prefix.
@@ -4525,6 +5016,53 @@ fn make_effect_params(name: &str, time: f32, vals: &ShaderVals) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `gpu_shaders.wgsl` must parse and validate as WGSL on its own — the
+    /// only check in this crate that catches a shader syntax/type error
+    /// before it surfaces at runtime as an opaque wgpu pipeline-creation
+    /// failure the first time a scene that uses that pass actually loads.
+    /// Uses naga directly (no GPU adapter needed — pure frontend/validator).
+    #[test]
+    fn gpu_shaders_wgsl_parses_and_validates() {
+        let module =
+            naga::front::wgsl::parse_str(SHADER_SRC).expect("gpu_shaders.wgsl failed to parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("gpu_shaders.wgsl failed validation");
+    }
+
+    /// Same rule as `hardcoded_effect_params_are_uniform_sized` below, for the
+    /// mesh3d lighting UBO: the Rust-side byte length must match WGSL's
+    /// std140 struct size (a 16-byte multiple) and `mesh3d_lighting_bytes`
+    /// must actually produce that many bytes, or wgpu rejects the mesh3d bind
+    /// group at draw time.
+    #[test]
+    fn mesh3d_lighting_bytes_are_uniform_sized_and_match_const() {
+        assert_eq!(MESH3D_LIGHTING_BYTES_LEN % 16, 0);
+        let scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
+        )
+        .unwrap();
+        let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap();
+
+        // The common case: no shadow-casting lights at all.
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+        assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
+
+        // One shadow-casting light occupying slot 0 — same length either way,
+        // since the shadow arrays are fixed-size regardless of how many
+        // slots are actually in use.
+        let shadow_slots = vec![Some(0)];
+        let shadow_slot_data = vec![(
+            crate::engine::camera3d::identity(),
+            [0.0, 0.0, 1.0, 1.0],
+        )];
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data);
+        assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
+    }
 
     /// WGSL rounds every uniform-address-space struct up to a 16-byte
     /// multiple, so a param buffer that isn't one can never match its shader

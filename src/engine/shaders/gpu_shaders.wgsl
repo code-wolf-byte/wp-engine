@@ -798,24 +798,223 @@ fn fs_particles(in: ParticleVsOut) -> @location(0) vec4<f32> {
 // .mdl, drawn through the scene camera with a depth buffer — unlike every other
 // pipeline here, which composites flat quads. See `engine::mesh3d`.
 
-@group(0) @binding(0) var<uniform> mesh3d_mvp: mat4x4<f32>;
+const MESH3D_MAX_LIGHTS: u32 = 8u;
+// Must match `engine::shadow::MAX_SHADOW_LIGHTS` and
+// `MESH3D_MAX_SHADOW_LIGHTS` in gpu_renderer.rs exactly — no shared constant
+// across the Rust/WGSL boundary, same caveat as MESH3D_MAX_LIGHTS.
+const MESH3D_MAX_SHADOW_LIGHTS: u32 = 4u;
+// Depth-compare bias, tuned to avoid acne without excessive peter-panning.
+// WE's real bias isn't recoverable from the binary (see the Ghidra report's
+// shadow-mapping follow-up) — this is a standard, documented stand-in value.
+const MESH3D_SHADOW_BIAS: f32 = 0.003;
+
+struct Mesh3dTransform {
+    mvp: mat4x4<f32>,
+    // World→view (no projection): gives the fragment shader a view-space
+    // position, matching the space `engine::lighting`'s BRDF math (and the
+    // original's own `PerformLighting_V1`) operates in.
+    model_view: mat4x4<f32>,
+    // view_rotation · object_rotation · diag(1/scale) — see
+    // `camera3d::PerspectiveCamera::normal_view`. Only the upper-left 3x3
+    // matters; normals are transformed with w=0 so the translation column
+    // (borrowed from `model_view`'s own layout) never contributes.
+    normal_view: mat4x4<f32>,
+    // Object→world, no view/projection. Shadow-map lookups need world
+    // position: each shadow-casting light's view-projection is naturally
+    // built in world space (see `engine::shadow::point_light_view_proj`),
+    // unlike everything else here, which stays in the main camera's view
+    // space.
+    model: mat4x4<f32>,
+}
+
+// Scene-wide lighting state, shared by every mesh3d draw call this frame (one
+// buffer, not per-mesh) — see `GpuSceneRenderer::build_mesh3d_lighting`.
+struct Mesh3dLighting {
+    // x = 1.0 when the scene has any `light` objects. Real Workshop content
+    // is ~100% unlit (see gpu_renderer.rs's ambientcolor note) so this stays
+    // 0.0 for virtually every scene, and the fragment shader falls back to
+    // the plain textured look every mesh3d scene already had — this pass is
+    // additive, never a regression for existing unlit content.
+    flags: vec4<f32>,
+    ambient: vec4<f32>,       // rgb; a unused
+    fog_distance: vec4<f32>,  // rgb = color, a = density (0 = off)
+    fog_height: vec4<f32>,    // rgb = color, a = density (0 = off)
+    fog_extra: vec4<f32>,     // x = height exponent, y = height offset
+    // Fixed-size point-light array (scene.json's `light` objects only ever
+    // resolve to points — see `Scene::lights`). Unused slots have
+    // light_color.a == 0 and are skipped; no separate count field needed.
+    // light_pos[i].w doubles as a shadow-atlas slot selector: 0.0 = this
+    // light casts no shadow, else `slot + 1` — see
+    // `gpu_renderer.rs::mesh3d_lighting_bytes`.
+    light_pos: array<vec4<f32>, MESH3D_MAX_LIGHTS>,
+    light_color: array<vec4<f32>, MESH3D_MAX_LIGHTS>,
+    // Per-shadow-slot world-space view-projection (wgpu depth range) and
+    // atlas sub-rect (u, v, scale_u, scale_v) — see `engine::shadow`. This
+    // is the shared-atlas addressing scheme recovered from the original
+    // binary's `g_LFeature_ShadowProjectionTransform` (a vec4 sub-rect, not
+    // a second matrix — see the Ghidra report's shadow-mapping follow-up).
+    shadow_view_proj: array<mat4x4<f32>, MESH3D_MAX_SHADOW_LIGHTS>,
+    shadow_uv_rect: array<vec4<f32>, MESH3D_MAX_SHADOW_LIGHTS>,
+}
+
+@group(0) @binding(0) var<uniform> mesh3d_xform: Mesh3dTransform;
 @group(0) @binding(1) var mesh3d_tex: texture_2d<f32>;
 @group(0) @binding(2) var mesh3d_sampler: sampler;
+@group(0) @binding(3) var<uniform> mesh3d_lighting: Mesh3dLighting;
+@group(0) @binding(4) var shadow_atlas: texture_depth_2d;
+@group(0) @binding(5) var shadow_sampler: sampler_comparison;
 
 struct Mesh3dVsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) view_pos: vec3<f32>,
+    @location(2) view_normal: vec3<f32>,
+    @location(3) world_pos: vec3<f32>,
 };
 
 @vertex
-fn vs_mesh3d(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>) -> Mesh3dVsOut {
+fn vs_mesh3d(
+    @location(0) pos: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) normal: vec3<f32>,
+) -> Mesh3dVsOut {
     var out: Mesh3dVsOut;
-    out.position = mesh3d_mvp * vec4(pos, 1.0);
+    out.position = mesh3d_xform.mvp * vec4(pos, 1.0);
     out.uv = uv;
+    out.view_pos = (mesh3d_xform.model_view * vec4(pos, 1.0)).xyz;
+    out.view_normal = (mesh3d_xform.normal_view * vec4(normal, 0.0)).xyz;
+    out.world_pos = (mesh3d_xform.model * vec4(pos, 1.0)).xyz;
     return out;
+}
+
+// ── Shadow-caster depth pass ──────────────────────────────────────────────
+// Renders every mesh3d object's geometry, position-only, into one tile of
+// the shared shadow atlas — see `engine::shadow` and
+// `GpuSceneInstance::build_shadow_atlas`. No fragment stage: depth-only.
+
+@group(0) @binding(0) var<uniform> shadow_mvp: mat4x4<f32>;
+
+@vertex
+fn vs_shadow_depth(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return shadow_mvp * vec4(pos, 1.0);
+}
+
+const MESH3D_ROUGHNESS: f32 = 0.6;
+const MESH3D_F0: vec3<f32> = vec3<f32>(0.04, 0.04, 0.04);
+const MESH3D_PI: f32 = 3.14159265;
+
+// Cook-Torrance BRDF core (GGX distribution + Smith-Schlick geometry +
+// Schlick Fresnel), ported term-for-term from `engine::lighting::brdf_core`
+// (that Rust version stays the CPU-side tested reference — WGSL can't call
+// into it, so this is a transcription, not a shared implementation).
+// Mesh3d materials don't expose per-material roughness/metallic yet, so this
+// uses fixed dielectric defaults rather than a full material PBR surface.
+fn mesh3d_brdf(n: vec3<f32>, l: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, light_color: vec3<f32>) -> vec3<f32> {
+    let h = normalize(l + v);
+    let ndl = max(dot(n, l), 0.0);
+    let ndv = max(dot(n, v), 0.001);
+    let ndh = max(dot(n, h), 0.0);
+    let ldh = max(dot(l, h), 0.0);
+
+    let a = MESH3D_ROUGHNESS * MESH3D_ROUGHNESS;
+    let a2 = a * a;
+    let denom = ndh * ndh * (a2 - 1.0) + 1.0;
+    let d = a2 / (MESH3D_PI * denom * denom);
+
+    let k = (MESH3D_ROUGHNESS + 1.0) * (MESH3D_ROUGHNESS + 1.0) * 0.125;
+    let gv = ndv / (ndv * (1.0 - k) + k);
+    let gl = ndl / (ndl * (1.0 - k) + k);
+
+    let f = MESH3D_F0 + (vec3<f32>(1.0) - MESH3D_F0) * pow(1.0 - ldh, 5.0);
+
+    let spec_den = max(4.0 * ndv * ndl, 0.001);
+    let spec = f * (d * gv * gl) * (ndl / spec_den) * 0.25;
+
+    let kd = 1.0 - max(max(MESH3D_F0.r, MESH3D_F0.g), MESH3D_F0.b);
+    let diff = vec3<f32>(kd) * albedo * (ndl / MESH3D_PI);
+
+    return (spec + diff) * light_color;
+}
+
+// `shadow_w` is `light_pos[i].w` — 0.0 means this light casts no shadow
+// (the common case: real Workshop content never sets `castshadow`, per the
+// Ghidra report). Otherwise `shadow_w - 1` is the slot into
+// `shadow_view_proj`/`shadow_uv_rect`. Returns 1.0 = fully lit, 0.0 = fully
+// shadowed, matching `engine::lighting`'s `shadow_factor` convention exactly
+// — this is the first real (non-1.0-constant) caller of that parameter.
+fn mesh3d_shadow_factor(shadow_w: f32, world_pos: vec3<f32>) -> f32 {
+    if (shadow_w < 0.5) {
+        return 1.0;
+    }
+    let slot = i32(shadow_w) - 1;
+    let light_clip = mesh3d_lighting.shadow_view_proj[slot] * vec4(world_pos, 1.0);
+    if (light_clip.w <= 0.0) {
+        // Behind the light's own near plane — outside its projection
+        // entirely, so there's nothing to compare against. Treat as
+        // unshadowed rather than sampling garbage.
+        return 1.0;
+    }
+    let ndc = light_clip.xy / light_clip.w;
+    let depth = light_clip.z / light_clip.w;
+    // NDC is Y-up in [-1,1]; texture V is Y-down in [0,1] — the standard
+    // rasterizer flip, same relationship every other screen-space pass in
+    // this file relies on implicitly via the rasterizer itself.
+    let local_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let uv_rect = mesh3d_lighting.shadow_uv_rect[slot];
+    let atlas_uv = uv_rect.xy + local_uv * uv_rect.zw;
+    return textureSampleCompareLevel(shadow_atlas, shadow_sampler, atlas_uv, depth - MESH3D_SHADOW_BIAS);
 }
 
 @fragment
 fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
-    return textureSample(mesh3d_tex, mesh3d_sampler, in.uv);
+    let albedo = textureSample(mesh3d_tex, mesh3d_sampler, in.uv);
+    if (mesh3d_lighting.flags.x < 0.5) {
+        return albedo;
+    }
+
+    let n = normalize(in.view_normal);
+    // The camera sits at the view-space origin by construction, so the
+    // direction back to it from any point is simply `-view_pos`.
+    let v = normalize(-in.view_pos);
+
+    var lit = mesh3d_lighting.ambient.rgb * albedo.rgb;
+    for (var i = 0u; i < MESH3D_MAX_LIGHTS; i = i + 1u) {
+        let lc = mesh3d_lighting.light_color[i];
+        if (lc.a <= 0.0) {
+            continue;
+        }
+        let to_light = mesh3d_lighting.light_pos[i].xyz - in.view_pos;
+        let dist2 = max(dot(to_light, to_light), 0.0001);
+        let l = to_light * inverseSqrt(dist2);
+        let atten = lc.a / dist2;
+        let shadow_factor = mesh3d_shadow_factor(mesh3d_lighting.light_pos[i].w, in.world_pos);
+        lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten) * shadow_factor;
+    }
+
+    var color = lit;
+    let fd = mesh3d_lighting.fog_distance;
+    let fh = mesh3d_lighting.fog_height;
+    if (fd.a > 0.0 || fh.a > 0.0) {
+        // Matches `engine::lighting::fog_factor`/`fog_apply` exactly — see
+        // that module for the derivation.
+        let dist = max(-in.view_pos.z, 0.0);
+        var d_factor = 0.0;
+        if (fd.a > 0.0) {
+            d_factor = 1.0 - exp(-fd.a * dist);
+        }
+        var h_factor = 0.0;
+        if (fh.a > 0.0) {
+            let height = max(mesh3d_lighting.fog_extra.y - in.view_pos.y, 0.0);
+            h_factor = 1.0 - exp(-fh.a * height * mesh3d_lighting.fog_extra.x);
+        }
+        let f = clamp(1.0 - (1.0 - d_factor) * (1.0 - h_factor), 0.0, 1.0);
+        var fog_color = fd.rgb;
+        if (fh.a > 0.0) {
+            let hw = fh.a / (fd.a + fh.a + 1e-6);
+            fog_color = fd.rgb * (1.0 - hw) + fh.rgb * hw;
+        }
+        color = color * (1.0 - f) + fog_color * f;
+    }
+
+    return vec4<f32>(color, albedo.a);
 }

@@ -1565,24 +1565,7 @@ fn mesh3d_layer_from_object(
 /// smooth quadratic falloff scaled by `intensity`. Additively blended so it
 /// brightens whatever is behind it (like a real light).
 fn light_layer_from_object(obj: &SceneObject) -> Option<Layer> {
-    let radius = obj
-        .radius
-        .as_ref()
-        .and_then(crate::engine::scene::parse_value_f32)
-        .unwrap_or(256.0)
-        .max(1.0);
-    let intensity = obj
-        .intensity
-        .as_ref()
-        .and_then(crate::engine::scene::parse_value_f32)
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
-    let color = obj
-        .color
-        .as_ref()
-        .and_then(|v| crate::engine::scene::parse_value_vec3(v))
-        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
-        .unwrap_or([1.0, 1.0, 1.0]);
+    let (radius, intensity, color) = obj.light_params()?;
 
     let d = (radius * 2.0).min(2048.0) as u32;
     let mut img = RgbaImage::new(d, d);

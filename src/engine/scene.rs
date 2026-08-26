@@ -39,6 +39,41 @@ impl Scene {
                 .as_ref()
                 .is_some_and(|c| c.parsed_eye().is_some() && c.parsed_center().is_some())
     }
+
+    /// Resolve every `light` scene object into a world-space point light for
+    /// the mesh3d lighting pass. Real content only ever populates the generic
+    /// `light`/`radius`/`intensity`/`color` fields (no directional/spot/tube
+    /// distinction is parseable from scene.json today — see
+    /// `SceneObject::light_params`), so every light resolves as a point light
+    /// positioned at the object's origin.
+    /// Every `light` scene object as `(light, casts_shadow)`. Paired rather
+    /// than two parallel vecs so a caller can never let a shadow flag drift
+    /// out of sync with the light it belongs to after filtering.
+    pub fn lights(&self) -> Vec<(crate::engine::lighting::Light, bool)> {
+        self.objects
+            .iter()
+            .filter(|o| o.image.is_none())
+            .filter_map(|o| {
+                let (radius, intensity, color) = o.light_params()?;
+                let origin = o.parsed_origin();
+                let origin = [origin[0] as f32, origin[1] as f32, origin[2] as f32];
+                let casts_shadow = o
+                    .castshadow
+                    .as_ref()
+                    .and_then(parse_value_bool)
+                    .unwrap_or(false);
+                Some((
+                    crate::engine::lighting::Light::Point {
+                        origin,
+                        color,
+                        intensity,
+                        radius,
+                    },
+                    casts_shadow,
+                ))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +165,21 @@ pub struct General {
     // tint (a minimal lighting approximation, no per-normal shading).
     pub ambientcolor: Option<serde_json::Value>,
     pub skylightcolor: Option<serde_json::Value>,
+    // Scene fog (from the 2031-name property schema: g_FogDistance_*, g_FogHeight_*).
+    // `fogdistance` = distance-fog density (0 = off); `fogheight` = height-fog density.
+    // Colours and exponents come from the per-scene property surface.
+    #[serde(rename = "fogdistance")]
+    pub fog_distance: Option<serde_json::Value>,
+    #[serde(rename = "fogheight")]
+    pub fog_height: Option<serde_json::Value>,
+    #[serde(rename = "fogdistancecolor")]
+    pub fog_distance_color: Option<serde_json::Value>,
+    #[serde(rename = "fogheightcolor")]
+    pub fog_height_color: Option<serde_json::Value>,
+    #[serde(rename = "fogheightexponent")]
+    pub fog_height_exponent: Option<serde_json::Value>,
+    #[serde(rename = "fogheightoffset")]
+    pub fog_height_offset: Option<serde_json::Value>,
     // Bloom color tint.
     pub bloomtint: Option<serde_json::Value>,
     #[serde(rename = "bloomhdrfeather")]
@@ -175,6 +225,58 @@ impl General {
             [0.0, 0.0]
         };
         [g[0] + w[0], -(g[1] + w[1])]
+    }
+
+    /// Resolve the scene's fog parameters from the `g_Fog*` property surface.
+    ///
+    /// Returns `None` when both distance and height fog density are 0 / unset
+    /// (fog off). The caller (render.rs / gpu_renderer.rs) should only run
+    /// the fog pass when this returns `Some`.
+    pub fn fog(&self) -> Option<crate::engine::lighting::Fog> {
+        use crate::engine::lighting::Fog;
+        let d = self.fog_distance.as_ref().and_then(parse_value_f32).unwrap_or(0.0);
+        let h = self.fog_height.as_ref().and_then(parse_value_f32).unwrap_or(0.0);
+        if d <= 0.0 && h <= 0.0 {
+            return None;
+        }
+        Some(Fog {
+            distance_density: d,
+            distance_color: self
+                .fog_distance_color
+                .as_ref()
+                .and_then(parse_value_vec3)
+                .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+                .unwrap_or([1.0; 3]),
+            height_density: h,
+            height_color: self
+                .fog_height_color
+                .as_ref()
+                .and_then(parse_value_vec3)
+                .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+                .unwrap_or([1.0; 3]),
+            height_exponent: self
+                .fog_height_exponent
+                .as_ref()
+                .and_then(parse_value_f32)
+                .unwrap_or(1.0),
+            height_offset: self
+                .fog_height_offset
+                .as_ref()
+                .and_then(parse_value_f32)
+                .unwrap_or(0.0),
+        })
+    }
+
+    /// Scene ambient color (`ambientcolor`), for the mesh3d lighting pass.
+    /// `None` when unset — distinct from `Some([0,0,0])`, so the lighting pass
+    /// can tell "no ambient authored" (skip the term) from "authored black"
+    /// (matches real content's near-universal unauthored default: applying it
+    /// unconditionally would darken every mesh3d scene, lit or not).
+    pub fn ambient_color(&self) -> Option<[f32; 3]> {
+        self.ambientcolor
+            .as_ref()
+            .and_then(parse_value_vec3)
+            .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
     }
 }
 
@@ -391,6 +493,33 @@ impl SceneObject {
         }
         let p = self.model.as_ref()?.as_str()?;
         p.to_lowercase().ends_with(".mdl").then_some(p)
+    }
+
+    /// Resolve `(radius, intensity, color)` for a `light` object — `None` when
+    /// this isn't one. Shared by the 2D glow stand-in (`render.rs`) and the
+    /// mesh3d per-pixel lighting pass (`Scene::lights`), so both treat a
+    /// `light` object's fields identically.
+    pub fn light_params(&self) -> Option<(f32, f32, [f32; 3])> {
+        self.light.as_ref()?;
+        let radius = self
+            .radius
+            .as_ref()
+            .and_then(parse_value_f32)
+            .unwrap_or(256.0)
+            .max(1.0);
+        let intensity = self
+            .intensity
+            .as_ref()
+            .and_then(parse_value_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let color = self
+            .color
+            .as_ref()
+            .and_then(parse_value_vec3)
+            .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+            .unwrap_or([1.0, 1.0, 1.0]);
+        Some((radius, intensity, color))
     }
 }
 
@@ -741,6 +870,20 @@ pub fn parse_value_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
             // Use the static default; runtime scripting is not yet supported.
             m.get("value").and_then(|inner| parse_value_vec3(inner))
         }
+        _ => None,
+    }
+}
+
+/// Unwrap a possibly `{"value": ...}`-wrapped JSON value to `[f64; 4]` (rgb + w).
+/// Accepts a 4-component array/string, or a 3-component value (w defaults to 1.0).
+/// Used for `g_L*_Color` / `g_L*_Origin` uniforms where w carries intensity.
+pub fn parse_value_vec4(v: &serde_json::Value) -> Option<[f64; 4]> {
+    match v {
+        serde_json::Value::Array(arr) if arr.len() >= 3 => {
+            let g = |i: usize| arr.get(i).and_then(|x| x.as_f64()).unwrap_or(if i == 3 { 1.0 } else { 0.0 });
+            Some([g(0), g(1), g(2), g(3)])
+        }
+        serde_json::Value::Object(m) => m.get("value").and_then(|inner| parse_value_vec4(inner)),
         _ => None,
     }
 }
