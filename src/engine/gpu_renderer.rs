@@ -1964,6 +1964,7 @@ fn mesh3d_lighting_bytes(
             l,
             crate::engine::lighting::Light::Point { .. }
                 | crate::engine::lighting::Light::Spot { .. }
+                | crate::engine::lighting::Light::Directional { .. }
         )
     });
     push4([if has_renderable_light { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
@@ -2024,8 +2025,31 @@ fn mesh3d_lighting_bytes(
                 let vd = cam.to_view_direction(*direction);
                 *spot_slot = [vd[0], vd[1], vd[2], *exponent];
             }
-            // Directional/Tube: `Scene::lights()` never produces these
-            // today (see scene.rs) — left unrenderable rather than guessed.
+            crate::engine::lighting::Light::Directional {
+                direction,
+                color,
+                intensity,
+            } => {
+                // Infinite light: `light_pos[i].xyz` carries a
+                // pre-normalized view-space direction from the surface
+                // toward the light (the negation of the light's own
+                // travel direction, matching `to_light`'s convention for
+                // Point/Spot), flagged via `w = -1.0` — a sentinel real
+                // shadow_w values never take (0, or a positive slot+1).
+                // See `fs_mesh3d`'s light loop in gpu_shaders.wgsl.
+                let vd = cam.to_view_direction(*direction);
+                let neg = [-vd[0], -vd[1], -vd[2]];
+                let len = (neg[0] * neg[0] + neg[1] * neg[1] + neg[2] * neg[2])
+                    .sqrt()
+                    .max(1e-6);
+                *pos_slot = [neg[0] / len, neg[1] / len, neg[2] / len, -1.0];
+                *color_slot = [color[0], color[1], color[2], *intensity];
+                // spot_slot stays [0,0,0,0] — mesh3d_spot_factor's own
+                // "not a spot" check already no-ops for a directional light.
+            }
+            // Tube: `Scene::lights()` never produces this today (see
+            // scene.rs's `LightType::Tube` doc comment) — left unrenderable
+            // rather than guessed.
             _ => {}
         }
     }
@@ -5432,6 +5456,46 @@ mod tests {
         let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
         assert!(len2 > 0.25, "spot direction must not read as zero: {dir:?}");
         assert!(read_f32(3) >= 1.0, "exponent must be clamped to at least 1.0");
+    }
+
+    /// A directional light must flag itself via `light_pos[0].w == -1.0`
+    /// (the sentinel `fs_mesh3d`'s light loop branches on) with a unit-length
+    /// view-space direction in xyz, and still engage the lit branch.
+    #[test]
+    fn mesh3d_lighting_bytes_encodes_directional_sentinel_and_direction() {
+        let cam_scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
+        )
+        .unwrap();
+        let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+
+        let scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
+                "general": {"orthogonalprojection": null},
+                "objects": [
+                    {"id": 1, "light": "ldirectional", "angles": "0 1.5707963 0",
+                     "intensity": 0.6, "color": "1 1 1"}
+                ]}"#,
+        )
+        .unwrap();
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+
+        let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(flags_x, 1.0, "a directional-only scene must still engage the lit branch");
+
+        // light_pos[0] starts right after the 5 leading vec4s.
+        let pos0_offset = 16 * 5;
+        let read_f32 = |i: usize| {
+            f32::from_le_bytes(
+                bytes[pos0_offset + i * 4..pos0_offset + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let dir = [read_f32(0), read_f32(1), read_f32(2)];
+        let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        assert!((len2 - 1.0).abs() < 1e-4, "direction must be unit-length: {dir:?}");
+        assert_eq!(read_f32(3), -1.0, "w must carry the directional sentinel");
     }
 
     /// WGSL rounds every uniform-address-space struct up to a 16-byte

@@ -1061,12 +1061,30 @@ fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
         if (lc.a <= 0.0) {
             continue;
         }
-        let to_light = mesh3d_lighting.light_pos[i].xyz - in.view_pos;
-        let dist2 = max(dot(to_light, to_light), 0.0001);
-        let l = to_light * inverseSqrt(dist2);
-        let atten = lc.a / dist2;
+        let shadow_w = mesh3d_lighting.light_pos[i].w;
+        var l: vec3<f32>;
+        var atten: f32;
+        if (shadow_w < -0.5) {
+            // Directional (infinite) light: `light_pos[i].xyz` carries a
+            // pre-normalized view-space direction from the surface toward
+            // the light, not a position — no distance falloff. Flagged by
+            // this sentinel since shadow_w is otherwise always >= 0 (see
+            // `gpu_renderer.rs::mesh3d_lighting_bytes`).
+            l = mesh3d_lighting.light_pos[i].xyz;
+            atten = lc.a;
+        } else {
+            let to_light = mesh3d_lighting.light_pos[i].xyz - in.view_pos;
+            let dist2 = max(dot(to_light, to_light), 0.0001);
+            l = to_light * inverseSqrt(dist2);
+            atten = lc.a / dist2;
+        }
+        // Both gracefully no-op for a directional light: `spot_slot` stays
+        // zero-length (mesh3d_spot_factor's own "not a spot" check), and
+        // `shadow_w`'s -1.0 sentinel is already < 0.5 (mesh3d_shadow_factor's
+        // own "no shadow" check) — directional lights aren't shadow-mapped
+        // yet, same as spot.
         let spot_factor = mesh3d_spot_factor(mesh3d_lighting.light_spot[i], l);
-        let shadow_factor = mesh3d_shadow_factor(mesh3d_lighting.light_pos[i].w, in.world_pos);
+        let shadow_factor = mesh3d_shadow_factor(shadow_w, in.world_pos);
         lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten * spot_factor) * shadow_factor;
     }
 
