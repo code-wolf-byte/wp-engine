@@ -40,12 +40,15 @@ impl Scene {
                 .is_some_and(|c| c.parsed_eye().is_some() && c.parsed_center().is_some())
     }
 
-    /// Resolve every `light` scene object into a world-space point light for
-    /// the mesh3d lighting pass. Real content only ever populates the generic
-    /// `light`/`radius`/`intensity`/`color` fields (no directional/spot/tube
-    /// distinction is parseable from scene.json today — see
-    /// `SceneObject::light_params`), so every light resolves as a point light
-    /// positioned at the object's origin.
+    /// Resolve every `light` scene object into a world-space light for the
+    /// mesh3d lighting pass. `SceneObject::light_type()` (the `light`
+    /// field's own string value — see its doc comment) is the primary
+    /// type signal; cone-angle presence is a secondary fallback so content
+    /// authoring the common `"light": true` boolean form (which never
+    /// matches the type-discriminant table, so the real engine itself
+    /// treats it as `Point`) can still resolve to `Spot` when the author's
+    /// intent is otherwise clear from `innercone`/`outercone` being set.
+    ///
     /// Every `light` scene object as `(light, casts_shadow)`. Paired rather
     /// than two parallel vecs so a caller can never let a shadow flag drift
     /// out of sync with the light it belongs to after filtering.
@@ -62,52 +65,62 @@ impl Scene {
                     .as_ref()
                     .and_then(parse_value_bool)
                     .unwrap_or(false);
-                let light = match o.spot_cone_degrees() {
-                    Some((_inner, outer)) => {
-                        // Forward = -Z of the object's own rotation. Picked
-                        // as the most common "facing" convention (matching
-                        // how `camera3d`'s eye→center direction works) —
-                        // unverified against real content, since no
-                        // downloaded Workshop `light` object with cone
-                        // angles was available locally. See the
-                        // `innercone`/`outercone` field docs.
-                        let angles = o
-                            .angles
-                            .as_ref()
-                            .and_then(parse_value_vec3)
-                            .map(|a| [a[0] as f32, a[1] as f32, a[2] as f32])
-                            .unwrap_or([0.0; 3]);
-                        let direction =
-                            crate::engine::camera3d::rotate_euler([0.0, 0.0, -1.0], angles);
-                        // `pbr_spot`'s falloff is `cos_angle.powf(exponent)`
-                        // (a Phong-style approximation — see lighting.rs's
-                        // own module docs), not WE's recovered
-                        // `smoothstep(inner, outer, cosAngle)` formula, so
-                        // `innercone` isn't used yet: converting a
-                        // smoothstep pair into a single Phong exponent
-                        // faithfully needs both edges, and getting that
-                        // wrong would be worse than an honest partial
-                        // mapping. `exponent` is picked so the falloff
-                        // reaches roughly zero brightness at `outercone`:
-                        // reasonable, not verified against real content.
-                        let exponent = (2.0
-                            / (1.0 - outer.to_radians().cos()).max(1e-4))
-                        .clamp(1.0, 64.0);
-                        crate::engine::lighting::Light::Spot {
-                            origin,
-                            direction,
-                            exponent,
-                            color,
-                            intensity,
-                            radius,
-                        }
+                // Forward = -Z of the object's own rotation, shared by
+                // Spot and Directional. Picked as the most common "facing"
+                // convention (matching how `camera3d`'s eye→center
+                // direction works) — unverified against real content, since
+                // no downloaded Workshop `light` object was available
+                // locally. See the `innercone`/`outercone` field docs.
+                let angles = o
+                    .angles
+                    .as_ref()
+                    .and_then(parse_value_vec3)
+                    .map(|a| [a[0] as f32, a[1] as f32, a[2] as f32])
+                    .unwrap_or([0.0; 3]);
+                let direction = || crate::engine::camera3d::rotate_euler([0.0, 0.0, -1.0], angles);
+
+                let is_spot = matches!(o.light_type(), LightType::Spot) || o.spot_cone_degrees().is_some();
+                let light = if matches!(o.light_type(), LightType::Directional) {
+                    crate::engine::lighting::Light::Directional {
+                        direction: direction(),
+                        color,
+                        intensity,
                     }
-                    None => crate::engine::lighting::Light::Point {
+                } else if is_spot {
+                    // `pbr_spot`'s falloff is `cos_angle.powf(exponent)` (a
+                    // Phong-style approximation — see lighting.rs's own
+                    // module docs), not WE's recovered `smoothstep(inner,
+                    // outer, cosAngle)` formula, so `innercone` isn't used
+                    // yet: converting a smoothstep pair into a single Phong
+                    // exponent faithfully needs both edges, and getting
+                    // that wrong would be worse than an honest partial
+                    // mapping. `exponent` is picked so the falloff reaches
+                    // roughly zero brightness at `outercone` (defaulting to
+                    // a narrow cone when cone angles aren't set at all —
+                    // reached only via the `light_type() == Spot` string
+                    // signal without cone fields, an edge case no real
+                    // content was available to verify): reasonable, not
+                    // verified against real content.
+                    let outer = o.spot_cone_degrees().map(|(_, o)| o).unwrap_or(30.0);
+                    let exponent =
+                        (2.0 / (1.0 - outer.to_radians().cos()).max(1e-4)).clamp(1.0, 64.0);
+                    crate::engine::lighting::Light::Spot {
+                        origin,
+                        direction: direction(),
+                        exponent,
+                        color,
+                        intensity,
+                        radius,
+                    }
+                } else {
+                    // `Tube` also lands here — no `origin_b` field is
+                    // parsed yet, see `LightType::Tube`'s doc comment.
+                    crate::engine::lighting::Light::Point {
                         origin,
                         color,
                         intensity,
                         radius,
-                    },
+                    }
                 };
                 Some((light, casts_shadow))
             })
@@ -505,7 +518,17 @@ pub struct SceneObject {
     // Object-level texture clamp override.
     #[serde(default)]
     pub clampuvs: Option<serde_json::Value>,
-    // Light objects (radial glow approximation).
+    /// Light objects (radial glow approximation). Presence alone gates
+    /// whether this object is a light at all (`light_params`) — but the
+    /// *value* is also the real light-type discriminant, per the Ghidra
+    /// report's directional-light-type-discriminant follow-up:
+    /// `FUN_14025da80`'s property parser registers `"light"` itself (not a
+    /// separate `"type"` field) with a string-enum setter
+    /// (`FUN_14025eb40`/`FUN_14025e9e0`) that `memcmp`s the value against a
+    /// 5-entry table — `"point"`, `"lpoint"`, `"lspot"`, `"ltube"`,
+    /// `"ldirectional"` — falling back to the `"point"` slot when nothing
+    /// matches (covers the common authored `"light": true` boolean form).
+    /// See [`SceneObject::light_type`].
     #[serde(default)]
     pub light: Option<serde_json::Value>,
     #[serde(default)]
@@ -514,11 +537,12 @@ pub struct SceneObject {
     pub intensity: Option<serde_json::Value>,
     /// Spot-light cone angles (degrees). Confirmed field names from the
     /// Ghidra property dump (`~/Applications/ghidra-dump/REPORT.md`,
-    /// Follow-up (f)) — presence of both is how `Scene::lights()` tells a
-    /// spot light from a point light, since no downloaded Workshop content
-    /// with a `light` object was available locally to verify an explicit
-    /// type-discriminant field name against (see the report for the
-    /// full caveat).
+    /// Follow-up (f)). `Scene::lights()` now reads `light`'s own value as
+    /// the primary type signal (see `light_type`); cone-angle presence is
+    /// kept as a fallback for content that authors `"light": true` (a
+    /// boolean never matches the string table, so the real engine itself
+    /// falls back to point too — cone presence is wp-engine's own extra
+    /// signal to still catch author intent in that case).
     #[serde(default)]
     pub innercone: Option<serde_json::Value>,
     #[serde(default)]
@@ -581,6 +605,37 @@ impl SceneObject {
         let outer = self.outercone.as_ref().and_then(parse_value_f32)?;
         Some((inner, outer))
     }
+
+    /// The `light` field's own value as a type discriminant — see the
+    /// field's doc comment for the decompiled evidence. `memcmp`-equivalent
+    /// (case-sensitive, exact match against the binary's own table); any
+    /// non-string value (`true`, a number) or unrecognized string falls
+    /// back to `Point`, mirroring `FUN_14025eb40`'s own fallback-to-first-
+    /// table-entry behavior exactly.
+    pub fn light_type(&self) -> LightType {
+        match self.light.as_ref().and_then(|v| v.as_str()) {
+            Some("lspot") => LightType::Spot,
+            Some("ltube") => LightType::Tube,
+            Some("ldirectional") => LightType::Directional,
+            _ => LightType::Point,
+        }
+    }
+}
+
+/// The light-type discriminant recovered from `SceneObject::light_type`.
+/// `Tube` has no wp-engine construction yet — no `origin_b`/second-endpoint
+/// field is parsed (the property parser also registers a `controlpoint`
+/// field alongside the light-type table, which is the likely candidate,
+/// unverified since no real content to test against was found — see the
+/// Ghidra report's directional-light-type-discriminant follow-up) — so
+/// `Scene::lights()` treats a `Tube`-typed object as a `Point` for now,
+/// same honest-fallback spirit as the field's own real-engine default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightType {
+    Point,
+    Spot,
+    Tube,
+    Directional,
 }
 
 impl SceneObject {
@@ -1012,6 +1067,64 @@ mod tests {
             scene.lights()[0].0,
             crate::engine::lighting::Light::Point { .. }
         ));
+    }
+
+    // `light: "ldirectional"` — the real type-discriminant value recovered
+    // from FUN_14025eb40's string table — must resolve to Directional, with
+    // direction derived from the object's own angles (the same convention
+    // Spot already uses).
+    #[test]
+    fn light_string_ldirectional_resolves_to_directional() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": "ldirectional", "angles": "0 1.5707963 0",
+                 "intensity": 0.6, "color": "1 1 1"}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 1);
+        match &lights[0].0 {
+            crate::engine::lighting::Light::Directional { direction, intensity, .. } => {
+                assert!((*intensity - 0.6).abs() < 1e-5);
+                // angles.y = 90°: forward (-Z rotated by yaw) points toward -X.
+                assert!(direction[0] < -0.9, "direction={direction:?}");
+            }
+            other => panic!("expected Directional, got {other:?}"),
+        }
+    }
+
+    // `light: "lspot"` alone (no innercone/outercone) must still resolve to
+    // Spot via the string discriminant — the cone-presence heuristic is a
+    // fallback, not the only path.
+    #[test]
+    fn light_string_lspot_resolves_to_spot_without_cone_fields() {
+        let scene = Scene::from_json(
+            r#"{"objects": [{"id": 1, "light": "lspot", "origin": "0 0 0"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            scene.lights()[0].0,
+            crate::engine::lighting::Light::Spot { .. }
+        ));
+    }
+
+    // `light: "lpoint"` (the table's OTHER accepted point spelling) and the
+    // common authored `light: true` boolean must both land on Point, exactly
+    // matching the real engine's own fallback-to-first-table-entry behavior.
+    #[test]
+    fn light_string_lpoint_and_bare_true_both_stay_point() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": "lpoint", "origin": "0 0 0"},
+                {"id": 2, "light": true, "origin": "0 0 0"}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 2);
+        assert!(matches!(lights[0].0, crate::engine::lighting::Light::Point { .. }));
+        assert!(matches!(lights[1].0, crate::engine::lighting::Light::Point { .. }));
     }
 
     // A visible text layer whose parent group is hidden must NOT draw — the WE
