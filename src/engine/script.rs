@@ -36,6 +36,25 @@ fn js_num(v: f32) -> String {
     }
 }
 
+/// Format a `&str` as a JS string literal (proper escaping via
+/// `serde_json`'s compatible-with-JS escaping rules — same trick
+/// [`ScriptContext::eval_update_string`] already relies on).
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// One scene object's current name/id/transform, as fed to
+/// [`ScriptContext::set_layers`] for `thisScene.getLayer(...)` to search.
+/// `name`/`id` of `None` never match a script's `getLayer` lookup (mirrors
+/// how a nameless/idless object can't be looked up in real WE either).
+pub struct LayerSnapshot<'a> {
+    pub name: Option<&'a str>,
+    pub id: Option<i64>,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+    pub scale: [f32; 3],
+}
+
 /// The WE scripting globals, declared ahead of the user script.
 fn prelude(current_value: f32, env: &ScriptEnv) -> String {
     format!(
@@ -65,6 +84,149 @@ pub fn eval_update(script: &str, current_value: f32, env: &ScriptEnv) -> Option<
     let n = result.to_number(&mut context).ok()?;
     n.is_finite().then_some(n as f32)
 }
+
+/// WE exposes an object/attachment scripting API on every scene object
+/// (`thisLayer`, and anything `thisScene.getLayer(...)` returns): xref'd from
+/// the binary as 11 functions/properties all registered from one method
+/// table (`lookAt`, `lookAtYaw`, `rotateObjectSpace`, `setParent`,
+/// `parallaxDepth`, `getTransformMatrix`, `getAttachmentOrigin`,
+/// `getAttachmentAngles`, `getAttachmentIndex`, `getAttachmentMatrix`,
+/// `disablepropagation` — see the Ghidra report's object-attachment
+/// follow-up). wp-engine had none of this before; `thisLayer`/`thisScene`
+/// were static stubs.
+///
+/// No real downloaded Workshop content calls any of these (searched the
+/// local corpus), and the vendored C++ reference doesn't implement this API
+/// either (`parallaxDepth` there is only a parsed, non-scripted property) —
+/// so beyond the names and the fact that they're one object's method table,
+/// there's no ground truth for the exact semantics. This is an honest
+/// best-effort implementation grounded in wp-engine's *own* transform
+/// conventions (the same additive-Euler rotation composition
+/// `render::Xform::compose` already uses for the static scene.json `parent`
+/// field, and `camera3d::model_matrix`'s own Rz·Ry·Rx convention for
+/// `getTransformMatrix`), not a verified match to the original binary.
+///
+/// No skeleton/bone/attachment-point data exists anywhere in this engine (or
+/// in the C++ reference), so the `getAttachment*` family can't resolve a
+/// real socket: `getAttachmentIndex` always reports "not found" (-1), and
+/// `getAttachmentOrigin`/`Angles`/`Matrix` always resolve to the queried
+/// object's own root transform regardless of `index`. `setParent` only
+/// takes effect on `thisLayer` itself (the object whose own script is
+/// running) — this engine has no live scene-graph re-parenting, so mutating
+/// an object obtained via `getLayer` doesn't feed back into rendering.
+const OBJECT_ATTACHMENT_API_JS: &str = r#"
+function wpRotateEuler(v, angles) {
+    var sx = Math.sin(angles.x), cx = Math.cos(angles.x);
+    var sy = Math.sin(angles.y), cy = Math.cos(angles.y);
+    var sz = Math.sin(angles.z), cz = Math.cos(angles.z);
+    var x1 = v.x, y1 = cx * v.y - sx * v.z, z1 = sx * v.y + cx * v.z;
+    var x2 = cy * x1 + sy * z1, y2 = y1, z2 = -sy * x1 + cy * z1;
+    var x3 = cz * x2 - sz * y2, y3 = sz * x2 + cz * y2, z3 = z2;
+    return new Vec3(x3, y3, z3);
+}
+
+function wpBuildMatrix(origin, angles, scale) {
+    var sx = Math.sin(angles.x), cx = Math.cos(angles.x);
+    var sy = Math.sin(angles.y), cy = Math.cos(angles.y);
+    var sz = Math.sin(angles.z), cz = Math.cos(angles.z);
+    var r00 = cz*cy,               r10 = sz*cy,               r20 = -sy;
+    var r01 = cz*sy*sx - sz*cx,    r11 = sz*sy*sx + cz*cx,    r21 = cy*sx;
+    var r02 = cz*sy*cx + sz*sx,    r12 = sz*sy*cx - cz*sx,    r22 = cy*cx;
+    return [
+        r00*scale.x, r10*scale.x, r20*scale.x, 0,
+        r01*scale.y, r11*scale.y, r21*scale.y, 0,
+        r02*scale.z, r12*scale.z, r22*scale.z, 0,
+        origin.x, origin.y, origin.z, 1
+    ];
+}
+
+function wpMakeSceneObject(name, id, origin, angles, scale, parallaxDepth) {
+    var obj = {
+        name: name || '',
+        id: (id === null || id === undefined) ? -1 : id,
+        origin: origin, angles: angles, scale: scale,
+        parallaxDepth: parallaxDepth || new Vec3(0, 0, 0),
+        visible: true, pointsize: 32, font: '', text: '', __frame: -1,
+        __propagationDisabled: false,
+        getTextureAnimation: function() {
+            return {
+                setFrame: function(f) { obj.__frame = f; },
+                setFrameByName: function() {},
+                getFrameCount: function() { return 1; }
+            };
+        },
+        getTransformMatrix: function() {
+            return wpBuildMatrix(obj.origin, obj.angles, obj.scale);
+        },
+        // Faces `target` (world position) by solving yaw (angles.y) and
+        // pitch (angles.x) directly from wpBuildMatrix's own Rz*Ry*Rx
+        // convention. Roll (angles.z) is left untouched — a full
+        // look-at-with-roll decomposition needs a target "up" vector this
+        // API doesn't supply.
+        lookAt: function(target) {
+            var d = target.subtract(obj.origin);
+            var len = Math.sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+            if (len > 1e-6) {
+                obj.angles.y = Math.atan2(d.x, d.z);
+                obj.angles.x = Math.asin(Math.max(-1, Math.min(1, -d.y / len)));
+            }
+            return obj.angles;
+        },
+        lookAtYaw: function(target) {
+            var d = target.subtract(obj.origin);
+            if (Math.abs(d.x) > 1e-6 || Math.abs(d.z) > 1e-6) {
+                obj.angles.y = Math.atan2(d.x, d.z);
+            }
+            return obj.angles;
+        },
+        // Additive, matching `Xform::compose`'s own simplified Euler-sum
+        // rotation model — this engine never composes rotations as true
+        // matrices (see render.rs), so staying additive here keeps this
+        // consistent with every other rotation composition in the codebase.
+        rotateObjectSpace: function(x, y, z) {
+            obj.angles.x += x; obj.angles.y += y; obj.angles.z += z;
+            return obj.angles;
+        },
+        // Treats this object's own origin/angles/scale as a local offset and
+        // composes them onto `parent`'s current transform, via the exact
+        // rule `Xform::compose`/`apply_point` already use for this engine's
+        // static scene.json `parent` field.
+        setParent: function(parent) {
+            if (!parent) { return obj; }
+            var scaledLocal = new Vec3(obj.origin.x * parent.scale.x, obj.origin.y * parent.scale.y, obj.origin.z * parent.scale.z);
+            var rotated = wpRotateEuler(scaledLocal, parent.angles);
+            obj.origin = rotated.add(parent.origin);
+            obj.angles = new Vec3(obj.angles.x + parent.angles.x, obj.angles.y + parent.angles.y, obj.angles.z + parent.angles.z);
+            obj.scale = new Vec3(obj.scale.x * parent.scale.x, obj.scale.y * parent.scale.y, obj.scale.z * parent.scale.z);
+            return obj;
+        },
+        getAttachmentOrigin: function(index) { return obj.origin.copy(); },
+        getAttachmentAngles: function(index) { return obj.angles.copy(); },
+        getAttachmentMatrix: function(index) { return obj.getTransformMatrix(); },
+        getAttachmentIndex: function(attachmentName) { return -1; },
+        disablepropagation: function() { obj.__propagationDisabled = true; }
+    };
+    return obj;
+}
+
+var __wp_layers = [];
+var thisLayer = wpMakeSceneObject('', -1, new Vec3(0,0,0), new Vec3(0,0,0), new Vec3(1,1,1), new Vec3(0,0,0));
+var thisScene = {
+    createLayer: function() { return { visible: false, origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), text: '' }; },
+    sortLayer: function() {},
+    getLayerIndex: function() { return 0; },
+    // Searches the snapshot `set_layers` refreshes once per frame. `null`
+    // when not found, matching WE's own documented behavior.
+    getLayer: function(nameOrId) {
+        for (var i = 0; i < __wp_layers.length; i++) {
+            if (__wp_layers[i].name === nameOrId || __wp_layers[i].id === nameOrId) {
+                return __wp_layers[i];
+            }
+        }
+        return null;
+    }
+};
+"#;
 
 /// A persistent JS runtime for the render loop: the realm, intrinsics, and the
 /// WE globals (`engine`, `WEMath`, `value`, `update`) are created once and
@@ -176,16 +338,14 @@ impl ScriptContext {
              Vec3.prototype.subtract = function(o) { return new Vec3(this.x - o.x, this.y - o.y, this.z - o.z); };\n\
              Vec3.prototype.multiply = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x * (s ? o : o.x), this.y * (s ? o : o.y), this.z * (s ? o : o.z)); };\n\
              Vec3.prototype.divide = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x / (s ? o : o.x), this.y / (s ? o : o.y), this.z / (s ? o : o.z)); };\n\
-             var thisLayer = { origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), visible: true, pointsize: 32, font: '', text: '', __frame: -1, \
-                 getTextureAnimation: function() { return { setFrame: function(f) { thisLayer.__frame = f; }, setFrameByName: function(){}, getFrameCount: function(){ return 1; } }; } };\n\
-             var thisScene = { \
-                 createLayer: function() { return { visible: false, origin: new Vec3(0,0,0), angles: new Vec3(0,0,0), scale: new Vec3(1,1,1), text: '' }; }, \
-                 sortLayer: function() {}, \
-                 getLayerIndex: function() { return 0; }, \
-                 getLayer: function() { return null; } \
-             };\n\
              var input = { cursorWorldPosition: new Vec3(0,0,0), cursorPosition: new Vec3(0,0,0) };",
         ));
+        // The object-attachment scripting API (`lookAt`, `setParent`,
+        // `getAttachmentX`, `getTransformMatrix`, `disablepropagation` —
+        // see `OBJECT_ATTACHMENT_API_JS`'s own doc comment) is sizeable
+        // enough to keep as its own eval rather than folding into the
+        // block above.
+        let _ = context.eval(Source::from_bytes(OBJECT_ATTACHMENT_API_JS.as_bytes()));
         Self { context }
     }
 
@@ -201,6 +361,67 @@ impl ScriptContext {
             js_num(frametime),
         );
         let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+    }
+
+    /// Refresh `thisLayer` to the scene object about to have its own
+    /// SceneScripts evaluated — the object-attachment API (`lookAt`,
+    /// `setParent`, `getTransformMatrix`, etc., see
+    /// [`OBJECT_ATTACHMENT_API_JS`]) reads and mutates whatever `thisLayer`
+    /// currently holds, so callers must call this before evaluating that
+    /// object's `origin`/`angles`/`scale`/`visible`/etc. scripts. Replaces
+    /// `thisLayer` wholesale (a fresh `wpMakeSceneObject` call) rather than
+    /// mutating fields in place, so a previous object's `disablepropagation`
+    /// flag or attachment state can't leak into the next.
+    pub fn set_current_object(
+        &mut self,
+        name: Option<&str>,
+        id: Option<i64>,
+        origin: [f32; 3],
+        angles: [f32; 3],
+        scale: [f32; 3],
+        parallax_depth: [f32; 2],
+    ) {
+        let src = format!(
+            "thisLayer = wpMakeSceneObject({name}, {id}, new Vec3({ox},{oy},{oz}), new Vec3({ax},{ay},{az}), new Vec3({sx},{sy},{sz}), new Vec3({px},{py},0));",
+            name = js_str(name.unwrap_or("")),
+            id = id.map(|v| v.to_string()).unwrap_or_else(|| "-1".to_string()),
+            ox = js_num(origin[0]), oy = js_num(origin[1]), oz = js_num(origin[2]),
+            ax = js_num(angles[0]), ay = js_num(angles[1]), az = js_num(angles[2]),
+            sx = js_num(scale[0]), sy = js_num(scale[1]), sz = js_num(scale[2]),
+            px = js_num(parallax_depth[0]), py = js_num(parallax_depth[1]),
+        );
+        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+    }
+
+    /// Refresh `thisScene`'s object registry — `getLayer(nameOrId)` searches
+    /// this. Call once per frame (not once per object) with every scene
+    /// object's current name/id/origin/angles/scale.
+    pub fn set_layers(&mut self, layers: &[LayerSnapshot]) {
+        let mut src = String::from("__wp_layers = [");
+        for l in layers {
+            src.push_str(&format!(
+                "wpMakeSceneObject({name}, {id}, new Vec3({ox},{oy},{oz}), new Vec3({ax},{ay},{az}), new Vec3({sx},{sy},{sz}), new Vec3(0,0,0)),",
+                name = js_str(l.name.unwrap_or("")),
+                id = l.id.map(|v| v.to_string()).unwrap_or_else(|| "-1".to_string()),
+                ox = js_num(l.origin[0]), oy = js_num(l.origin[1]), oz = js_num(l.origin[2]),
+                ax = js_num(l.angles[0]), ay = js_num(l.angles[1]), az = js_num(l.angles[2]),
+                sx = js_num(l.scale[0]), sy = js_num(l.scale[1]), sz = js_num(l.scale[2]),
+            ));
+        }
+        src.push_str("];");
+        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+    }
+
+    /// Whether the object last set via [`Self::set_current_object`] called
+    /// `disablepropagation()` on itself. Call right after evaluating that
+    /// object's scripts, before the next `set_current_object` overwrites
+    /// `thisLayer`.
+    pub fn take_propagation_disabled(&mut self) -> bool {
+        self.context
+            .eval(Source::from_bytes(b"thisLayer.__propagationDisabled"))
+            .ok()
+            .map(|v| v.to_boolean())
+            .unwrap_or(false)
     }
 
     /// Evaluate a Vec3-valued property's `update(value)` (WE `origin`/`scale`/
@@ -582,5 +803,114 @@ export function update(value) {
             "\"use strict\";export var a=1;export function update(v){return a;}",
         );
         assert!(!s.contains("export"), "leftover export in: {s}");
+    }
+
+    // --- object-attachment API (`OBJECT_ATTACHMENT_API_JS`) ---
+
+    #[test]
+    fn look_at_faces_the_target_straight_ahead() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_current_object(Some("obj"), Some(1), [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 0.0]);
+        let script = "export function update(value) { return thisLayer.lookAt(new Vec3(0, 0, 5)); }";
+        let angles = ctx.eval_update_vec3(script, [0.0, 0.0, 0.0]).expect("should evaluate");
+        // Target is straight down local +Z: both pitch and yaw are 0.
+        assert!(angles[0].abs() < 1e-4, "pitch: {angles:?}");
+        assert!(angles[1].abs() < 1e-4, "yaw: {angles:?}");
+    }
+
+    #[test]
+    fn look_at_yaw_touches_only_the_y_axis() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_current_object(None, None, [0.0, 0.0, 0.0], [0.3, 0.0, 0.7], [1.0, 1.0, 1.0], [0.0, 0.0]);
+        // Target far to +X, high up: yaw should swing toward +X (atan2(5,0) = pi/2)
+        // while the authored pitch/roll pass through untouched.
+        let script = "export function update(value) { return thisLayer.lookAtYaw(new Vec3(5, 100, 0)); }";
+        let angles = ctx.eval_update_vec3(script, [0.3, 0.0, 0.7]).expect("should evaluate");
+        assert!((angles[0] - 0.3).abs() < 1e-4, "pitch must stay unchanged: {angles:?}");
+        assert!((angles[2] - 0.7).abs() < 1e-4, "roll must stay unchanged: {angles:?}");
+        assert!(
+            (angles[1] - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
+            "yaw should point toward +X: {angles:?}"
+        );
+    }
+
+    #[test]
+    fn rotate_object_space_is_additive() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_current_object(None, None, [0.0; 3], [0.1, 0.2, 0.3], [1.0; 3], [0.0, 0.0]);
+        let script = "export function update(value) { return thisLayer.rotateObjectSpace(0.5, -0.1, 0.2); }";
+        let angles = ctx.eval_update_vec3(script, [0.1, 0.2, 0.3]).expect("should evaluate");
+        assert!((angles[0] - 0.6).abs() < 1e-5, "{angles:?}");
+        assert!((angles[1] - 0.1).abs() < 1e-5, "{angles:?}");
+        assert!((angles[2] - 0.5).abs() < 1e-5, "{angles:?}");
+    }
+
+    #[test]
+    fn get_transform_matrix_translation_column_matches_origin() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_current_object(None, None, [3.0, 4.0, 5.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
+        let script = "export function update(value) { \
+            var m = thisLayer.getTransformMatrix(); \
+            return new Vec3(m[12], m[13], m[14]); }";
+        let t = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
+        assert_eq!(t, [3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn set_parent_composes_local_offset_onto_the_named_parent() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_layers(&[LayerSnapshot {
+            name: Some("Anchor"),
+            id: Some(9),
+            origin: [10.0, 0.0, 0.0],
+            angles: [0.0, 0.0, 0.0],
+            scale: [2.0, 2.0, 2.0],
+        }]);
+        ctx.set_current_object(Some("Child"), Some(1), [1.0, 0.0, 0.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
+        let script = "export function update(value) { \
+            return thisLayer.setParent(thisScene.getLayer('Anchor')).origin; }";
+        let origin = ctx.eval_update_vec3(script, [1.0, 0.0, 0.0]).expect("should evaluate");
+        // local (1,0,0) * parent scale (2,2,2) = (2,0,0), unrotated, + parent origin (10,0,0)
+        assert_eq!(origin, [12.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn get_layer_returns_null_for_an_unknown_name() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_layers(&[]);
+        let script = "export function update(value) { \
+            return thisScene.getLayer('Nope') === null ? new Vec3(1,1,1) : new Vec3(0,0,0); }";
+        let v = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
+        assert_eq!(v, [1.0, 1.0, 1.0]);
+    }
+
+    /// No skeleton/bone/attachment-point data exists anywhere in this engine
+    /// — `getAttachmentIndex` always reports -1, and `getAttachmentOrigin`
+    /// always resolves to the object's own transform regardless of index.
+    #[test]
+    fn attachment_queries_have_no_bone_table_so_resolve_to_self_or_not_found() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_current_object(None, None, [7.0, 8.0, 9.0], [0.0; 3], [1.0; 3], [0.0, 0.0]);
+        let script = "export function update(value) { \
+            var idx = thisLayer.getAttachmentIndex('hand'); \
+            var o = thisLayer.getAttachmentOrigin(idx); \
+            return new Vec3(idx, o.x, o.z); }";
+        let out = ctx.eval_update_vec3(script, [0.0; 3]).expect("should evaluate");
+        assert_eq!(out, [-1.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn disablepropagation_sets_a_readable_flag_reset_by_the_next_object() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_current_object(None, None, [0.0; 3], [0.0; 3], [1.0; 3], [0.0, 0.0]);
+        assert!(!ctx.take_propagation_disabled());
+
+        let script = "export function update(value) { thisLayer.disablepropagation(); return value; }";
+        ctx.eval_update_vec3(script, [0.0; 3]);
+        assert!(ctx.take_propagation_disabled());
+
+        // A fresh object (no call to disablepropagation) starts clean again.
+        ctx.set_current_object(None, None, [0.0; 3], [0.0; 3], [1.0; 3], [0.0, 0.0]);
+        assert!(!ctx.take_propagation_disabled());
     }
 }

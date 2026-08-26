@@ -2270,6 +2270,13 @@ pub struct TransformGraph {
     pub local: Vec<Xform>,
     /// `(origin, angles, scale)` SceneScript sources per object.
     pub scripts: Vec<[Option<String>; 3]>,
+    /// Object name/id, indexed the same as every other field here — feeds
+    /// `ScriptContext::set_current_object`/`set_layers` so an
+    /// object-attachment script (`thisLayer`, `thisScene.getLayer(...)`) can
+    /// identify itself and look up other objects. See the Ghidra report's
+    /// object-attachment follow-up.
+    pub name: Vec<Option<String>>,
+    pub id: Vec<Option<i64>>,
 }
 
 impl TransformGraph {
@@ -2282,10 +2289,19 @@ impl TransformGraph {
     }
 
     /// World transform per object, composing `locals` up each parent chain.
-    pub fn world(&self, locals: &[Xform]) -> Vec<Xform> {
+    /// `disabled[i]` (this frame's live `thisLayer.disablepropagation()`
+    /// call — see the object-attachment API) makes object `i` stop
+    /// inheriting *its own* parent's transform, exactly like the static
+    /// scene.json `disablepropagation: true` field already does via
+    /// `parent_index` returning `None` — see
+    /// `disablepropagation_severs_transform_inheritance` below. This is
+    /// that same rule evaluated live per-frame instead of once at load, for
+    /// an object whose `parent` link is real (baked into `self.parent`) but
+    /// wants to sever it dynamically.
+    pub fn world(&self, locals: &[Xform], disabled: &[bool]) -> Vec<Xform> {
         let mut memo: Vec<Option<Xform>> = vec![None; self.parent.len()];
         (0..self.parent.len())
-            .map(|i| self.world_of(i, locals, &mut memo, 0))
+            .map(|i| self.world_of(i, locals, disabled, &mut memo, 0))
             .collect()
     }
 
@@ -2293,17 +2309,19 @@ impl TransformGraph {
         &self,
         idx: usize,
         locals: &[Xform],
+        disabled: &[bool],
         memo: &mut Vec<Option<Xform>>,
         depth: u32,
     ) -> Xform {
         if let Some(x) = memo[idx] {
             return x;
         }
+        let severed = disabled.get(idx).copied().unwrap_or(false);
         // Same 64-deep guard as the load-time walker: a malformed scene must
         // not blow the stack.
         let w = match self.parent[idx] {
-            Some(p) if p != idx && depth < 64 => self
-                .world_of(p, locals, memo, depth + 1)
+            Some(p) if p != idx && depth < 64 && !severed => self
+                .world_of(p, locals, disabled, memo, depth + 1)
                 .compose(&locals[idx]),
             _ => locals[idx],
         };
@@ -2344,6 +2362,8 @@ fn build_transform_graph(scene: &Scene) -> TransformGraph {
                 ]
             })
             .collect(),
+        name: objects.iter().map(|o| o.name.clone()).collect(),
+        id: objects.iter().map(|o| o.id).collect(),
     }
 }
 
@@ -2569,6 +2589,47 @@ mod tests {
             parent_index(&objs[2], &id_to_idx, &name_to_idx),
             None,
             "disablepropagation must stop transform inheritance"
+        );
+    }
+
+    /// The object-attachment API's `thisLayer.disablepropagation()` (see
+    /// `engine::script::OBJECT_ATTACHMENT_API_JS`) is this same
+    /// `disablepropagation` rule, just evaluated live per-frame instead of
+    /// baked once from scene.json — `TransformGraph::world`'s `disabled`
+    /// slice must sever object `i`'s *own* inheritance from its parent
+    /// (matching `parent_index` above exactly), not affect what `i`'s
+    /// children inherit from `i`.
+    #[test]
+    fn live_disablepropagation_severs_only_the_flagged_objects_own_inheritance() {
+        // 0 (root, moves) -> 1 (child of 0) -> 2 (grandchild, child of 1)
+        let graph = TransformGraph {
+            parent: vec![None, Some(0), Some(1)],
+            local: vec![Xform::IDENTITY; 3],
+            scripts: vec![[None, None, None], [None, None, None], [None, None, None]],
+            name: vec![None, None, None],
+            id: vec![None, None, None],
+        };
+        let locals = vec![
+            Xform { t: [10.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
+            Xform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
+            Xform { t: [1.0, 0.0, 0.0], r: [0.0; 3], s: [1.0; 3] },
+        ];
+
+        let worlds = graph.world(&locals, &[false, false, false]);
+        assert_eq!(worlds[2].t, [12.0, 0.0, 0.0], "baseline: full chain composes");
+
+        // Sever object 1's own inheritance from object 0.
+        let worlds = graph.world(&locals, &[false, true, false]);
+        assert_eq!(worlds[0].t, [10.0, 0.0, 0.0], "object 0 is untouched");
+        assert_eq!(
+            worlds[1].t,
+            [1.0, 0.0, 0.0],
+            "object 1 must stop inheriting object 0's transform"
+        );
+        assert_eq!(
+            worlds[2].t,
+            [2.0, 0.0, 0.0],
+            "object 2 still inherits normally from (now-severed) object 1"
         );
     }
 

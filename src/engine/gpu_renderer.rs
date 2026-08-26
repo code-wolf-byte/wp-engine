@@ -2924,9 +2924,23 @@ impl GpuSceneInstance {
         // through the shared `shared` object (one writes `shared.gjz`, another
         // reads it), and declaration order is the only ordering WE implies.
         let mut locals = self.current_locals.clone();
+        let mut disabled = vec![false; self.transform_graph.parent.len()];
         for (i, scripts) in self.transform_graph.scripts.iter().enumerate() {
             // Previous frame's value, not the authored one — see `current_locals`.
             let base = self.current_locals[i];
+            // `thisLayer`/`disablepropagation()` — the object-attachment
+            // scripting API (see `engine::script::OBJECT_ATTACHMENT_API_JS`)
+            // — needs to know which object is about to run, and this is the
+            // one place every object (including image-less parent nodes)
+            // gets its scripts evaluated.
+            self.script_ctx.set_current_object(
+                self.transform_graph.name[i].as_deref(),
+                self.transform_graph.id[i],
+                [base.t[0] as f32, base.t[1] as f32, base.t[2] as f32],
+                [base.r[0] as f32, base.r[1] as f32, base.r[2] as f32],
+                [base.s[0] as f32, base.s[1] as f32, base.s[2] as f32],
+                [0.0, 0.0],
+            );
             let eval = |ctx: &mut crate::engine::script::ScriptContext,
                         src: &Option<String>,
                         b: [f64; 3]| match src {
@@ -2941,9 +2955,10 @@ impl GpuSceneInstance {
                 r: eval(&mut self.script_ctx, &scripts[1], base.r),
                 s: eval(&mut self.script_ctx, &scripts[2], base.s),
             };
+            disabled[i] = self.script_ctx.take_propagation_disabled();
         }
         self.current_locals.clone_from(&locals);
-        let worlds = self.transform_graph.world(&locals);
+        let worlds = self.transform_graph.world(&locals, &disabled);
         // The PARENT's world transform, not the object's own — `worlds[i]`
         // already folds in object i's local transform, and the layer/mesh
         // values we apply it to are pre-parent locals. Applying the full world
@@ -3114,12 +3129,53 @@ impl GpuSceneInstance {
                 .unwrap_or(0);
             let time_of_day = secs_into_day as f32 / 3600.0;
             let (w, h, persp) = (self.width, self.height, self.perspective);
+            // Every scene object's current name/id/transform, for
+            // `thisScene.getLayer(...)` (the object-attachment API — see
+            // `engine::script::OBJECT_ATTACHMENT_API_JS`) to search. Built
+            // from last frame's resolved locals (`update_parent_transforms`,
+            // which refreshes them, runs later this same frame) — one frame
+            // of staleness here, same as every other cross-script read in
+            // this codebase (e.g. the `shared` object's declaration-order
+            // dependency, documented below).
+            let layer_snapshots: Vec<crate::engine::script::LayerSnapshot> = self
+                .transform_graph
+                .name
+                .iter()
+                .zip(self.transform_graph.id.iter())
+                .zip(self.current_locals.iter())
+                .map(|((name, id), xform)| crate::engine::script::LayerSnapshot {
+                    name: name.as_deref(),
+                    id: *id,
+                    origin: [xform.t[0] as f32, xform.t[1] as f32, xform.t[2] as f32],
+                    angles: [xform.r[0] as f32, xform.r[1] as f32, xform.r[2] as f32],
+                    scale: [xform.s[0] as f32, xform.s[1] as f32, xform.s[2] as f32],
+                })
+                .collect();
             let ctx = &mut self.script_ctx;
             // `delta`, not `time - self.last_time`: last_time was already
             // advanced to `time` above, so that expression is always exactly 0
             // and every `engine.frametime` script silently multiplied by zero.
             ctx.set_time(time, time_of_day, delta);
+            ctx.set_layers(&layer_snapshots);
             for layer in &mut self.layers {
+                // Refreshes `thisLayer` so this object's own scripts can use
+                // the object-attachment API (`lookAt`, `setParent`,
+                // `getTransformMatrix`, etc.) against real data.
+                ctx.set_current_object(
+                    self.transform_graph
+                        .name
+                        .get(layer.order_index)
+                        .and_then(|n| n.as_deref()),
+                    layer.object_id,
+                    [
+                        layer.origin_base[0] as f32,
+                        layer.origin_base[1] as f32,
+                        layer.origin_base[2] as f32,
+                    ],
+                    layer.angles_base,
+                    layer.scale_base,
+                    layer.parallax_depth,
+                );
                 if let Some(script) = &layer.alpha_script {
                     layer.alpha = ctx
                         .eval_update(script, layer.alpha_base)
