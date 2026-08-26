@@ -4416,22 +4416,24 @@ fn load_effect_instance(
                 tex_key,
                 hardcoded: true,
                 target: None,
-                // waterripple/waterwaves distort-and-resample their primary
-                // color input (src_tex) to fake refraction — for that to look
-                // like real refraction it has to be the scene behind this
-                // layer, not the layer's own base texture. Binding slot 0 to
-                // the wallpaper-global scene buffer name reuses the exact
-                // snapshot-and-bind machinery the generic (non-hardcoded)
-                // per-pass loop already runs for any effect that declares
-                // this bind in its own JSON (see the `_rt_FullFrameBuffer`
-                // arm below) — these two hardcoded kernels just never asked
-                // for it, so they fell back to self-refracting their own
-                // base image instead of the real backdrop.
-                binds: if matches!(effect_name.as_str(), "waterripple" | "waterwaves") {
-                    vec![(0, "_rt_FullFrameBuffer".to_string())]
-                } else {
-                    Vec::new()
-                },
+                // REVERTED (2026-08-26, see the Ghidra report's godrays/
+                // waterwaves follow-up): this used to bind slot 0 to
+                // `_rt_FullFrameBuffer` for waterripple/waterwaves, on the
+                // theory that their `g_Texture0` ("hidden"/"framebuffer" in
+                // the real shader's own annotation) meant the global scene
+                // buffer. Real content proved that wrong: a real downloaded
+                // wallpaper attaches 8 waterwaves instances directly to its
+                // own background image (a shimmer filter on itself, not a
+                // transparent water surface revealing what's behind it) —
+                // at the point this object's own effect chain runs, the
+                // global scene target is still blank (this object hasn't
+                // composited onto it yet), so binding it there fed every
+                // instance blank input, chained through 8 passes to a flat
+                // grey wash-out. "framebuffer" evidently means this pass's
+                // own chain input here, which is exactly what leaving
+                // `binds` empty (falling through to `chain_view`) already
+                // gives it — the pre-fix behavior, restored.
+                binds: Vec::new(),
                 values: {
                     // Hardcoded kernels read combos (e.g. shake's DIRECTION/
                     // NOISE) as pseudo-values with a `combo_` prefix.
