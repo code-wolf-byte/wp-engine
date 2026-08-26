@@ -2016,10 +2016,9 @@ fn mesh3d_lighting_bytes(
                 ..
             } => {
                 let vp = cam.to_view_space(*origin);
-                // Shadows aren't wired for spot lights yet (`build_shadow_atlas`
-                // only casts from `Light::Point`) — shadow_w() would always be
-                // 0.0 here regardless, called anyway so a future shadow-casting
-                // spot doesn't silently need this call site revisited too.
+                // `build_shadow_atlas` now casts shadows from `Light::Spot`
+                // too (see `engine::shadow::spot_light_view_proj`), so
+                // `shadow_w()` is real here, not always 0.0.
                 *pos_slot = [vp[0], vp[1], vp[2], shadow_w()];
                 *color_slot = [color[0], color[1], color[2], *intensity];
                 let vd = cam.to_view_direction(*direction);
@@ -2680,26 +2679,49 @@ impl GpuSceneInstance {
         use crate::engine::lighting::Light;
         use crate::engine::shadow;
 
-        let shadow_casters: Vec<(usize, [f32; 3])> = lights
+        let mut shadow_slots: Vec<Option<usize>> = vec![None; lights.len()];
+
+        // Needed to build either projection (`point_light_view_proj`'s own
+        // aim-and-size target, `spot_light_view_proj`'s near/far sizing) —
+        // computed once up front now that both light types consume it,
+        // rather than after filtering casters like the point-only version
+        // did.
+        let (center, radius) = shadow::scene_bounds(mesh3d_layers);
+        let shadow_casters: Vec<(usize, crate::engine::camera3d::Mat4)> = lights
             .iter()
             .enumerate()
             .filter_map(|(i, (light, casts_shadow))| {
                 if !*casts_shadow {
                     return None;
                 }
-                match light {
-                    Light::Point { origin, .. } => Some((i, *origin)),
-                    // Directional/spot/tube shadows aren't built yet — see
-                    // the Ghidra report's shadow-mapping follow-up. Not
-                    // reachable today anyway: `Scene::lights()` only ever
-                    // produces `Light::Point`.
-                    _ => None,
-                }
+                let view_proj = match light {
+                    Light::Point { origin, .. } => {
+                        shadow::point_light_view_proj(*origin, center, radius)
+                    }
+                    Light::Spot {
+                        origin,
+                        direction,
+                        outer_cone_degrees,
+                        ..
+                    } => shadow::spot_light_view_proj(
+                        *origin,
+                        *direction,
+                        *outer_cone_degrees,
+                        center,
+                        radius,
+                    ),
+                    // Directional/tube shadows aren't built yet — see the
+                    // Ghidra report's shadow-mapping follow-up. Directional
+                    // has no natural "position" to cast a perspective
+                    // shadow from (it'd need an orthographic projection, a
+                    // different pipeline shape); tube isn't constructed by
+                    // `Scene::lights()` at all yet.
+                    _ => return None,
+                };
+                Some((i, view_proj))
             })
             .take(shadow::MAX_SHADOW_LIGHTS)
             .collect();
-
-        let mut shadow_slots: Vec<Option<usize>> = vec![None; lights.len()];
 
         if shadow_casters.is_empty() || mesh3d_layers.is_empty() {
             let dummy = renderer.device.create_texture(&wgpu::TextureDescriptor {
@@ -2719,7 +2741,6 @@ impl GpuSceneInstance {
             return (dummy, shadow_slots, Vec::new());
         }
 
-        let (center, radius) = shadow::scene_bounds(mesh3d_layers);
         let (atlas_w, atlas_h, tiles) = shadow::pack_tiles(
             shadow_casters.len(),
             shadow::SHADOW_TILE_SIZE,
@@ -2758,8 +2779,8 @@ impl GpuSceneInstance {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("shadow_atlas_pass"),
             });
-        for (slot, ((light_idx, origin), tile)) in shadow_casters.iter().zip(tiles.iter()).enumerate() {
-            let view_proj = shadow::point_light_view_proj(*origin, center, radius);
+        for (slot, ((light_idx, view_proj), tile)) in shadow_casters.iter().zip(tiles.iter()).enumerate() {
+            let view_proj = *view_proj;
             let uv_rect = shadow::tile_uv_rect(*tile, atlas_w, atlas_h);
             shadow_slots[*light_idx] = Some(slot);
             slot_data.push((view_proj, uv_rect));

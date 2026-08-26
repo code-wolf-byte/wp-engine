@@ -516,6 +516,13 @@ pub enum Light {
         color: [f32; 3],
         intensity: f32,
         radius: f32,
+        /// The raw `outercone` half-angle in degrees — kept alongside the
+        /// already-derived Phong `exponent` because the shadow-atlas
+        /// projection (`engine::shadow::spot_light_view_proj`) needs the
+        /// actual cone width for its frustum FOV, and recovering it by
+        /// inverting `exponent`'s formula would be lossy at the exponent's
+        /// clamp bounds.
+        outer_cone_degrees: f32,
     },
     Tube {
         origin_a: [f32; 3],

@@ -181,6 +181,45 @@ pub fn point_light_view_proj(light_origin: [f32; 3], target: [f32; 3], radius: f
     camera3d::gl_to_wgpu_depth(&camera3d::mat4_mul(&proj, &view))
 }
 
+/// Build a single perspective shadow view-projection for a spot light,
+/// aimed along its own facing `direction` with FOV set directly from its
+/// `outer_cone_degrees` — unlike a point light (omnidirectional, so its
+/// frustum has to be aimed at and sized to the scene's bounding sphere,
+/// see `point_light_view_proj`), a spot light already has an exact,
+/// physically-motivated direction and cone width, no guesswork needed.
+/// `scene_center`/`scene_radius` (the same bounding sphere point lights
+/// use) still size the near/far planes, projected onto the light's own
+/// axis, so the depth range covers whatever the cone can actually see.
+pub fn spot_light_view_proj(
+    light_origin: [f32; 3],
+    direction: [f32; 3],
+    outer_cone_degrees: f32,
+    scene_center: [f32; 3],
+    scene_radius: f32,
+) -> Mat4 {
+    let dir_len = len3(direction).max(1e-6);
+    let dir = [
+        direction[0] / dir_len,
+        direction[1] / dir_len,
+        direction[2] / dir_len,
+    ];
+    let target = [
+        light_origin[0] + dir[0],
+        light_origin[1] + dir[1],
+        light_origin[2] + dir[2],
+    ];
+    // Full FOV is twice the cone's half-angle.
+    let fovy = (outer_cone_degrees.to_radians() * 2.0).clamp(0.1, 170f32.to_radians());
+    let to_center = sub3(scene_center, light_origin);
+    let axial_dist = to_center[0] * dir[0] + to_center[1] * dir[1] + to_center[2] * dir[2];
+    let near = (axial_dist - scene_radius).max(0.05);
+    let far = (axial_dist + scene_radius).max(near + 0.1);
+    let up = pick_up_vector(dir);
+    let view = camera3d::look_at(light_origin, target, up);
+    let proj = camera3d::perspective(fovy, 1.0, near, far);
+    camera3d::gl_to_wgpu_depth(&camera3d::mat4_mul(&proj, &view))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +315,61 @@ mod tests {
     fn scene_bounds_empty_is_sane() {
         let (_, r) = scene_bounds(&[]);
         assert!(r > 0.0);
+    }
+
+    #[test]
+    fn spot_light_view_proj_centers_a_target_on_its_own_axis() {
+        // Light at (0,0,10) aimed straight down -Z, a wide-ish 45° cone.
+        // A point directly ahead on that axis must land at NDC center,
+        // regardless of where the scene's bounding sphere actually is.
+        let vp = spot_light_view_proj(
+            [0.0, 0.0, 10.0],
+            [0.0, 0.0, -1.0],
+            45.0,
+            [3.0, 3.0, 3.0],
+            2.0,
+        );
+        let p = [0.0, 0.0, 0.0, 1.0];
+        let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
+        assert!(clip[3] > 0.0, "w should be positive: {clip:?}");
+        let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
+        assert!(ndc[0].abs() < 1e-4 && ndc[1].abs() < 1e-4, "got {ndc:?}");
+    }
+
+    #[test]
+    fn spot_light_view_proj_off_axis_point_escapes_a_narrow_cone() {
+        // A point well outside a narrow 5° cone's frustum must land outside
+        // [-1,1] NDC — proves the FOV genuinely tracks outer_cone_degrees,
+        // not some fixed/wide default.
+        let vp = spot_light_view_proj(
+            [0.0, 0.0, 10.0],
+            [0.0, 0.0, -1.0],
+            5.0,
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        let p = [5.0, 0.0, 0.0, 1.0];
+        let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
+        assert!(clip[3] > 0.0);
+        let ndc_x = clip[0] / clip[3];
+        assert!(ndc_x.abs() > 1.0, "off-axis point should escape a narrow cone: ndc_x={ndc_x}");
+    }
+
+    #[test]
+    fn spot_light_view_proj_wide_cone_keeps_the_same_point_in_frustum() {
+        // The same off-axis point from the previous test, but with a wide
+        // 60° cone — must now land inside [-1,1].
+        let vp = spot_light_view_proj(
+            [0.0, 0.0, 10.0],
+            [0.0, 0.0, -1.0],
+            60.0,
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        let p = [1.0, 0.0, 0.0, 1.0];
+        let clip: [f32; 4] = std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * p[k]).sum());
+        assert!(clip[3] > 0.0);
+        let ndc_x = clip[0] / clip[3];
+        assert!(ndc_x.abs() <= 1.0, "point should be inside a wide cone: ndc_x={ndc_x}");
     }
 }

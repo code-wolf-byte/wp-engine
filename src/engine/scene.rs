@@ -111,6 +111,7 @@ impl Scene {
                         color,
                         intensity,
                         radius,
+                        outer_cone_degrees: outer,
                     }
                 } else {
                     // `Tube` also lands here — no `origin_b` field is
