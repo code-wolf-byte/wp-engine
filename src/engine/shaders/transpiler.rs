@@ -702,8 +702,30 @@ pub fn translate(model: &ShaderModel) -> Result<TranslatedShader> {
 #[tracing::instrument(target = "shader", level = "trace", skip_all, fields(shader = %model.name, real_vs = vert_glsl.is_some()))]
 pub fn translate_full(model: &ShaderModel, vert_glsl: Option<&str>) -> Result<TranslatedShader> {
     tracing::trace!(target: "shader", "translating GLSL → WGSL");
-    // Shaders that use array varyings (e.g. `varying vec2 v[7]`) cannot be translated
-    // because naga's SPIR-V reader rejects array-typed entry-point I/O.
+
+    // Unroll literal-indexed array varyings (`varying vec2 v[7]` → `v_0`,
+    // `v_1`, ...) before anything else touches the source — naga's SPIR-V
+    // reader rejects array-typed entry-point I/O outright, so this has to
+    // happen up front. `unroll_array_varyings` was already fully
+    // implemented and tested (see the tests below) but was never actually
+    // wired into this function — real content that uses this exact pattern
+    // (godrays_gaussian.frag's `v_TexCoord[13|7|3]` per KERNEL combo, its
+    // own motivating comment) failed to transpile as a result. Rebinding
+    // `model` to an owned, patched clone means every function below that
+    // takes `&ShaderModel` sees the unrolled source with no signature
+    // changes needed.
+    let mut model = model.clone();
+    model.frag_glsl = unroll_array_varyings(&model.frag_glsl);
+    let vert_unrolled = vert_glsl.map(unroll_array_varyings);
+    let vert_glsl = vert_unrolled.as_deref();
+    let model = &model;
+
+    // Shaders that still have an array varying at this point use a
+    // variable index somewhere in the body (a `for` loop reading `tex[i]`)
+    // — `unroll_array_varyings` deliberately leaves those alone rather than
+    // unrolling a declaration out from under a reference that's still
+    // there (see its own doc comment), so this honestly rejects them: naga's
+    // SPIR-V reader rejects array-typed entry-point I/O either way.
     for line in model.frag_glsl.lines() {
         let t = line.trim();
         if t.starts_with("varying ") || t.starts_with("attribute ") {
@@ -2533,6 +2555,74 @@ fn is_word_char(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Research check (not permanent coverage — depends on an untracked,
+    /// locally-downloaded Workshop sample that won't exist in CI): does the
+    /// real "godrays" effect's GLSL, exactly as authored by Valve/WE and
+    /// shipped in a real wallpaper, transpile through the *fully generic*
+    /// effect pipeline with zero wp-engine-specific code? See
+    /// ~/Applications/ghidra-dump/REPORT.md's volumetric-lighting follow-up
+    /// for why this matters: godrays is what real content actually uses for
+    /// light shafts, not the Light-object-driven `castvolumetrics` system.
+    #[test]
+    fn real_godrays_effect_transpiles_through_generic_pipeline() {
+        let wallpaper_dir =
+            std::path::Path::new("/home/tupretiw/wp-engine/analysis/orig_1137423685");
+        if !wallpaper_dir.exists() {
+            eprintln!("SKIP: analysis/ sample not present locally");
+            return;
+        }
+        // No real WE assets dir in this sandbox — forces the embedded
+        // WE_COMMON_H/WE_COMMON_BLENDING_H fallback in loader.rs, exactly
+        // the path a Linux/macOS install without the Steam client hits too.
+        let resolver = super::super::resolver::AssetResolver::new(Some(wallpaper_dir), None);
+
+        let cases: &[(&str, &str, &[(&str, i32)])] = &[
+            ("effects/godrays_downsample2", "effects/godrays_downsample2", &[]),
+            ("effects/godrays_cast", "effects/godrays_cast", &[("CASTER", 0), ("SAMPLES", 0)]),
+            (
+                "effects/godrays_gaussian_x",
+                "effects/godrays_gaussian",
+                &[("KERNEL", 1), ("VERTICAL", 0)],
+            ),
+            (
+                "effects/godrays_gaussian_y",
+                "effects/godrays_gaussian",
+                &[("KERNEL", 1), ("VERTICAL", 1)],
+            ),
+            ("effects/godrays_combine", "effects/godrays_combine", &[("BLENDMODE", 9)]),
+        ];
+
+        let mut failures = Vec::new();
+        for (label, shader_name, combo_pairs) in cases {
+            let (frag_glsl, vert_glsl) =
+                match super::super::loader::load_glsl_shader_with_resolver(
+                    &resolver,
+                    shader_name,
+                    None,
+                ) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        failures.push(format!("{label}: load failed: {e:#}"));
+                        continue;
+                    }
+                };
+            let combos: std::collections::HashMap<String, i32> = combo_pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect();
+            let model = crate::engine::model::ShaderModel::from_resolved_glsl(
+                label.to_string(),
+                frag_glsl,
+                combos,
+                crate::engine::model::WEBlending::Normal,
+            );
+            if let Err(e) = translate_full(&model, Some(&vert_glsl)) {
+                failures.push(format!("{label}: {e:#}"));
+            }
+        }
+        assert!(failures.is_empty(), "godrays passes failed to transpile:\n{}", failures.join("\n"));
+    }
 
     #[test]
     fn unrolls_literal_indexed_array_varying() {
