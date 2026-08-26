@@ -108,6 +108,9 @@ pub struct GpuSceneRenderer {
     shadow_pass_bgl: wgpu::BindGroupLayout,
     mesh3d_shadow_pipeline: wgpu::RenderPipeline,
     shadow_comparison_sampler: wgpu::Sampler,
+    // Perspective-projected 2D quads: see `vs_quad3d`/`fs_quad3d`.
+    quad3d_bgl: wgpu::BindGroupLayout,
+    quad3d_pipeline: wgpu::RenderPipeline,
 }
 
 /// Depth format for the 3D mesh pass. Depth32Float is guaranteed everywhere
@@ -647,6 +650,50 @@ impl GpuSceneRenderer {
             ..Default::default()
         });
 
+        // Perspective-projected 2D quads (true silhouette, not the AABB
+        // `project_quad_ndc` collapses to) — see `vs_quad3d`/`fs_quad3d` in
+        // gpu_shaders.wgsl and the Ghidra report's quad-warp finding. Its
+        // own small bind group layout rather than extending the widely
+        // shared `base_bgl`: `Quad3DParams` (corners) has nothing to do with
+        // any other pass that layout serves.
+        let quad3d_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("quad3d_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let quad3d_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("quad3d_layout"),
+            bind_group_layouts: &[&quad3d_bgl],
+            push_constant_ranges: &[],
+        });
+        let quad3d_pipeline = Self::create_pipeline(
+            &device,
+            &quad3d_layout,
+            &shader_module,
+            "vs_quad3d",
+            "fs_quad3d",
+            "quad3d",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
         let dummy_tex = Self::create_white_1x1_texture(&device, &queue);
 
         Ok(Self {
@@ -677,6 +724,8 @@ impl GpuSceneRenderer {
             shadow_pass_bgl,
             mesh3d_shadow_pipeline,
             shadow_comparison_sampler,
+            quad3d_bgl,
+            quad3d_pipeline,
             particle_bgl,
             particle_pipeline_add,
             particle_pipeline_over,
@@ -1538,6 +1587,19 @@ struct SceneLayerGpu {
     angle: f32,
     /// Object quad: (center_ndc.x, center_ndc.y, half_extent_ndc.x, half_extent_ndc.y).
     rect: [f32; 4],
+    /// True perspective-projected quad corners (NDC, already divided) in
+    /// `project_quad_ndc`'s corner order — `Some` only for perspective-scene
+    /// layers where every corner projects in front of the camera. `rect`
+    /// above is still always populated (their axis-aligned bounding box, via
+    /// `project_quad_ndc`) since depth-sort and the fallback draw path both
+    /// need it regardless. See `project_quad_corners` and the Ghidra
+    /// report's quad-perspective-warp finding: without this, an off-axis
+    /// quad's silhouette collapses to a rectangle instead of the true
+    /// trapezoid. Only consumed when `blend_mode == 0` (normal) — non-normal
+    /// blend modes on perspective quads keep the existing rect-based
+    /// approximation, a narrow and rare combination not worth a second
+    /// pipeline variant per blend mode.
+    quad_corners: Option<[[f32; 2]; 4]>,
     /// Live visibility for this frame. Starts `true`; only a `visible` script
     /// can flip it off. `render()` skips the layer entirely when `false`.
     visible: bool,
@@ -1708,6 +1770,19 @@ pub struct GpuSceneInstance {
 
 /// One static 3D mesh, uploaded once: geometry never changes, and its MVP is
 /// baked at load because these objects don't animate in real content.
+/// World-space corners of a quad centered at `center`, rotated by `angles`,
+/// sized `size_px` — bottom-left, bottom-right, top-right, top-left in the
+/// quad's own unrotated local space. Shared by `project_quad_ndc` and
+/// `project_quad_corners` so their corner math can't drift apart.
+fn quad_world_corners(center: [f32; 3], angles: [f32; 3], size_px: [f64; 2]) -> [[f32; 3]; 4] {
+    let hx = (size_px[0] / 2.0) as f32;
+    let hy = (size_px[1] / 2.0) as f32;
+    [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
+        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], angles);
+        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
+    })
+}
+
 /// Project a world-space quad through the perspective camera into an NDC rect.
 ///
 /// Returns `(rect, depth)`; a negative depth means the quad was culled (some
@@ -1715,20 +1790,16 @@ pub struct GpuSceneInstance {
 /// per-frame parent recompose so the two can't drift apart.
 ///
 /// Approximation: no in-quad perspective warp — the four projected corners
-/// collapse to their axis-aligned bounding box, which is fine for the mostly
-/// camera-facing layers these scenes use.
+/// collapse to their axis-aligned bounding box. Used for depth-sort and as
+/// the composite fallback in all cases; `project_quad_corners` (below) gives
+/// the true quad shape for the common normal-blend case — see its own docs.
 fn project_quad_ndc(
     cam: &crate::engine::camera3d::PerspectiveCamera,
     center: [f32; 3],
     angles: [f32; 3],
     size_px: [f64; 2],
 ) -> ([f32; 4], f32) {
-    let hx = (size_px[0] / 2.0) as f32;
-    let hy = (size_px[1] / 2.0) as f32;
-    let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[cx, cy]| {
-        let off = crate::engine::camera3d::rotate_euler([cx, cy, 0.0], angles);
-        [center[0] + off[0], center[1] + off[1], center[2] + off[2]]
-    });
+    let corners = quad_world_corners(center, angles, size_px);
     let ndc: Vec<[f32; 2]> = corners.iter().filter_map(|c| cam.project(*c)).collect();
     if ndc.len() < 4 {
         return ([-10.0, -10.0, 0.0, 0.0], -1.0);
@@ -1750,6 +1821,34 @@ fn project_quad_ndc(
         ],
         cam.view_depth(center),
     )
+}
+
+/// True perspective-projected quad corners (NDC, already divided), in the
+/// same bottom-left/bottom-right/top-right/top-left order
+/// `quad_world_corners` builds — `None` if any corner sits at or behind the
+/// eye plane (same cull condition `project_quad_ndc` uses, kept consistent
+/// rather than drawing a degenerate partial quad).
+///
+/// This fixes the silhouette bug `project_quad_ndc`'s AABB collapse has: an
+/// off-axis or steeply-angled quad renders as a true trapezoid instead of a
+/// rectangle. UV mapping across it is bilinear, not hardware
+/// perspective-correct (that would need clip-space corners with real w, not
+/// pre-divided NDC) — a scoped simplification: the silhouette is what the
+/// Ghidra report flagged as visibly wrong, and bilinear already fixes that;
+/// full perspective-correct texture mapping is a further, separate
+/// improvement.
+fn project_quad_corners(
+    cam: &crate::engine::camera3d::PerspectiveCamera,
+    center: [f32; 3],
+    angles: [f32; 3],
+    size_px: [f64; 2],
+) -> Option<[[f32; 2]; 4]> {
+    let corners = quad_world_corners(center, angles, size_px);
+    let mut ndc = [[0.0f32; 2]; 4];
+    for (i, c) in corners.iter().enumerate() {
+        ndc[i] = cam.project(*c)?;
+    }
+    Some(ndc)
 }
 
 struct Mesh3dGpu {
@@ -1850,7 +1949,18 @@ fn mesh3d_lighting_bytes(
         }
     };
 
-    push4([if lights.is_empty() { 0.0 } else { 1.0 }, 0.0, 0.0, 0.0]);
+    // Gates on "at least one light this loop can actually render" rather
+    // than "at least one light object exists": `Scene::lights()` can also
+    // produce `Light::Spot` (see `scene.rs`), which this loop below doesn't
+    // shade yet (GPU spot support is a follow-on, not wired). A scene with
+    // only spot lights must still fall through to the plain unlit look, not
+    // engage the lit branch with zero actual light contributions (which
+    // would multiply by `ambient` alone — usually black, per the corpus's
+    // near-universal unset `ambientcolor`).
+    let has_renderable_light = lights
+        .iter()
+        .any(|(l, _)| matches!(l, crate::engine::lighting::Light::Point { .. }));
+    push4([if has_renderable_light { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
     push4([ambient[0], ambient[1], ambient[2], 0.0]);
     match &fog {
         Some(f) => {
@@ -2061,10 +2171,11 @@ impl GpuSceneInstance {
                     effective_size[0] * l.scale[0],
                     effective_size[1] * l.scale[1],
                 ];
-                let (rect, angle, depth) = if let Some(cam) = &camera3d {
+                let (rect, angle, depth, quad_corners) = if let Some(cam) = &camera3d {
                     let center = [l.origin[0] as f32, l.origin[1] as f32, l.origin[2] as f32];
                     let (rect, depth) = project_quad_ndc(cam, center, l.angles, size_px);
-                    (rect, 0.0, depth)
+                    let quad_corners = project_quad_corners(cam, center, l.angles, size_px);
+                    (rect, 0.0, depth, quad_corners)
                 } else {
                     // `general.zoom` scales the whole scene about its center;
                     // NDC (0,0) is the scene center, so a uniform rect scale
@@ -2075,7 +2186,7 @@ impl GpuSceneInstance {
                         (size_px[0] / w as f64) as f32 * zoom,
                         (size_px[1] / h as f64) as f32 * zoom,
                     ];
-                    (rect, l.angle, 0.0)
+                    (rect, l.angle, 0.0, None)
                 };
 
                 SceneLayerGpu {
@@ -2094,6 +2205,7 @@ impl GpuSceneInstance {
                     parallax_depth: [l.parallax_depth[0] as f32, l.parallax_depth[1] as f32],
                     angle,
                     rect,
+                    quad_corners,
                     depth,
                     object_size,
                     no_interpolation: l.no_interpolation,
@@ -2838,13 +2950,10 @@ impl GpuSceneInstance {
                 Some(cam) => {
                     let angles: [f32; 3] =
                         std::array::from_fn(|i| layer.local_angles[i] + w.r[i] as f32);
-                    let (rect, depth) = project_quad_ndc(
-                        cam,
-                        [o[0] as f32, o[1] as f32, o[2] as f32],
-                        angles,
-                        size_px,
-                    );
+                    let centre = [o[0] as f32, o[1] as f32, o[2] as f32];
+                    let (rect, depth) = project_quad_ndc(cam, centre, angles, size_px);
                     layer.rect = rect;
+                    layer.quad_corners = project_quad_corners(cam, centre, angles, size_px);
                     // Feeds the painter's-algorithm sort in `render()`; a
                     // negative depth culls the quad, same as at build.
                     layer.depth = depth;
@@ -3522,46 +3631,91 @@ impl GpuSceneInstance {
                     dynamics.fade * layer.alpha,
                 )
             };
-            let composite_buf = self.renderer.make_uniform_buffer(
-                &composite_params(
-                    opacity,
-                    layer.blend_mode as i32,
-                    uv_offset,
-                    tint,
-                    layer.angle,
-                    layer.rect,
-                    self.width as f32 / self.height as f32,
-                    [self.width as f32, self.height as f32],
-                ),
-                64,
-            );
             let src_view = match cur {
                 None => base_view,
                 Some(i) => pp[i].view(),
             };
-            // Photoshop-style blend modes read the destination in-shader, so
-            // snapshot the scene target before drawing over it.
-            let extra: Vec<Option<wgpu::TextureView>> = if layer.blend_mode != 0 {
-                encoder.copy_texture_to_texture(
-                    self.target.as_image_copy(),
-                    self.scene_copy.as_image_copy(),
-                    wgpu::Extent3d {
-                        width: self.width,
-                        height: self.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                vec![Some(self.scene_copy.create_view(&Default::default()))]
+            // True perspective-quad silhouette, normal blending only — see
+            // `vs_quad3d`/`fs_quad3d` and the Ghidra report's quad-warp
+            // finding. `uv_offset` (shake/parallax) isn't applied on this
+            // path: under true perspective it belongs on the camera or the
+            // object's world position, not a flat post-hoc UV shift, and
+            // wiring that through is future work, not this fix. Falls
+            // through to the same draw + `_rt_imageLayerComposite` capture
+            // code below as the rect-based path, just with a different
+            // pipeline/bind group, so neither can drift out of sync with
+            // the other.
+            let (pipeline, base_bg) = if layer.blend_mode == 0 && layer.quad_corners.is_some() {
+                let corners = layer.quad_corners.unwrap();
+                let mut params = Vec::with_capacity(80);
+                for c in corners {
+                    params.extend_from_slice(&c[0].to_le_bytes());
+                    params.extend_from_slice(&c[1].to_le_bytes());
+                    params.extend_from_slice(&0.0f32.to_le_bytes());
+                    params.extend_from_slice(&0.0f32.to_le_bytes());
+                }
+                for f in [tint[0], tint[1], tint[2], opacity] {
+                    params.extend_from_slice(&f.to_le_bytes());
+                }
+                let quad3d_buf = self.renderer.make_uniform_buffer(&params, 80);
+                let quad3d_bg = self.renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("quad3d_bg"),
+                    layout: &self.renderer.quad3d_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: quad3d_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&src_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(layer_sampler),
+                        },
+                    ],
+                });
+                (&self.renderer.quad3d_pipeline, quad3d_bg)
             } else {
-                vec![]
+                let composite_buf = self.renderer.make_uniform_buffer(
+                    &composite_params(
+                        opacity,
+                        layer.blend_mode as i32,
+                        uv_offset,
+                        tint,
+                        layer.angle,
+                        layer.rect,
+                        self.width as f32 / self.height as f32,
+                        [self.width as f32, self.height as f32],
+                    ),
+                    64,
+                );
+                // Photoshop-style blend modes read the destination
+                // in-shader, so snapshot the scene target before drawing
+                // over it.
+                let extra: Vec<Option<wgpu::TextureView>> = if layer.blend_mode != 0 {
+                    encoder.copy_texture_to_texture(
+                        self.target.as_image_copy(),
+                        self.scene_copy.as_image_copy(),
+                        wgpu::Extent3d {
+                            width: self.width,
+                            height: self.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    vec![Some(self.scene_copy.create_view(&Default::default()))]
+                } else {
+                    vec![]
+                };
+                let base_bg = self.renderer.make_base_bind_group(
+                    &src_view,
+                    layer_sampler,
+                    &composite_buf,
+                    &extra,
+                );
+                (self.renderer.composite_pipeline(layer.blend_mode), base_bg)
             };
-            let base_bg = self.renderer.make_base_bind_group(
-                &src_view,
-                layer_sampler,
-                &composite_buf,
-                &extra,
-            );
-            let pipeline = self.renderer.composite_pipeline(layer.blend_mode);
             self.renderer.run_pass(
                 encoder,
                 pipeline,
@@ -5032,6 +5186,71 @@ mod tests {
         )
         .validate(&module)
         .expect("gpu_shaders.wgsl failed validation");
+    }
+
+    fn quad3d_test_camera() -> crate::engine::camera3d::PerspectiveCamera {
+        let scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0", "up": "0 1 0"},
+                "general": {"orthogonalprojection": null, "fov": 60.0}}"#,
+        )
+        .unwrap();
+        crate::engine::camera3d::PerspectiveCamera::from_scene(&scene, 1.0).unwrap()
+    }
+
+    /// A camera-facing quad (no rotation, centered on the view axis) must
+    /// project to a symmetric rectangle: opposite corners mirror each other
+    /// around the NDC origin. This is the case `project_quad_ndc`'s AABB
+    /// collapse already gets right — `project_quad_corners` must agree with
+    /// it exactly here, only diverging once the quad is off-axis/rotated.
+    #[test]
+    fn project_quad_corners_symmetric_for_camera_facing_quad() {
+        let cam = quad3d_test_camera();
+        let corners = project_quad_corners(&cam, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [4.0, 2.0])
+            .expect("camera-facing quad in front of the eye must project");
+        // Order: bottom-left, bottom-right, top-right, top-left.
+        assert!((corners[0][0] + corners[1][0]).abs() < 1e-5, "{corners:?}");
+        assert!((corners[0][1] + corners[3][1]).abs() < 1e-5, "{corners:?}");
+        assert!(corners[0][0] < corners[1][0], "left must be left of right");
+        assert!(corners[0][1] < corners[2][1], "bottom must be below top");
+    }
+
+    /// The whole point of this function: a quad rotated hard off-axis
+    /// projects to a genuine trapezoid, not a rectangle. Rotating around Y
+    /// swings one vertical edge toward the camera and the other away from
+    /// it (left edge: x=-2 → z=+1.73, closer to the eye at z=10; right
+    /// edge: x=+2 → z=-1.73, farther away) — the closer edge must span a
+    /// taller NDC range than the farther one. `project_quad_ndc`'s AABB
+    /// would hide this entirely (both edges would just extend its bounding
+    /// box, indistinguishable from a same-size rectangle).
+    #[test]
+    fn project_quad_corners_is_a_true_trapezoid_when_rotated() {
+        let cam = quad3d_test_camera();
+        let corners = project_quad_corners(
+            &cam,
+            [0.0, 0.0, 0.0],
+            [0.0, 60f32.to_radians(), 0.0],
+            [4.0, 2.0],
+        )
+        .expect("quad must still project in front of the eye");
+        // Left edge: corner0 (bottom-left) to corner3 (top-left).
+        let left_height = (corners[3][1] - corners[0][1]).abs();
+        // Right edge: corner1 (bottom-right) to corner2 (top-right).
+        let right_height = (corners[2][1] - corners[1][1]).abs();
+        assert!(
+            left_height > right_height + 1e-4,
+            "expected the closer (left) edge to project taller than the \
+             farther (right) edge: left={left_height} right={right_height}"
+        );
+    }
+
+    /// A corner behind the eye plane must cull the whole quad — same rule
+    /// `project_quad_ndc` uses, kept consistent rather than drawing a
+    /// partially-degenerate quad.
+    #[test]
+    fn project_quad_corners_none_when_behind_camera() {
+        let cam = quad3d_test_camera();
+        // Eye is at z=10 looking toward the origin; z=20 is behind it.
+        assert!(project_quad_corners(&cam, [0.0, 0.0, 20.0], [0.0, 0.0, 0.0], [4.0, 2.0]).is_none());
     }
 
     /// Same rule as `hardcoded_effect_params_are_uniform_sized` below, for the

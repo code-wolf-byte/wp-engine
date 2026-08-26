@@ -62,15 +62,54 @@ impl Scene {
                     .as_ref()
                     .and_then(parse_value_bool)
                     .unwrap_or(false);
-                Some((
-                    crate::engine::lighting::Light::Point {
+                let light = match o.spot_cone_degrees() {
+                    Some((_inner, outer)) => {
+                        // Forward = -Z of the object's own rotation. Picked
+                        // as the most common "facing" convention (matching
+                        // how `camera3d`'s eye→center direction works) —
+                        // unverified against real content, since no
+                        // downloaded Workshop `light` object with cone
+                        // angles was available locally. See the
+                        // `innercone`/`outercone` field docs.
+                        let angles = o
+                            .angles
+                            .as_ref()
+                            .and_then(parse_value_vec3)
+                            .map(|a| [a[0] as f32, a[1] as f32, a[2] as f32])
+                            .unwrap_or([0.0; 3]);
+                        let direction =
+                            crate::engine::camera3d::rotate_euler([0.0, 0.0, -1.0], angles);
+                        // `pbr_spot`'s falloff is `cos_angle.powf(exponent)`
+                        // (a Phong-style approximation — see lighting.rs's
+                        // own module docs), not WE's recovered
+                        // `smoothstep(inner, outer, cosAngle)` formula, so
+                        // `innercone` isn't used yet: converting a
+                        // smoothstep pair into a single Phong exponent
+                        // faithfully needs both edges, and getting that
+                        // wrong would be worse than an honest partial
+                        // mapping. `exponent` is picked so the falloff
+                        // reaches roughly zero brightness at `outercone`:
+                        // reasonable, not verified against real content.
+                        let exponent = (2.0
+                            / (1.0 - outer.to_radians().cos()).max(1e-4))
+                        .clamp(1.0, 64.0);
+                        crate::engine::lighting::Light::Spot {
+                            origin,
+                            direction,
+                            exponent,
+                            color,
+                            intensity,
+                            radius,
+                        }
+                    }
+                    None => crate::engine::lighting::Light::Point {
                         origin,
                         color,
                         intensity,
                         radius,
                     },
-                    casts_shadow,
-                ))
+                };
+                Some((light, casts_shadow))
             })
             .collect()
     }
@@ -473,6 +512,17 @@ pub struct SceneObject {
     pub radius: Option<serde_json::Value>,
     #[serde(default)]
     pub intensity: Option<serde_json::Value>,
+    /// Spot-light cone angles (degrees). Confirmed field names from the
+    /// Ghidra property dump (`~/Applications/ghidra-dump/REPORT.md`,
+    /// Follow-up (f)) — presence of both is how `Scene::lights()` tells a
+    /// spot light from a point light, since no downloaded Workshop content
+    /// with a `light` object was available locally to verify an explicit
+    /// type-discriminant field name against (see the report for the
+    /// full caveat).
+    #[serde(default)]
+    pub innercone: Option<serde_json::Value>,
+    #[serde(default)]
+    pub outercone: Option<serde_json::Value>,
     // Puppet animation layers (blended each frame).
     #[serde(default)]
     pub animationlayers: Option<serde_json::Value>,
@@ -520,6 +570,16 @@ impl SceneObject {
             .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
             .unwrap_or([1.0, 1.0, 1.0]);
         Some((radius, intensity, color))
+    }
+
+    /// `(innercone, outercone)` in degrees, when this light object sets
+    /// both — the signal `Scene::lights()` uses to build a spot light
+    /// instead of a point light. See the `innercone`/`outercone` field docs
+    /// for the "no real content to verify a type field against" caveat.
+    pub fn spot_cone_degrees(&self) -> Option<(f32, f32)> {
+        let inner = self.innercone.as_ref().and_then(parse_value_f32)?;
+        let outer = self.outercone.as_ref().and_then(parse_value_f32)?;
+        Some((inner, outer))
     }
 }
 
@@ -891,6 +951,68 @@ pub fn parse_value_vec4(v: &serde_json::Value) -> Option<[f64; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A `light` object with both innercone/outercone set must resolve to a
+    // Spot light, not the default Point.
+    #[test]
+    fn lights_with_cone_angles_resolve_to_spot() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": true, "origin": "1 2 3", "radius": 100,
+                 "intensity": 0.8, "color": "1 0.5 0.2",
+                 "innercone": 20, "outercone": 45}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 1);
+        match &lights[0].0 {
+            crate::engine::lighting::Light::Spot {
+                origin,
+                intensity,
+                exponent,
+                ..
+            } => {
+                assert_eq!(*origin, [1.0, 2.0, 3.0]);
+                assert!((*intensity - 0.8).abs() < 1e-5);
+                // Narrower-than-default cone should sharpen the falloff
+                // above the widest (2.0) end of the clamp range.
+                assert!(*exponent > 2.0, "exponent={exponent}");
+            }
+            other => panic!("expected Spot, got {other:?}"),
+        }
+    }
+
+    // A `light` object with no cone angles must keep resolving to Point —
+    // the pre-existing, still-most-common case must not regress.
+    #[test]
+    fn lights_without_cone_angles_stay_point() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": true, "origin": "0 0 0", "radius": 50, "intensity": 1.0}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 1);
+        assert!(matches!(lights[0].0, crate::engine::lighting::Light::Point { .. }));
+    }
+
+    // Only one of the two cone fields set is treated as "no cone data" —
+    // half a spot-light definition shouldn't silently activate spot mode.
+    #[test]
+    fn spot_cone_degrees_requires_both_fields() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": true, "origin": "0 0 0", "outercone": 45}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            scene.lights()[0].0,
+            crate::engine::lighting::Light::Point { .. }
+        ));
+    }
 
     // A visible text layer whose parent group is hidden must NOT draw — the WE
     // subtree-hide rule (regression for the LonelyCat multi-language overlap).

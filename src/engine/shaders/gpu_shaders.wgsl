@@ -899,6 +899,58 @@ fn vs_shadow_depth(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> 
     return shadow_mvp * vec4(pos, 1.0);
 }
 
+// ── Perspective-projected 2D quads ────────────────────────────────────────
+// True quadrilateral silhouette for image layers in 3D perspective scenes —
+// `project_quad_ndc` (gpu_renderer.rs) collapses the 4 projected corners to
+// their axis-aligned bounding box, which renders an off-axis or
+// steeply-angled quad as a rectangle instead of the true trapezoid (see the
+// Ghidra report's quad-perspective-warp finding). This pipeline draws the
+// real 4 corners instead.
+//
+// Scoped simplification: UV mapping across the quad is bilinear, not
+// hardware perspective-correct (`corners` are already-divided NDC, not
+// clip-space with a real w) — fixes the silhouette, which is what's
+// visibly wrong; full perspective-correct texture mapping would need
+// passing undivided clip-space corners instead, a further improvement.
+// Normal blending only (mode 0) — `gpu_renderer.rs` falls back to the
+// existing rect-based composite path for any other blend mode on a
+// perspective quad, a narrow and rare combination not worth a second
+// pipeline variant per blend mode.
+
+struct Quad3DParams {
+    corners: array<vec4<f32>, 4>, // xy = NDC (already divided); zw unused
+    color: vec4<f32>,             // rgb = tint, a = opacity
+}
+@group(0) @binding(0) var<uniform> quad3d: Quad3DParams;
+@group(0) @binding(1) var quad3d_tex: texture_2d<f32>;
+@group(0) @binding(2) var quad3d_sampler: sampler;
+
+struct Quad3DVsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_quad3d(@builtin(vertex_index) vi: u32) -> Quad3DVsOut {
+    // Two triangles from the 4 corners (bottom-left, bottom-right,
+    // top-right, top-left — see `quad_world_corners` in gpu_renderer.rs).
+    var idx = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    var uvs = array<vec2<f32>, 4>(
+        vec2(0.0, 1.0), vec2(1.0, 1.0), vec2(1.0, 0.0), vec2(0.0, 0.0),
+    );
+    let corner_i = idx[vi];
+    var out: Quad3DVsOut;
+    out.position = vec4(quad3d.corners[corner_i].xy, 0.0, 1.0);
+    out.uv = uvs[corner_i];
+    return out;
+}
+
+@fragment
+fn fs_quad3d(in: Quad3DVsOut) -> @location(0) vec4<f32> {
+    let s = textureSample(quad3d_tex, quad3d_sampler, in.uv);
+    return vec4(s.rgb * quad3d.color.rgb, s.a * quad3d.color.a);
+}
+
 const MESH3D_ROUGHNESS: f32 = 0.6;
 const MESH3D_F0: vec3<f32> = vec3<f32>(0.04, 0.04, 0.04);
 const MESH3D_PI: f32 = 3.14159265;
