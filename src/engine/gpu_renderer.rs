@@ -2039,14 +2039,25 @@ fn mesh3d_lighting_bytes(
         push4(s);
     }
 
+    // `Mesh3dLighting` in WGSL declares these as two *separate* fixed-size
+    // arrays (`shadow_view_proj` then `shadow_uv_rect`), not an
+    // array-of-structs — every matrix must be written before any rect, or
+    // WGSL indexes into the wrong bytes entirely (confirmed the hard way: an
+    // earlier interleaved version of this loop packed matrix+rect pairs
+    // per-slot, which happened to leave `shadow_view_proj[0]` intact by
+    // coincidence but made every `shadow_uv_rect[slot]` read garbage spliced
+    // from a neighboring slot's matrix).
     for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
-        let (vp, uv_rect) = shadow_slot_data
+        let vp = shadow_slot_data
             .get(slot)
-            .copied()
-            .unwrap_or((crate::engine::camera3d::identity(), [0.0; 4]));
+            .map(|(vp, _)| *vp)
+            .unwrap_or_else(crate::engine::camera3d::identity);
         for col in vp.iter() {
             push4(*col);
         }
+    }
+    for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
+        let uv_rect = shadow_slot_data.get(slot).map(|(_, r)| *r).unwrap_or([0.0; 4]);
         push4(uv_rect);
     }
     bytes
