@@ -125,6 +125,32 @@ fn perlin_noise_vec3(p: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Fractal Brownian motion: `octaves` layers of `perlin_noise`, each at
+/// double the previous frequency and half the previous amplitude (the
+/// standard lacunarity=2/persistence=0.5 construction), normalized by the
+/// actual sum of amplitudes used so the result stays in [-1, 1] regardless
+/// of octave count. Drives the `remapvalue` particle operator's `fbmnoise`
+/// mode. Unlike `perlin_noise` itself (a verified port of the reference's
+/// `NoiseUtils.h`), this octave-summation scheme isn't recoverable against
+/// any ground truth in this project: the vendored linux-wallpaperengine
+/// reference doesn't implement `remapvalue` at all, and no Ghidra string
+/// match exists for the real formula — see the Ghidra report's fbmnoise
+/// follow-up. This is the industry-standard fBm construction, not a
+/// verified port.
+pub fn fbm_noise(x: f64, y: f64, z: f64, octaves: u32) -> f64 {
+    let mut sum = 0.0;
+    let mut amplitude = 1.0;
+    let mut max_amplitude = 0.0;
+    let mut frequency = 1.0;
+    for _ in 0..octaves.max(1) {
+        sum += perlin_noise(x * frequency, y * frequency, z * frequency) * amplitude;
+        max_amplitude += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    sum / max_amplitude.max(1e-9)
+}
+
 /// Curl of the vector noise field — divergence-free, so particles driven by
 /// it swirl smoothly instead of clumping. Central differences with the
 /// reference's epsilon.
@@ -159,6 +185,56 @@ mod tests {
         assert!(a.abs() <= 1.5, "perlin out of expected range: {a}");
         // Integer lattice points evaluate to exactly zero in classic Perlin.
         assert_eq!(perlin_noise(1.0, 2.0, 3.0), 0.0);
+    }
+
+    #[test]
+    fn fbm_noise_stays_in_unit_range_regardless_of_octave_count() {
+        // Perlin's own bound is documented as "roughly [-1,1]" (not exactly
+        // — see `perlin_is_deterministic_and_bounded`'s 1.5 margin), so fBm,
+        // being a weighted average of several Perlin samples, should have
+        // the same character: a generous but real bound, not unbounded
+        // growth as octaves increase (the bug a wrong normalizer, e.g. a
+        // hardcoded divisor sized for a specific octave count, would cause).
+        for octaves in [1, 2, 3, 4, 8] {
+            let v = fbm_noise(1.37, 2.41, 3.59, octaves);
+            assert!(v.abs() <= 1.5, "octaves={octaves}: fbm out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn fbm_noise_is_deterministic() {
+        let a = fbm_noise(0.31, 0.72, 0.19, 4);
+        let b = fbm_noise(0.31, 0.72, 0.19, 4);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fbm_noise_adds_higher_frequency_detail_over_plain_perlin() {
+        // The defining property of fBm over single-octave noise: it should
+        // NOT just equal the base octave (a regression to "plain Perlin",
+        // the exact bug this function replaces — see its own doc comment).
+        // Sampled at a handful of points since any single point could
+        // coincidentally match.
+        let mut differs = false;
+        for i in 0..8 {
+            let t = i as f64 * 0.37;
+            let base = perlin_noise(t, t * 1.3, t * 0.7);
+            let fbm = fbm_noise(t, t * 1.3, t * 0.7, 4);
+            if (base - fbm).abs() > 1e-6 {
+                differs = true;
+            }
+        }
+        assert!(differs, "4-octave fbm was identical to single-octave Perlin everywhere sampled");
+    }
+
+    #[test]
+    fn fbm_noise_one_octave_matches_plain_perlin() {
+        // With a single octave, fbm's normalization (divide by that one
+        // octave's own amplitude, 1.0) must reduce to exactly perlin_noise
+        // — the degenerate case that pins down the normalization formula.
+        let x = 0.83;
+        let (y, z) = (0.44, 0.91);
+        assert_eq!(fbm_noise(x, y, z, 1), perlin_noise(x, y, z));
     }
 
     #[test]

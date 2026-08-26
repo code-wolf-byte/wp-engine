@@ -739,7 +739,10 @@ struct RemapParams {
     out_min: [f32; 3],
     out_max: [f32; 3],
     input_scale: f32,
-    /// `fbmnoise` sums octaves; both approximated with our Perlin noise.
+    /// `fbmnoise` sums 4 octaves via `noise::fbm_noise` instead of a single
+    /// `perlin_noise` sample — see that function's doc comment for why the
+    /// octave count/weighting is a reasonable approximation, not a verified
+    /// port (WE's real formula isn't recoverable for this operator).
     fbm: bool,
 }
 
@@ -1468,16 +1471,18 @@ impl ParticleSystem {
 
             // `remapvalue`: sample a noise field at the particle position and
             // remap it into the output range, setting velocity (or rescaling
-            // speed). fbmnoise adds a second octave.
+            // speed). fbmnoise sums 4 octaves via `noise::fbm_noise`
+            // (industry-standard construction, not a verified port — WE's
+            // real formula isn't recoverable; see the Ghidra report's
+            // fbmnoise follow-up). `octaves = 1` makes the non-fbm case
+            // reduce to exactly `perlin_noise`, unchanged from before.
             if let Some(r) = self.remap {
                 let s = r.input_scale;
                 let noise = |seed: f64| -> f32 {
-                    use crate::engine::noise::perlin_noise;
+                    use crate::engine::noise::fbm_noise;
                     let (x, y, t) = ((p.x * s) as f64, (p.y * s) as f64, self.time as f64);
-                    let mut n = perlin_noise(x + seed, y, t);
-                    if r.fbm {
-                        n = (n + 0.5 * perlin_noise(x * 2.0 + seed, y * 2.0, t * 2.0)) / 1.5;
-                    }
+                    let octaves = if r.fbm { 4 } else { 1 };
+                    let n = fbm_noise(x + seed, y, t, octaves);
                     ((n * 0.5 + 0.5) as f32).clamp(0.0, 1.0) // [-1,1] → [0,1]
                 };
                 let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
