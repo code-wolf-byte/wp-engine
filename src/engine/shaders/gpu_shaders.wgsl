@@ -840,14 +840,20 @@ struct Mesh3dLighting {
     fog_distance: vec4<f32>,  // rgb = color, a = density (0 = off)
     fog_height: vec4<f32>,    // rgb = color, a = density (0 = off)
     fog_extra: vec4<f32>,     // x = height exponent, y = height offset
-    // Fixed-size point-light array (scene.json's `light` objects only ever
-    // resolve to points — see `Scene::lights`). Unused slots have
+    // Fixed-size light array (scene.json's `light` objects resolve to
+    // either Point or Spot — see `Scene::lights`). Unused slots have
     // light_color.a == 0 and are skipped; no separate count field needed.
     // light_pos[i].w doubles as a shadow-atlas slot selector: 0.0 = this
     // light casts no shadow, else `slot + 1` — see
     // `gpu_renderer.rs::mesh3d_lighting_bytes`.
     light_pos: array<vec4<f32>, MESH3D_MAX_LIGHTS>,
     light_color: array<vec4<f32>, MESH3D_MAX_LIGHTS>,
+    // Spot-light shaping, view-space: xyz = facing direction, w = Phong-style
+    // falloff exponent (see `mesh3d_spot_factor`). A zero-length xyz means
+    // "this light is a Point, not a Spot" — cheaper than a separate flag,
+    // and a real spot direction is never exactly zero (it's always a
+    // rotated unit vector — see `Scene::lights`).
+    light_spot: array<vec4<f32>, MESH3D_MAX_LIGHTS>,
     // Per-shadow-slot world-space view-projection (wgpu depth range) and
     // atlas sub-rect (u, v, scale_u, scale_v) — see `engine::shadow`. This
     // is the shared-atlas addressing scheme recovered from the original
@@ -1017,6 +1023,26 @@ fn mesh3d_shadow_factor(shadow_w: f32, world_pos: vec3<f32>) -> f32 {
     return textureSampleCompareLevel(shadow_atlas, shadow_sampler, atlas_uv, depth - MESH3D_SHADOW_BIAS);
 }
 
+// Spot angular falloff — matches `engine::lighting::pbr_spot`'s formula
+// exactly: the cosine of the angle between the light's own facing direction
+// and the direction from the light toward the surface, raised to a falloff
+// exponent (Phong-style, not WE's real recovered `smoothstep(inner, outer,
+// cosAngle)` — see the Ghidra report's light-schema follow-up for why).
+// `light_spot.xyz` zero-length means "this light is a Point, not a Spot"
+// (see the `Mesh3dLighting` field doc) — returns 1.0 so a point light's
+// contribution is left untouched.
+fn mesh3d_spot_factor(light_spot: vec4<f32>, l: vec3<f32>) -> f32 {
+    let dir_len2 = dot(light_spot.xyz, light_spot.xyz);
+    if (dir_len2 < 0.25) {
+        return 1.0;
+    }
+    let spot_dir = light_spot.xyz * inverseSqrt(dir_len2);
+    // `l` points from the surface toward the light; the light's own facing
+    // direction points the other way, hence `-l`.
+    let cos_angle = max(dot(-l, spot_dir), 0.0);
+    return pow(cos_angle, max(light_spot.w, 1.0));
+}
+
 @fragment
 fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
     let albedo = textureSample(mesh3d_tex, mesh3d_sampler, in.uv);
@@ -1039,8 +1065,9 @@ fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
         let dist2 = max(dot(to_light, to_light), 0.0001);
         let l = to_light * inverseSqrt(dist2);
         let atten = lc.a / dist2;
+        let spot_factor = mesh3d_spot_factor(mesh3d_lighting.light_spot[i], l);
         let shadow_factor = mesh3d_shadow_factor(mesh3d_lighting.light_pos[i].w, in.world_pos);
-        lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten) * shadow_factor;
+        lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten * spot_factor) * shadow_factor;
     }
 
     var color = lit;

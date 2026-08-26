@@ -165,6 +165,20 @@ impl PerspectiveCamera {
         ]
     }
 
+    /// Transform a world-space *direction* into view space — same rotation
+    /// `to_view_space` applies to a position, without the translation
+    /// (directions have no location to translate). Used to place a spot
+    /// light's facing direction for the mesh3d lighting pass, which shades
+    /// entirely in view space — see `to_view_space`.
+    pub fn to_view_direction(&self, d: [f32; 3]) -> [f32; 3] {
+        let m = &self.view;
+        [
+            m[0][0] * d[0] + m[1][0] * d[1] + m[2][0] * d[2],
+            m[0][1] * d[0] + m[1][1] * d[1] + m[2][1] * d[2],
+            m[0][2] * d[0] + m[1][2] * d[1] + m[2][2] * d[2],
+        ]
+    }
+
     /// Model-view (no projection) for an object — world→view space, ready to
     /// upload as a `mat4x4<f32>` uniform. The lighting pass needs view-space
     /// vertex positions separately from the clip-space `mvp` output.
@@ -331,6 +345,28 @@ mod tests {
         ];
         assert!((got[0] - 0.5).abs() < 1e-5, "expected 1/scale.x = 0.5, got {got:?}");
         assert!(got[1].abs() < 1e-5 && got[2].abs() < 1e-5, "got {got:?}");
+    }
+
+    #[test]
+    fn to_view_direction_ignores_translation() {
+        // `to_view_direction(d)` must equal `to_view_space(p + d) -
+        // to_view_space(p)` for any `p` — the defining property of a
+        // direction transform (no location to translate), and the bug
+        // class this method exists to avoid (accidentally reusing
+        // `to_view_space`'s translation term for a direction).
+        let cam = PerspectiveCamera::from_scene(&test_scene(), 1.0).unwrap();
+        let d = [0.3, -0.7, 0.5];
+        let got = cam.to_view_direction(d);
+        for p in [[0.0, 0.0, 0.0], [4.0, -2.0, 9.0], [-100.0, 3.0, 0.0]] {
+            let want = [
+                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[0] - cam.to_view_space(p)[0],
+                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[1] - cam.to_view_space(p)[1],
+                cam.to_view_space([p[0] + d[0], p[1] + d[1], p[2] + d[2]])[2] - cam.to_view_space(p)[2],
+            ];
+            for i in 0..3 {
+                assert!((got[i] - want[i]).abs() < 1e-4, "axis {i}: got {got:?} want {want:?} (p={p:?})");
+            }
+        }
     }
 
     #[test]

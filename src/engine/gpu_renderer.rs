@@ -1881,12 +1881,13 @@ const MESH3D_MAX_LIGHTS: usize = 8;
 const MESH3D_MAX_SHADOW_LIGHTS: usize = crate::engine::shadow::MAX_SHADOW_LIGHTS;
 
 /// Byte length of the `Mesh3dLighting` uniform buffer: 5 leading `vec4`s
-/// (flags, ambient, fog_distance, fog_height, fog_extra), two
-/// `MESH3D_MAX_LIGHTS`-length `vec4` arrays (positions, colors), then
-/// `MESH3D_MAX_SHADOW_LIGHTS` `mat4x4`s (shadow view-projections) and
-/// `MESH3D_MAX_SHADOW_LIGHTS` `vec4`s (their atlas UV sub-rects).
+/// (flags, ambient, fog_distance, fog_height, fog_extra), three
+/// `MESH3D_MAX_LIGHTS`-length `vec4` arrays (positions, colors, spot
+/// direction+exponent), then `MESH3D_MAX_SHADOW_LIGHTS` `mat4x4`s (shadow
+/// view-projections) and `MESH3D_MAX_SHADOW_LIGHTS` `vec4`s (their atlas UV
+/// sub-rects).
 const MESH3D_LIGHTING_BYTES_LEN: usize =
-    16 * 5 + 16 * MESH3D_MAX_LIGHTS * 2 + (64 + 16) * MESH3D_MAX_SHADOW_LIGHTS;
+    16 * 5 + 16 * MESH3D_MAX_LIGHTS * 3 + (64 + 16) * MESH3D_MAX_SHADOW_LIGHTS;
 
 /// Pack one mesh's `Mesh3dTransform` uniform (mvp, model_view, normal_view,
 /// model) — layout must match `Mesh3dTransform` in `gpu_shaders.wgsl`
@@ -1918,9 +1919,10 @@ fn mesh3d_transform_bytes(
 
 /// Pack the scene-wide `Mesh3dLighting` uniform: ambient + fog (already
 /// resolved by `General::ambient_color`/`General::fog`), up to
-/// `MESH3D_MAX_LIGHTS` point lights from `Scene::lights` (positions in the
-/// camera's view space, matching everything else `fs_mesh3d` works in), and
-/// up to `MESH3D_MAX_SHADOW_LIGHTS` shadow view-projections + atlas UV
+/// `MESH3D_MAX_LIGHTS` point or spot lights from `Scene::lights` (positions
+/// in the camera's view space, matching everything else `fs_mesh3d` works
+/// in; a spot's facing direction goes into `light_spot`, also view-space),
+/// and up to `MESH3D_MAX_SHADOW_LIGHTS` shadow view-projections + atlas UV
 /// rects (world space — see `mesh3d_transform_bytes`). Layout must match
 /// `Mesh3dLighting` in `gpu_shaders.wgsl` exactly.
 ///
@@ -1950,16 +1952,20 @@ fn mesh3d_lighting_bytes(
     };
 
     // Gates on "at least one light this loop can actually render" rather
-    // than "at least one light object exists": `Scene::lights()` can also
-    // produce `Light::Spot` (see `scene.rs`), which this loop below doesn't
-    // shade yet (GPU spot support is a follow-on, not wired). A scene with
-    // only spot lights must still fall through to the plain unlit look, not
-    // engage the lit branch with zero actual light contributions (which
+    // than "at least one light object exists" — `Scene::lights()` can
+    // produce light variants this loop doesn't shade (only Tube today; see
+    // `mesh3d_brdf`'s callers below for what Point/Spot get). A scene with
+    // only unrenderable lights must still fall through to the plain unlit
+    // look, not engage the lit branch with zero actual contributions (which
     // would multiply by `ambient` alone — usually black, per the corpus's
     // near-universal unset `ambientcolor`).
-    let has_renderable_light = lights
-        .iter()
-        .any(|(l, _)| matches!(l, crate::engine::lighting::Light::Point { .. }));
+    let has_renderable_light = lights.iter().any(|(l, _)| {
+        matches!(
+            l,
+            crate::engine::lighting::Light::Point { .. }
+                | crate::engine::lighting::Light::Spot { .. }
+        )
+    });
     push4([if has_renderable_light { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
     push4([ambient[0], ambient[1], ambient[2], 0.0]);
     match &fog {
@@ -1977,22 +1983,50 @@ fn mesh3d_lighting_bytes(
 
     let mut positions = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
     let mut colors = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
-    for (i, ((pos_slot, color_slot), (light, _casts_shadow))) in positions
+    let mut spots = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
+    for (i, ((pos_slot, (color_slot, spot_slot)), (light, _casts_shadow))) in positions
         .iter_mut()
-        .zip(colors.iter_mut())
+        .zip(colors.iter_mut().zip(spots.iter_mut()))
         .zip(lights.iter())
         .enumerate()
     {
-        if let crate::engine::lighting::Light::Point { origin, color, intensity, .. } = light {
-            let vp = cam.to_view_space(*origin);
-            let shadow_w = shadow_slots
+        let shadow_w = || {
+            shadow_slots
                 .get(i)
                 .copied()
                 .flatten()
                 .map(|s| (s + 1) as f32)
-                .unwrap_or(0.0);
-            *pos_slot = [vp[0], vp[1], vp[2], shadow_w];
-            *color_slot = [color[0], color[1], color[2], *intensity];
+                .unwrap_or(0.0)
+        };
+        match light {
+            crate::engine::lighting::Light::Point { origin, color, intensity, .. } => {
+                let vp = cam.to_view_space(*origin);
+                *pos_slot = [vp[0], vp[1], vp[2], shadow_w()];
+                *color_slot = [color[0], color[1], color[2], *intensity];
+                // spot_slot stays [0,0,0,0] — zero-length direction reads as
+                // "not a spot" in `mesh3d_spot_factor`.
+            }
+            crate::engine::lighting::Light::Spot {
+                origin,
+                direction,
+                exponent,
+                color,
+                intensity,
+                ..
+            } => {
+                let vp = cam.to_view_space(*origin);
+                // Shadows aren't wired for spot lights yet (`build_shadow_atlas`
+                // only casts from `Light::Point`) — shadow_w() would always be
+                // 0.0 here regardless, called anyway so a future shadow-casting
+                // spot doesn't silently need this call site revisited too.
+                *pos_slot = [vp[0], vp[1], vp[2], shadow_w()];
+                *color_slot = [color[0], color[1], color[2], *intensity];
+                let vd = cam.to_view_direction(*direction);
+                *spot_slot = [vd[0], vd[1], vd[2], *exponent];
+            }
+            // Directional/Tube: `Scene::lights()` never produces these
+            // today (see scene.rs) — left unrenderable rather than guessed.
+            _ => {}
         }
     }
     for p in positions {
@@ -2000,6 +2034,9 @@ fn mesh3d_lighting_bytes(
     }
     for c in colors {
         push4(c);
+    }
+    for s in spots {
+        push4(s);
     }
 
     for slot in 0..MESH3D_MAX_SHADOW_LIGHTS {
@@ -5281,6 +5318,51 @@ mod tests {
         )];
         let bytes = mesh3d_lighting_bytes(&scene, &cam, &shadow_slots, &shadow_slot_data);
         assert_eq!(bytes.len(), MESH3D_LIGHTING_BYTES_LEN);
+    }
+
+    /// A spot light must (a) count as renderable (`flags.x == 1.0` — the
+    /// bug fixed alongside GPU spot support: `Scene::lights()` producing a
+    /// `Light::Spot` must not silently fall back to the unlit branch) and
+    /// (b) write a non-zero direction into its `light_spot` slot, so
+    /// `mesh3d_spot_factor` in the shader doesn't read it as "not a spot".
+    #[test]
+    fn mesh3d_lighting_bytes_encodes_spot_direction() {
+        let cam_scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
+        )
+        .unwrap();
+        let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+
+        let scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
+                "general": {"orthogonalprojection": null},
+                "objects": [
+                    {"id": 1, "light": true, "origin": "0 0 0", "radius": 100,
+                     "intensity": 0.8, "color": "1 1 1",
+                     "innercone": 20, "outercone": 45}
+                ]}"#,
+        )
+        .unwrap();
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+
+        // flags.x is the buffer's first f32.
+        let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(flags_x, 1.0, "a spot-only scene must still engage the lit branch");
+
+        // light_spot[0] starts after 5 leading vec4s + 2 MESH3D_MAX_LIGHTS
+        // vec4 arrays (positions, colors).
+        let spot0_offset = 16 * 5 + 16 * MESH3D_MAX_LIGHTS * 2;
+        let read_f32 = |i: usize| {
+            f32::from_le_bytes(
+                bytes[spot0_offset + i * 4..spot0_offset + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let dir = [read_f32(0), read_f32(1), read_f32(2)];
+        let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        assert!(len2 > 0.25, "spot direction must not read as zero: {dir:?}");
+        assert!(read_f32(3) >= 1.0, "exponent must be clamped to at least 1.0");
     }
 
     /// WGSL rounds every uniform-address-space struct up to a 16-byte
