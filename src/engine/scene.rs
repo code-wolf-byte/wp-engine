@@ -49,10 +49,13 @@ impl Scene {
     /// treats it as `Point`) can still resolve to `Spot` when the author's
     /// intent is otherwise clear from `innercone`/`outercone` being set.
     ///
-    /// Every `light` scene object as `(light, casts_shadow)`. Paired rather
-    /// than two parallel vecs so a caller can never let a shadow flag drift
-    /// out of sync with the light it belongs to after filtering.
-    pub fn lights(&self) -> Vec<(crate::engine::lighting::Light, bool)> {
+    /// Every `light` scene object as `(light, casts_shadow, volumetrics)`.
+    /// Paired rather than parallel vecs so a caller can never let a flag
+    /// drift out of sync with the light it belongs to after filtering.
+    /// `volumetrics` is `Some((density, exponent))` when `castvolumetrics`
+    /// is set — see `SceneObject::volumetrics_params` and the Ghidra
+    /// report's `_rt_volumetrics*` follow-up.
+    pub fn lights(&self) -> Vec<(crate::engine::lighting::Light, bool, Option<(f32, f32)>)> {
         self.objects
             .iter()
             .filter(|o| o.image.is_none())
@@ -65,6 +68,7 @@ impl Scene {
                     .as_ref()
                     .and_then(parse_value_bool)
                     .unwrap_or(false);
+                let volumetrics = o.volumetrics_params();
                 // Forward = -Z of the object's own rotation, shared by
                 // Spot and Directional. Picked as the most common "facing"
                 // convention (matching how `camera3d`'s eye→center
@@ -123,7 +127,7 @@ impl Scene {
                         radius,
                     }
                 };
-                Some((light, casts_shadow))
+                Some((light, casts_shadow, volumetrics))
             })
             .collect()
     }
@@ -460,7 +464,8 @@ pub struct SceneObject {
     pub shape: Option<serde_json::Value>,
     #[serde(default)]
     pub particlesrc: Option<serde_json::Value>,
-    /// Volumetric-lighting parameters. Parsed; no lighting subsystem yet.
+    /// Volumetric-lighting parameters — see `SceneObject::volumetrics_params`
+    /// and `engine::volumetrics`.
     #[serde(default)]
     pub castvolumetrics: Option<serde_json::Value>,
     #[serde(default)]
@@ -620,6 +625,39 @@ impl SceneObject {
             Some("ldirectional") => LightType::Directional,
             _ => LightType::Point,
         }
+    }
+
+    /// `(density, exponent)` for a volumetric light shaft, when
+    /// `castvolumetrics` is truthy — `None` otherwise. Both properties are
+    /// already parsed (see their field docs, "Parsed; no lighting subsystem
+    /// yet" — now there is one, `engine::volumetrics`); defaults picked to
+    /// give a visible-but-not-overwhelming shaft when a scene sets
+    /// `castvolumetrics` without also tuning `density`/`volumetricsexponent`
+    /// — unverified against real content, no downloaded Workshop light
+    /// object with `castvolumetrics` set was available locally (see the
+    /// Ghidra report's `_rt_volumetrics*` follow-up).
+    pub fn volumetrics_params(&self) -> Option<(f32, f32)> {
+        let on = self
+            .castvolumetrics
+            .as_ref()
+            .and_then(parse_value_bool)
+            .unwrap_or(false);
+        if !on {
+            return None;
+        }
+        let density = self
+            .density
+            .as_ref()
+            .and_then(parse_value_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 4.0);
+        let exponent = self
+            .volumetricsexponent
+            .as_ref()
+            .and_then(parse_value_f32)
+            .unwrap_or(1.0)
+            .max(0.01);
+        Some((density, exponent))
     }
 }
 
@@ -1126,6 +1164,37 @@ mod tests {
         assert_eq!(lights.len(), 2);
         assert!(matches!(lights[0].0, crate::engine::lighting::Light::Point { .. }));
         assert!(matches!(lights[1].0, crate::engine::lighting::Light::Point { .. }));
+    }
+
+    // `castvolumetrics: true` must surface as `Some((density, exponent))`
+    // in `Scene::lights()`'s third tuple slot, with the authored values
+    // read through, not the defaults.
+    #[test]
+    fn volumetrics_params_read_when_castvolumetrics_set() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": true, "origin": "0 0 0",
+                 "castvolumetrics": true, "density": 2.5, "volumetricsexponent": 0.5}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 1);
+        let (density, exponent) = lights[0].2.expect("must report volumetrics params");
+        assert!((density - 2.5).abs() < 1e-5);
+        assert!((exponent - 0.5).abs() < 1e-5);
+    }
+
+    // Without `castvolumetrics` (the overwhelmingly common case), the third
+    // tuple slot must be `None` — not a light silently defaulting into a
+    // volumetric shaft nobody asked for.
+    #[test]
+    fn volumetrics_params_none_by_default() {
+        let scene = Scene::from_json(
+            r#"{"objects": [{"id": 1, "light": true, "origin": "0 0 0"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(scene.lights()[0].2, None);
     }
 
     // A visible text layer whose parent group is hidden must NOT draw — the WE

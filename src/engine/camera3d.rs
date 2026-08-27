@@ -78,6 +78,7 @@ pub(crate) fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
 pub struct PerspectiveCamera {
     view: Mat4,
     view_proj: Mat4,
+    eye: [f32; 3],
 }
 
 impl PerspectiveCamera {
@@ -115,7 +116,22 @@ impl PerspectiveCamera {
         Some(Self {
             view,
             view_proj: mat4_mul(&proj, &view),
+            eye,
         })
+    }
+
+    /// World-space camera position.
+    pub fn eye(&self) -> [f32; 3] {
+        self.eye
+    }
+
+    /// `view_proj` in GL clip-space z ([-1,1], not remapped to wgpu's
+    /// [0,1] the way [`Self::view_proj_gpu`] is) — the convention
+    /// `mat4_inverse` + NDC unprojection expects. `pub(crate)` so
+    /// `engine::volumetrics` can reconstruct world-space view rays for its
+    /// ray march.
+    pub(crate) fn view_proj_raw(&self) -> Mat4 {
+        self.view_proj
     }
 
     /// Project a world-space point. Returns `(ndc_x, ndc_y)`; `None` when the
@@ -213,6 +229,78 @@ pub(crate) fn gl_to_wgpu_depth(m: &Mat4) -> Mat4 {
     mat4_mul(&fix, m)
 }
 
+/// General 4x4 matrix inverse (cofactor/adjugate method — no assumptions
+/// about the matrix's shape, unlike `gl_to_wgpu_depth`'s special-cased
+/// remap). Used to unproject screen-space rays back to world space for the
+/// volumetric-lighting ray march (`engine::volumetrics`) — a raw NDC point
+/// times this inverse recovers its world-space position. Returns the
+/// identity matrix for a singular input (determinant ~0) rather than
+/// producing NaNs; callers that can't tolerate a wrong-but-finite fallback
+/// should check `is_finite()` on the result themselves.
+pub fn mat4_inverse(m: &Mat4) -> Mat4 {
+    // `m[col][row]`, so index as m[c][r] throughout — same convention
+    // `mat4_mul` already uses.
+    let a = |r: usize, c: usize| m[c][r];
+    // Cofactor expansion along the first row, using the standard 2x2 minor
+    // trick for a 4x4 (each 3x3 cofactor built from six precomputed 2x2
+    // sub-determinants of the bottom two rows, then again for the top two).
+    let s0 = a(0, 0) * a(1, 1) - a(1, 0) * a(0, 1);
+    let s1 = a(0, 0) * a(1, 2) - a(1, 0) * a(0, 2);
+    let s2 = a(0, 0) * a(1, 3) - a(1, 0) * a(0, 3);
+    let s3 = a(0, 1) * a(1, 2) - a(1, 1) * a(0, 2);
+    let s4 = a(0, 1) * a(1, 3) - a(1, 1) * a(0, 3);
+    let s5 = a(0, 2) * a(1, 3) - a(1, 2) * a(0, 3);
+
+    let c5 = a(2, 2) * a(3, 3) - a(3, 2) * a(2, 3);
+    let c4 = a(2, 1) * a(3, 3) - a(3, 1) * a(2, 3);
+    let c3 = a(2, 1) * a(3, 2) - a(3, 1) * a(2, 2);
+    let c2 = a(2, 0) * a(3, 3) - a(3, 0) * a(2, 3);
+    let c1 = a(2, 0) * a(3, 2) - a(3, 0) * a(2, 2);
+    let c0 = a(2, 0) * a(3, 1) - a(3, 0) * a(2, 1);
+
+    let det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+    if det.abs() < 1e-12 {
+        return identity();
+    }
+    let inv_det = 1.0 / det;
+
+    // Result built row-by-row in standard (row, col) math notation, then
+    // transposed into this codebase's `m[col][row]` storage at the end.
+    let r = [
+        [
+            a(1, 1) * c5 - a(1, 2) * c4 + a(1, 3) * c3,
+            -a(0, 1) * c5 + a(0, 2) * c4 - a(0, 3) * c3,
+            a(3, 1) * s5 - a(3, 2) * s4 + a(3, 3) * s3,
+            -a(2, 1) * s5 + a(2, 2) * s4 - a(2, 3) * s3,
+        ],
+        [
+            -a(1, 0) * c5 + a(1, 2) * c2 - a(1, 3) * c1,
+            a(0, 0) * c5 - a(0, 2) * c2 + a(0, 3) * c1,
+            -a(3, 0) * s5 + a(3, 2) * s2 - a(3, 3) * s1,
+            a(2, 0) * s5 - a(2, 2) * s2 + a(2, 3) * s1,
+        ],
+        [
+            a(1, 0) * c4 - a(1, 1) * c2 + a(1, 3) * c0,
+            -a(0, 0) * c4 + a(0, 1) * c2 - a(0, 3) * c0,
+            a(3, 0) * s4 - a(3, 1) * s2 + a(3, 3) * s0,
+            -a(2, 0) * s4 + a(2, 1) * s2 - a(2, 3) * s0,
+        ],
+        [
+            -a(1, 0) * c3 + a(1, 1) * c1 - a(1, 2) * c0,
+            a(0, 0) * c3 - a(0, 1) * c1 + a(0, 2) * c0,
+            -a(3, 0) * s3 + a(3, 1) * s1 - a(3, 2) * s0,
+            a(2, 0) * s3 - a(2, 1) * s1 + a(2, 2) * s0,
+        ],
+    ];
+    let mut out = identity();
+    for row in 0..4 {
+        for col in 0..4 {
+            out[col][row] = r[row][col] * inv_det;
+        }
+    }
+    out
+}
+
 pub fn identity() -> Mat4 {
     let mut m = [[0.0f32; 4]; 4];
     for (i, row) in m.iter_mut().enumerate() {
@@ -262,6 +350,64 @@ pub fn rotate_euler(v: [f32; 3], angles: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mat4_approx_eq(a: &Mat4, b: &Mat4, eps: f32) -> bool {
+        (0..4).all(|c| (0..4).all(|r| (a[c][r] - b[c][r]).abs() < eps))
+    }
+
+    #[test]
+    fn mat4_inverse_of_identity_is_identity() {
+        assert!(mat4_approx_eq(&mat4_inverse(&identity()), &identity(), 1e-6));
+    }
+
+    #[test]
+    fn mat4_inverse_roundtrips_a_real_view_proj() {
+        let view = look_at([3.0, 2.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj = perspective(50f32.to_radians(), 16.0 / 9.0, 0.1, 100.0);
+        let vp = mat4_mul(&proj, &view);
+        let inv = mat4_inverse(&vp);
+        let roundtrip = mat4_mul(&vp, &inv);
+        assert!(
+            mat4_approx_eq(&roundtrip, &identity(), 1e-3),
+            "vp * inverse(vp) should be ~identity, got {roundtrip:?}"
+        );
+    }
+
+    #[test]
+    fn mat4_inverse_unprojects_a_known_world_point_back_to_itself() {
+        let view = look_at([0.0, 0.0, 10.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj = perspective(60f32.to_radians(), 1.0, 0.1, 100.0);
+        let vp = mat4_mul(&proj, &view);
+        let inv = mat4_inverse(&vp);
+
+        let world = [1.5, -0.5, 2.0, 1.0f32];
+        // Project world -> clip -> NDC.
+        let clip: [f32; 4] =
+            std::array::from_fn(|row| (0..4).map(|k| vp[k][row] * world[k]).sum());
+        let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3], 1.0];
+        // Unproject NDC -> clip (undo the perspective divide with the same w) -> world.
+        let unclip = [ndc[0] * clip[3], ndc[1] * clip[3], ndc[2] * clip[3], clip[3]];
+        let back: [f32; 4] =
+            std::array::from_fn(|row| (0..4).map(|k| inv[k][row] * unclip[k]).sum());
+        for i in 0..3 {
+            assert!(
+                (back[i] - world[i]).abs() < 1e-3,
+                "component {i}: got {}, want {}",
+                back[i],
+                world[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mat4_inverse_of_singular_matrix_is_finite() {
+        // All-zero rotation/scale (a genuinely singular matrix) must not
+        // produce NaN/Inf.
+        let mut m = identity();
+        m[0][0] = 0.0;
+        let inv = mat4_inverse(&m);
+        assert!(inv.iter().all(|c| c.iter().all(|v| v.is_finite())));
+    }
 
     /// `model_matrix` expands the same Rz·Ry·Rx that `rotate_euler` applies
     /// step by step — they must not drift apart.

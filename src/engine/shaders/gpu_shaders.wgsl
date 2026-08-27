@@ -1115,3 +1115,106 @@ fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
 
     return vec4<f32>(color, albedo.a);
 }
+
+// ── Volumetric light shafts ──────────────────────────────────────────────
+//
+// A ray-marched-against-the-shadow-map light shaft for the *first*
+// `castvolumetrics` light in the scene (see `GpuSceneInstance::
+// build_volumetrics`/`record_volumetrics` and the Ghidra report's
+// `_rt_volumetrics*` follow-up). WE's real technique procedurally builds a
+// jittered per-light cone/box mesh on the CPU and rasterizes it; the exact
+// per-pixel math is unrecoverable D3D bytecode either way (same situation
+// as the main PBR lighting shader — see the report's own findings), so this
+// is an honest, differently-shaped approximation that reaches the same
+// visual result (a light shaft respecting real shadow occlusion) through a
+// simpler, GPU-standard technique: march the camera ray through world
+// space, sample the shadow atlas at each step, accumulate.
+
+struct VolumetricsParams {
+    inv_view_proj: mat4x4<f32>,
+    shadow_view_proj: mat4x4<f32>,
+    eye: vec4<f32>,           // xyz = world camera position
+    light_origin: vec4<f32>,  // xyz = world light position, w = density
+    light_color: vec4<f32>,   // rgb = color * intensity, a = volumetricsexponent
+    shadow_uv_rect: vec4<f32>,
+    misc: vec4<f32>,          // x = 1.0 if this light also casts a shadow, y = max march range
+}
+
+@group(0) @binding(0) var<uniform> vol_params: VolumetricsParams;
+@group(0) @binding(1) var vol_shadow_atlas: texture_depth_2d;
+@group(0) @binding(2) var vol_shadow_sampler: sampler_comparison;
+
+const VOLUMETRICS_STEPS: i32 = 24;
+// Same self-shadowing bias concern `MESH3D_SHADOW_BIAS` addresses, kept as
+// its own constant since this pass samples the same atlas from a
+// completely different set of world positions (ray-march sample points,
+// not surface fragments).
+const VOLUMETRICS_SHADOW_BIAS: f32 = 0.003;
+
+// Structurally the same projection→UV→compare sequence as
+// `mesh3d_shadow_factor`, just against this pass's own uniform layout
+// instead of `mesh3d_lighting`'s per-slot arrays.
+fn volumetrics_shadow_factor(world_pos: vec3<f32>) -> f32 {
+    if (vol_params.misc.x < 0.5) {
+        return 1.0;
+    }
+    let light_clip = vol_params.shadow_view_proj * vec4(world_pos, 1.0);
+    if (light_clip.w <= 0.0) {
+        return 1.0;
+    }
+    let ndc = light_clip.xy / light_clip.w;
+    let depth = light_clip.z / light_clip.w;
+    let local_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let atlas_uv = vol_params.shadow_uv_rect.xy + local_uv * vol_params.shadow_uv_rect.zw;
+    return textureSampleCompareLevel(vol_shadow_atlas, vol_shadow_sampler, atlas_uv, depth - VOLUMETRICS_SHADOW_BIAS);
+}
+
+@fragment
+fn fs_volumetrics(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    // Unproject this pixel's near/far NDC points back to world space (same
+    // GL-clip convention `camera3d::mat4_inverse`'s caller uses — see
+    // `PerspectiveCamera::view_proj_raw`) to reconstruct the camera ray,
+    // rather than needing separately-uploaded basis vectors.
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let near4 = vol_params.inv_view_proj * vec4(ndc, -1.0, 1.0);
+    let far4 = vol_params.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    let near_world = near4.xyz / near4.w;
+    let far_world = far4.xyz / far4.w;
+    let ray_dir = normalize(far_world - near_world);
+
+    let max_range = vol_params.misc.y;
+    let step_size = max_range / f32(VOLUMETRICS_STEPS);
+    let density = vol_params.light_origin.w;
+    // `exponent` (WE's `volumetricsexponent`) reinterpreted as an
+    // exponential extinction rate — how fast in-scattered light decays with
+    // distance from the light — rather than a literal power on inverse-
+    // square falloff: integrating inverse-square along a ray has a
+    // singularity at the light itself (falloff → ∞ as a sample's distance
+    // → 0), which blows out to solid white the instant any sample lands
+    // near the light. Exponential (Beer-Lambert-style) extinction is the
+    // standard, numerically well-behaved choice for this kind of in-
+    // scattering integral, and stays bounded ([0,1] per step) everywhere.
+    let decay = max(vol_params.light_color.a, 0.05);
+
+    var accum = 0.0;
+    for (var i = 0; i < VOLUMETRICS_STEPS; i = i + 1) {
+        // Mid-point sampling: softens the fixed step count's banding a
+        // little without needing per-pixel jitter (no blue-noise texture
+        // in this pipeline to jitter with).
+        let t = (f32(i) + 0.5) * step_size;
+        let p = vol_params.eye.xyz + ray_dir * t;
+        let shadow = volumetrics_shadow_factor(p);
+        if (shadow <= 0.0) {
+            continue;
+        }
+        let dist_to_light = length(vol_params.light_origin.xyz - p);
+        let falloff = exp(-dist_to_light * decay);
+        accum = accum + shadow * falloff * step_size;
+    }
+
+    // `density` (WE's own property) and a fixed brightness constant both
+    // scale the whole integral, kept outside the per-step loop so they
+    // can't compound step-over-step the way multiplying inside it would.
+    const VOLUMETRICS_SCALE: f32 = 0.06;
+    return vec4<f32>(vol_params.light_color.rgb * accum * density * VOLUMETRICS_SCALE, 1.0);
+}

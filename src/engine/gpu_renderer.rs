@@ -108,6 +108,10 @@ pub struct GpuSceneRenderer {
     shadow_pass_bgl: wgpu::BindGroupLayout,
     mesh3d_shadow_pipeline: wgpu::RenderPipeline,
     shadow_comparison_sampler: wgpu::Sampler,
+    // Volumetric-light-shaft ray march: see `fs_volumetrics`,
+    // `GpuSceneInstance::build_volumetrics`/`record_volumetrics`.
+    volumetrics_bgl: wgpu::BindGroupLayout,
+    volumetrics_pipeline: wgpu::RenderPipeline,
     // Perspective-projected 2D quads: see `vs_quad3d`/`fs_quad3d`.
     quad3d_bgl: wgpu::BindGroupLayout,
     quad3d_pipeline: wgpu::RenderPipeline,
@@ -650,6 +654,59 @@ impl GpuSceneRenderer {
             ..Default::default()
         });
 
+        // Volumetric-light-shaft ray march (`fs_volumetrics`): its own small
+        // bind group layout rather than extending `base_bgl`/`effect_bgl` —
+        // it needs the shadow atlas + a comparison sampler, which those
+        // don't declare, and nothing else. Downstream blur/combine passes
+        // reuse the existing bloom pipelines unchanged (both are already
+        // generic single-source-texture operations — see `record_volumetrics`).
+        let volumetrics_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("volumetrics_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Depth,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let volumetrics_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("volumetrics_layout"),
+            bind_group_layouts: &[&volumetrics_bgl],
+            push_constant_ranges: &[],
+        });
+        let volumetrics_pipeline = Self::create_pipeline(
+            &device,
+            &volumetrics_layout,
+            &shader_module,
+            "vs_fullscreen",
+            "fs_volumetrics",
+            "volumetrics",
+            None,
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+
         // Perspective-projected 2D quads (true silhouette, not the AABB
         // `project_quad_ndc` collapses to) — see `vs_quad3d`/`fs_quad3d` in
         // gpu_shaders.wgsl and the Ghidra report's quad-warp finding. Its
@@ -724,6 +781,8 @@ impl GpuSceneRenderer {
             shadow_pass_bgl,
             mesh3d_shadow_pipeline,
             shadow_comparison_sampler,
+            volumetrics_bgl,
+            volumetrics_pipeline,
             quad3d_bgl,
             quad3d_pipeline,
             particle_bgl,
@@ -1685,6 +1744,14 @@ pub struct GpuSceneInstance {
     clear_color: [f64; 3],
     dynamics: CameraDynamics,
     bloom: BloomSettings,
+    /// The volumetric-light-shaft ray march's static per-scene bind group —
+    /// `None` unless a light sets `castvolumetrics` (see `build_volumetrics`,
+    /// `record_volumetrics`, and the Ghidra report's `_rt_volumetrics*`
+    /// follow-up). Static because the camera and every light's world
+    /// transform are themselves static in this engine (mesh3d/lighting are
+    /// baked once at load, not per-frame — same precedent `mesh3d_lighting_ubo`
+    /// already sets).
+    volumetrics_bind_group: Option<wgpu::BindGroup>,
     /// Each owns independent simulation state; stepped and CPU-rendered into a
     /// scene-sized RGBA buffer every frame, then uploaded and composited like
     /// any other layer (see `render()` step 3). A known simplification: real
@@ -1959,7 +2026,7 @@ fn mesh3d_lighting_bytes(
     // look, not engage the lit branch with zero actual contributions (which
     // would multiply by `ambient` alone — usually black, per the corpus's
     // near-universal unset `ambientcolor`).
-    let has_renderable_light = lights.iter().any(|(l, _)| {
+    let has_renderable_light = lights.iter().any(|(l, ..)| {
         matches!(
             l,
             crate::engine::lighting::Light::Point { .. }
@@ -1985,7 +2052,7 @@ fn mesh3d_lighting_bytes(
     let mut positions = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
     let mut colors = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
     let mut spots = [[0.0f32; 4]; MESH3D_MAX_LIGHTS];
-    for (i, ((pos_slot, (color_slot, spot_slot)), (light, _casts_shadow))) in positions
+    for (i, ((pos_slot, (color_slot, spot_slot)), (light, ..))) in positions
         .iter_mut()
         .zip(colors.iter_mut().zip(spots.iter_mut()))
         .zip(lights.iter())
@@ -2360,6 +2427,13 @@ impl GpuSceneInstance {
             }
         }
 
+        // Computed early (not just before `build_shadow_atlas` needs it, its
+        // original spot) so the FBO-pool setup below can also gate
+        // `_rt_VolumetricsBuffer`'s allocation on whether any light actually
+        // needs it — see `engine::scene::SceneObject::volumetrics_params`.
+        let lights = resolved.scene.lights();
+        let has_volumetrics = lights.iter().any(|(_, _, v)| v.is_some());
+
         // Allocate all persistent render targets up front so the render loop
         // can look them up immutably. Per-layer effect-chain FBOs (ping-pong
         // pair + named targets) are sized to that layer's own object size,
@@ -2426,6 +2500,18 @@ impl GpuSceneInstance {
             fbo_pool.get_or_create(renderer.device(), "_rt_4FrameBuffer", qw, qh);
             fbo_pool.get_or_create(renderer.device(), "_rt_8FrameBuffer", ew, eh);
             fbo_pool.get_or_create(renderer.device(), "_rt_Bloom", ew, eh);
+        }
+
+        // Volumetric-light-shaft ray march (see `build_volumetrics` and
+        // `record_volumetrics`) — quarter-res like bloom's own chain, cheap
+        // enough for a per-pixel ray march, upsampled naturally by the blur
+        // pass. Gated on `has_volumetrics`: real content essentially never
+        // sets `castvolumetrics` (see the Ghidra report's `_rt_volumetrics*`
+        // follow-up), so this stays a zero-cost no-op for the common case.
+        if has_volumetrics {
+            let (qw, qh) = ((w / 4).max(1), (h / 4).max(1));
+            fbo_pool.get_or_create(renderer.device(), "_rt_VolumetricsBuffer", qw, qh);
+            fbo_pool.get_or_create(renderer.device(), "_rt_VolumetricsBlurTmp", qw, qh);
         }
 
         let target = renderer.create_render_target(w, h);
@@ -2547,7 +2633,7 @@ impl GpuSceneInstance {
         // shadow-casting `light` object — see `build_shadow_atlas` and
         // `engine::shadow`. Built before the lighting uniform and the final
         // mesh3d draws because both need to bind its (by-then-final) view.
-        let lights = resolved.scene.lights();
+        // `lights` itself was computed earlier, alongside `has_volumetrics`.
         let (shadow_atlas_tex, shadow_slots, shadow_slot_data) = if camera3d.is_some() {
             Self::build_shadow_atlas(&renderer, &resolved.mesh3d_layers, &lights)
         } else {
@@ -2567,6 +2653,19 @@ impl GpuSceneInstance {
             )
         };
         let shadow_atlas_view = shadow_atlas_tex.create_view(&Default::default());
+        // Volumetric-light-shaft ray march's static per-scene bind group —
+        // `None` unless `has_volumetrics` (checked again inside, cheaply,
+        // since it also needs to find *which* light). See `build_volumetrics`.
+        let volumetrics_bind_group = camera3d.as_ref().and_then(|cam| {
+            Self::build_volumetrics(
+                &renderer,
+                cam,
+                &lights,
+                &shadow_slots,
+                &shadow_slot_data,
+                &shadow_atlas_view,
+            )
+        });
         // Scene-wide lighting/fog/shadow uniform, shared by every mesh3d
         // bind group (binding 3) — see `mesh3d_lighting_bytes`. Zeroed (and
         // thus read as "no lighting") when there's no perspective camera to
@@ -2630,6 +2729,7 @@ impl GpuSceneInstance {
             clear_color,
             dynamics,
             bloom,
+            volumetrics_bind_group,
             particle_systems,
             particle_sprites,
             particle_order,
@@ -2653,6 +2753,112 @@ impl GpuSceneInstance {
         })
     }
 
+    /// Build the volumetric-light-shaft ray march's static per-scene bind
+    /// group (`VolumetricsParams` uniform + the shadow atlas + its
+    /// comparison sampler — see `vs_fullscreen`/`fs_volumetrics` in
+    /// gpu_shaders.wgsl), when the scene has a `castvolumetrics` light —
+    /// `None` otherwise (the overwhelmingly common case: skipped entirely,
+    /// no buffers allocated). See `SceneObject::volumetrics_params` and the
+    /// Ghidra report's `_rt_volumetrics*` follow-up.
+    ///
+    /// Scoped to the *first* volumetric light found. Real content doesn't
+    /// use this system at all (confirmed against the one downloaded
+    /// Workshop sample this session found — see the report), so building
+    /// multi-light support (looping N lights' worth of ray marches in one
+    /// pass, like `fs_mesh3d`'s `MESH3D_MAX_LIGHTS` loop) would be
+    /// speculative complexity with no real-content grounding to verify it
+    /// against, for a feature that's already an approximation (a
+    /// ray-marched-against-the-shadow-map technique, not WE's real
+    /// procedural per-light cone/box mesh — see the report's scoping note).
+    fn build_volumetrics(
+        renderer: &GpuSceneRenderer,
+        cam: &crate::engine::camera3d::PerspectiveCamera,
+        lights: &[(crate::engine::lighting::Light, bool, Option<(f32, f32)>)],
+        shadow_slots: &[Option<usize>],
+        shadow_slot_data: &[(crate::engine::camera3d::Mat4, [f32; 4])],
+        shadow_atlas_view: &wgpu::TextureView,
+    ) -> Option<wgpu::BindGroup> {
+        use crate::engine::lighting::Light;
+
+        let (idx, origin, color_intensity, density, exponent) =
+            lights.iter().enumerate().find_map(|(i, (light, _, volumetrics))| {
+                let (density, exponent) = (*volumetrics)?;
+                let (origin, color, intensity) = match light {
+                    // Directional has no position to march a shaft from;
+                    // Tube isn't constructed by `Scene::lights()` yet (see
+                    // `LightType::Tube`'s doc comment) — neither reaches here.
+                    Light::Point { origin, color, intensity, .. }
+                    | Light::Spot { origin, color, intensity, .. } => (*origin, *color, *intensity),
+                    _ => return None,
+                };
+                let ci = [color[0] * intensity, color[1] * intensity, color[2] * intensity];
+                Some((i, origin, ci, density, exponent))
+            })?;
+
+        // Reuses this light's shadow-atlas tile when it also casts a shadow
+        // (`castshadow: true`) — the shaft respects real occlusion, not just
+        // WE's own documented "unoccluded" fallback for when shadows aren't
+        // built. `has_shadow = 0.0` (no matching slot) makes
+        // `fs_volumetrics` skip the occlusion test entirely, matching that
+        // same documented fallback for a volumetric light that isn't also a
+        // shadow caster.
+        let (shadow_view_proj, shadow_uv_rect, has_shadow) = shadow_slots
+            .get(idx)
+            .copied()
+            .flatten()
+            .and_then(|slot| shadow_slot_data.get(slot))
+            .map(|(vp, rect)| (*vp, *rect, 1.0f32))
+            .unwrap_or((crate::engine::camera3d::identity(), [0.0; 4], 0.0));
+
+        let inv_view_proj = crate::engine::camera3d::mat4_inverse(&cam.view_proj_raw());
+        let eye = cam.eye();
+        // Fixed, honest default range for the ray march — no real content
+        // to derive a better heuristic from (see the fn doc comment).
+        // Comparable to `radius`'s own 256px-ish default scene scale.
+        const MAX_RANGE: f32 = 40.0;
+
+        let mut bytes = Vec::with_capacity(4 * 16 * 4 + 16 * 5);
+        let mut push_mat = |m: &crate::engine::camera3d::Mat4| {
+            for col in m.iter() {
+                for f in col {
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+        };
+        push_mat(&inv_view_proj);
+        push_mat(&shadow_view_proj);
+        let mut push4 = |v: [f32; 4]| {
+            for f in v {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+        };
+        push4([eye[0], eye[1], eye[2], 0.0]);
+        push4([origin[0], origin[1], origin[2], density]);
+        push4([color_intensity[0], color_intensity[1], color_intensity[2], exponent]);
+        push4(shadow_uv_rect);
+        push4([has_shadow, MAX_RANGE, 0.0, 0.0]);
+
+        let ubo = renderer.make_uniform_buffer(&bytes, bytes.len() as u64);
+        Some(renderer.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("volumetrics_bg"),
+            layout: &renderer.volumetrics_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ubo.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(shadow_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&renderer.shadow_comparison_sampler),
+                },
+            ],
+        }))
+    }
+
     /// Render the shadow atlas once at scene setup (shadow-casting lights
     /// are treated as static, same precedent as mesh MVPs — see
     /// `build_mesh3d`'s own doc comment). For every `light` object with
@@ -2670,7 +2876,7 @@ impl GpuSceneInstance {
     fn build_shadow_atlas(
         renderer: &GpuSceneRenderer,
         mesh3d_layers: &[crate::engine::render::Mesh3dLayer],
-        lights: &[(crate::engine::lighting::Light, bool)],
+        lights: &[(crate::engine::lighting::Light, bool, Option<(f32, f32)>)],
     ) -> (
         wgpu::Texture,
         Vec<Option<usize>>,
@@ -2690,7 +2896,7 @@ impl GpuSceneInstance {
         let shadow_casters: Vec<(usize, crate::engine::camera3d::Mat4)> = lights
             .iter()
             .enumerate()
-            .filter_map(|(i, (light, casts_shadow))| {
+            .filter_map(|(i, (light, casts_shadow, _volumetrics))| {
                 if !*casts_shadow {
                     return None;
                 }
@@ -3480,7 +3686,13 @@ impl GpuSceneInstance {
             }
         }
 
-        // 4. Scene bloom chain.
+        // 4. Volumetric light shafts (before bloom, so a bright shaft can
+        // itself contribute to the bloom pass — matching how particles are
+        // ordered before bloom for the same reason, see their own doc
+        // comment on `particle_systems`).
+        self.record_volumetrics(&mut encoder, &target_view);
+
+        // 5. Scene bloom chain.
         if self.bloom.enabled {
             self.record_bloom(&mut encoder, &target_view);
         }
@@ -4164,6 +4376,113 @@ impl GpuSceneInstance {
     /// utility shaders the linux port wires up as a hidden fullscreen effect —
     /// see CScene.cpp/WallpaperApplication.cpp). All texel offsets use the
     /// *scene's* texel size, matching WE's always-scene-relative `g_TexelSize`.
+    /// Volumetric-light-shaft ray march, generated at quarter res, blurred
+    /// (reusing the bloom chain's own separable-blur pipeline unmodified —
+    /// it's already a generic single-source-texture operation), then
+    /// additively combined onto the scene (reusing bloom's combine pipeline
+    /// too, for the same reason). See `build_volumetrics`/`fs_volumetrics`
+    /// and the Ghidra report's `_rt_volumetrics*` follow-up. A no-op unless
+    /// `self.volumetrics_bind_group` is `Some` (a `castvolumetrics` light
+    /// exists) — checked by the one caller, `render()`.
+    fn record_volumetrics(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
+        let Some(vol_bg) = &self.volumetrics_bind_group else {
+            return;
+        };
+        let buf = self.fbo_pool.get("_rt_VolumetricsBuffer").unwrap();
+        let tmp = self.fbo_pool.get("_rt_VolumetricsBlurTmp").unwrap();
+        let buf_texel = [1.0 / buf.width as f32, 1.0 / buf.height as f32];
+
+        // Snapshot the pre-volumetrics scene: the combine pass both reads
+        // and writes `self.target`, which a GPU can't do within one pass —
+        // same constraint `record_bloom` works around the same way.
+        encoder.copy_texture_to_texture(
+            self.target.as_image_copy(),
+            self.scene_copy.as_image_copy(),
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let scene_copy_view = self.scene_copy.create_view(&Default::default());
+
+        // Pass 1: the ray march itself — its own dedicated bind group
+        // (shadow atlas + comparison sampler + this light's params), not
+        // the generic base_bgl/effect_bgl shape the blur/combine passes
+        // below use.
+        self.renderer.run_pass(
+            encoder,
+            &self.renderer.volumetrics_pipeline,
+            vol_bg,
+            None,
+            &buf.view(),
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            "volumetrics_march",
+            3,
+            &[],
+        );
+
+        let run = |encoder: &mut wgpu::CommandEncoder,
+                   pipeline: &wgpu::RenderPipeline,
+                   src: &wgpu::TextureView,
+                   extra: &[Option<wgpu::TextureView>],
+                   dst: &wgpu::TextureView,
+                   params: &[u8]| {
+            let default_sampler = self.renderer.sampler_for(false, false);
+            let passthrough = self
+                .renderer
+                .make_uniform_buffer(&passthrough_composite_params(), 64);
+            let base_bg =
+                self.renderer
+                    .make_base_bind_group(src, default_sampler, &passthrough, extra);
+            let param_buf = self.renderer.make_uniform_buffer(params, 16);
+            let effect_bg = self.renderer.make_effect_bind_group(&param_buf);
+            self.renderer.run_pass(
+                encoder,
+                pipeline,
+                &base_bg,
+                Some(&effect_bg),
+                dst,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                "volumetrics_blur_combine",
+                3,
+                &[],
+            );
+        };
+        let f32s =
+            |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|f| f.to_le_bytes()).collect() };
+
+        // Passes 2-3: separable blur, in place within the same quarter-res
+        // buffer (via the tmp buffer) — softens the fixed-step-count ray
+        // march's banding and gives the shaft a less hard-edged look.
+        run(
+            encoder,
+            &self.renderer.bloom_blur_pipeline,
+            &buf.view(),
+            &[],
+            &tmp.view(),
+            &f32s(&[buf_texel[0] * 2.0, 0.0, 0.0, 0.0]),
+        );
+        run(
+            encoder,
+            &self.renderer.bloom_blur_pipeline,
+            &tmp.view(),
+            &[],
+            &buf.view(),
+            &f32s(&[0.0, buf_texel[1] * 2.0, 0.0, 0.0]),
+        );
+        // Pass 4: additive combine onto the scene (combine.frag: plain
+        // `scene + src`, the same math bloom's own combine pass uses).
+        run(
+            encoder,
+            &self.renderer.bloom_combine_pipeline,
+            &buf.view(),
+            &[Some(scene_copy_view)],
+            target_view,
+            &f32s(&[0.0, 0.0, 0.0, 0.0]),
+        );
+    }
+
     fn record_bloom(&self, encoder: &mut wgpu::CommandEncoder, target_view: &wgpu::TextureView) {
         let q = self.fbo_pool.get("_rt_4FrameBuffer").unwrap();
         let e = self.fbo_pool.get("_rt_8FrameBuffer").unwrap();
