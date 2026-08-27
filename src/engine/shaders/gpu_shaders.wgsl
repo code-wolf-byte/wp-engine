@@ -1064,12 +1064,29 @@ fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
         let shadow_w = mesh3d_lighting.light_pos[i].w;
         var l: vec3<f32>;
         var atten: f32;
-        if (shadow_w < -0.5) {
+        // Sentinels ordered most- to least-negative; real shadow_w values
+        // (0, or a positive shadow-atlas slot+1) never go negative, so none
+        // of these can collide with a real point/spot shadow slot.
+        if (shadow_w < -1.5) {
+            // Tube (line-segment) light: `light_pos[i].xyz`/`light_spot[i].xyz`
+            // carry endpoints A/B (view space) — light from the closest
+            // point on segment AB to this surface point, mirroring
+            // `engine::lighting::pbr_tube`'s CPU-side math exactly.
+            let origin_a = mesh3d_lighting.light_pos[i].xyz;
+            let origin_b = mesh3d_lighting.light_spot[i].xyz;
+            let ab = origin_b - origin_a;
+            let ap = in.view_pos - origin_a;
+            let ab2 = max(dot(ab, ab), 0.0001);
+            let t = clamp(dot(ap, ab) / ab2, 0.0, 1.0);
+            let closest = origin_a + ab * t;
+            let to_light = closest - in.view_pos;
+            let dist2 = max(dot(to_light, to_light), 0.0001);
+            l = to_light * inverseSqrt(dist2);
+            atten = lc.a / dist2;
+        } else if (shadow_w < -0.5) {
             // Directional (infinite) light: `light_pos[i].xyz` carries a
             // pre-normalized view-space direction from the surface toward
-            // the light, not a position — no distance falloff. Flagged by
-            // this sentinel since shadow_w is otherwise always >= 0 (see
-            // `gpu_renderer.rs::mesh3d_lighting_bytes`).
+            // the light, not a position — no distance falloff.
             l = mesh3d_lighting.light_pos[i].xyz;
             atten = lc.a;
         } else {
@@ -1078,12 +1095,17 @@ fn fs_mesh3d(in: Mesh3dVsOut) -> @location(0) vec4<f32> {
             l = to_light * inverseSqrt(dist2);
             atten = lc.a / dist2;
         }
-        // Both gracefully no-op for a directional light: `spot_slot` stays
-        // zero-length (mesh3d_spot_factor's own "not a spot" check), and
-        // `shadow_w`'s -1.0 sentinel is already < 0.5 (mesh3d_shadow_factor's
-        // own "no shadow" check) — directional lights aren't shadow-mapped
-        // yet, same as spot.
-        let spot_factor = mesh3d_spot_factor(mesh3d_lighting.light_spot[i], l);
+        // `shadow_w`'s negative sentinels are already < 0.5
+        // (mesh3d_shadow_factor's own "no shadow" check) — directional and
+        // tube lights aren't shadow-mapped yet, same as spot. A tube's
+        // `light_spot.xyz` holds endpoint B (not a direction, and not
+        // reliably zero-length), so it must skip `mesh3d_spot_factor`
+        // explicitly rather than relying on that function's own
+        // "zero-length = not a spot" check the way Point/Directional do.
+        var spot_factor = 1.0;
+        if (shadow_w >= -1.5) {
+            spot_factor = mesh3d_spot_factor(mesh3d_lighting.light_spot[i], l);
+        }
         let shadow_factor = mesh3d_shadow_factor(shadow_w, in.world_pos);
         lit = lit + mesh3d_brdf(n, l, v, albedo.rgb, lc.rgb * atten * spot_factor) * shadow_factor;
     }

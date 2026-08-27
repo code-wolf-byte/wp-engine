@@ -117,9 +117,15 @@ impl Scene {
                         radius,
                         outer_cone_degrees: outer,
                     }
+                } else if matches!(o.light_type(), LightType::Tube) {
+                    let (origin_a, origin_b) = o.tube_endpoints();
+                    crate::engine::lighting::Light::Tube {
+                        origin_a,
+                        origin_b,
+                        color,
+                        intensity,
+                    }
                 } else {
-                    // `Tube` also lands here — no `origin_b` field is
-                    // parsed yet, see `LightType::Tube`'s doc comment.
                     crate::engine::lighting::Light::Point {
                         origin,
                         color,
@@ -553,6 +559,17 @@ pub struct SceneObject {
     pub innercone: Option<serde_json::Value>,
     #[serde(default)]
     pub outercone: Option<serde_json::Value>,
+    /// A tube light's second endpoint, relative to `origin` — see
+    /// `SceneObject::tube_endpoints`. Confirmed a vec3 field from the Ghidra
+    /// property dump (same type code and setter function as `color`, a
+    /// known vec3), registered by the same Light property parser as
+    /// `light`/`innercone`/etc; whether it's relative-to-origin or an
+    /// absolute world position wasn't recoverable (no real content with a
+    /// tube light was available locally to check against — see the report's
+    /// `_rt_volumetrics*`/tube-lights follow-up) — relative was picked to
+    /// match how every other per-object offset in this schema works.
+    #[serde(default)]
+    pub controlpoint: Option<serde_json::Value>,
     // Puppet animation layers (blended each frame).
     #[serde(default)]
     pub animationlayers: Option<serde_json::Value>,
@@ -628,10 +645,10 @@ impl SceneObject {
     }
 
     /// `(density, exponent)` for a volumetric light shaft, when
-    /// `castvolumetrics` is truthy — `None` otherwise. Both properties are
-    /// already parsed (see their field docs, "Parsed; no lighting subsystem
-    /// yet" — now there is one, `engine::volumetrics`); defaults picked to
-    /// give a visible-but-not-overwhelming shaft when a scene sets
+    /// `castvolumetrics` is truthy — `None` otherwise. See
+    /// `GpuSceneInstance::build_volumetrics`/`record_volumetrics` in
+    /// gpu_renderer.rs for the consumer; defaults picked to give a
+    /// visible-but-not-overwhelming shaft when a scene sets
     /// `castvolumetrics` without also tuning `density`/`volumetricsexponent`
     /// — unverified against real content, no downloaded Workshop light
     /// object with `castvolumetrics` set was available locally (see the
@@ -659,16 +676,40 @@ impl SceneObject {
             .max(0.01);
         Some((density, exponent))
     }
+
+    /// World-space `(origin_a, origin_b)` for a tube light — `origin_a` is
+    /// the object's own `origin`, `origin_b` is `origin + controlpoint`
+    /// (see `controlpoint`'s field doc for the relative-vs-absolute
+    /// caveat). Always returns a pair (falls back to `controlpoint`
+    /// defaulting to zero, degenerating to a zero-length tube = a point
+    /// light in all but name) rather than `None`, since every light object
+    /// already has an `origin` regardless of type.
+    pub fn tube_endpoints(&self) -> ([f32; 3], [f32; 3]) {
+        let origin = self.parsed_origin();
+        let origin_a = [origin[0] as f32, origin[1] as f32, origin[2] as f32];
+        let offset = self
+            .controlpoint
+            .as_ref()
+            .and_then(parse_value_vec3)
+            .unwrap_or([0.0; 3]);
+        let origin_b = [
+            origin_a[0] + offset[0] as f32,
+            origin_a[1] + offset[1] as f32,
+            origin_a[2] + offset[2] as f32,
+        ];
+        (origin_a, origin_b)
+    }
 }
 
 /// The light-type discriminant recovered from `SceneObject::light_type`.
-/// `Tube` has no wp-engine construction yet — no `origin_b`/second-endpoint
-/// field is parsed (the property parser also registers a `controlpoint`
-/// field alongside the light-type table, which is the likely candidate,
-/// unverified since no real content to test against was found — see the
-/// Ghidra report's directional-light-type-discriminant follow-up) — so
-/// `Scene::lights()` treats a `Tube`-typed object as a `Point` for now,
-/// same honest-fallback spirit as the field's own real-engine default.
+/// `Tube` constructs `lighting::Light::Tube` via `SceneObject::tube_endpoints`
+/// — see its doc comment for the relative-endpoint caveat (the one part of
+/// this that's a guess rather than directly recovered; everything else
+/// about tube-light *construction* follows straightforwardly once the type
+/// discriminant and the endpoint field are both known). Not shadow-mapped
+/// (matches Point/Spot's own staged rollout — shadows for spot lights only
+/// shipped after point lights had already been working for a while) — no
+/// tube-light case exists in `engine::shadow` yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightType {
     Point,
@@ -1195,6 +1236,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scene.lights()[0].2, None);
+    }
+
+    // `light: "ltube"` must resolve to Tube, with origin_b = origin +
+    // controlpoint (the relative-offset interpretation — see
+    // `SceneObject::tube_endpoints`'s doc comment for the caveat).
+    #[test]
+    fn light_string_ltube_resolves_to_tube_with_relative_controlpoint() {
+        let scene = Scene::from_json(
+            r#"{"objects": [
+                {"id": 1, "light": "ltube", "origin": "1 2 3",
+                 "controlpoint": "0 0 4", "intensity": 0.7, "color": "1 1 1"}
+            ]}"#,
+        )
+        .unwrap();
+        let lights = scene.lights();
+        assert_eq!(lights.len(), 1);
+        match &lights[0].0 {
+            crate::engine::lighting::Light::Tube { origin_a, origin_b, intensity, .. } => {
+                assert_eq!(*origin_a, [1.0, 2.0, 3.0]);
+                assert_eq!(*origin_b, [1.0, 2.0, 7.0]);
+                assert!((*intensity - 0.7).abs() < 1e-5);
+            }
+            other => panic!("expected Tube, got {other:?}"),
+        }
+    }
+
+    // No `controlpoint` at all must degenerate to a zero-length tube
+    // (origin_a == origin_b) rather than panicking or defaulting oddly.
+    #[test]
+    fn tube_endpoints_default_to_a_zero_length_segment() {
+        let scene = Scene::from_json(
+            r#"{"objects": [{"id": 1, "light": "ltube", "origin": "5 0 0"}]}"#,
+        )
+        .unwrap();
+        match &scene.lights()[0].0 {
+            crate::engine::lighting::Light::Tube { origin_a, origin_b, .. } => {
+                assert_eq!(origin_a, origin_b);
+            }
+            other => panic!("expected Tube, got {other:?}"),
+        }
     }
 
     // A visible text layer whose parent group is hidden must NOT draw — the WE

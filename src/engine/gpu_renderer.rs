@@ -2018,20 +2018,20 @@ fn mesh3d_lighting_bytes(
         }
     };
 
-    // Gates on "at least one light this loop can actually render" rather
-    // than "at least one light object exists" — `Scene::lights()` can
-    // produce light variants this loop doesn't shade (only Tube today; see
-    // `mesh3d_brdf`'s callers below for what Point/Spot get). A scene with
-    // only unrenderable lights must still fall through to the plain unlit
-    // look, not engage the lit branch with zero actual contributions (which
-    // would multiply by `ambient` alone — usually black, per the corpus's
-    // near-universal unset `ambientcolor`).
+    // Gates on "at least one light this loop can actually render" — every
+    // `Scene::lights()` variant is renderable now (Point, Spot, Directional,
+    // Tube), so in practice this only matters for an empty `lights` list. A
+    // scene with no renderable lights must still fall through to the plain
+    // unlit look, not engage the lit branch with zero actual contributions
+    // (which would multiply by `ambient` alone — usually black, per the
+    // corpus's near-universal unset `ambientcolor`).
     let has_renderable_light = lights.iter().any(|(l, ..)| {
         matches!(
             l,
             crate::engine::lighting::Light::Point { .. }
                 | crate::engine::lighting::Light::Spot { .. }
                 | crate::engine::lighting::Light::Directional { .. }
+                | crate::engine::lighting::Light::Tube { .. }
         )
     });
     push4([if has_renderable_light { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
@@ -2113,10 +2113,28 @@ fn mesh3d_lighting_bytes(
                 // spot_slot stays [0,0,0,0] — mesh3d_spot_factor's own
                 // "not a spot" check already no-ops for a directional light.
             }
-            // Tube: `Scene::lights()` never produces this today (see
-            // scene.rs's `LightType::Tube` doc comment) — left unrenderable
-            // rather than guessed.
-            _ => {}
+            crate::engine::lighting::Light::Tube {
+                origin_a,
+                origin_b,
+                color,
+                intensity,
+            } => {
+                // Line-segment light: `light_pos[i].xyz` carries endpoint A
+                // (view space), `light_spot[i].xyz` carries endpoint B
+                // (view space, *not* a direction) — flagged via `w = -3.0`,
+                // a sentinel distinct from directional's `-1.0` (both are
+                // already `< 0.5`, so `mesh3d_shadow_factor` already treats
+                // either as "unshadowed" with no extra branching needed
+                // there; `mesh3d_spot_factor` does need an explicit skip,
+                // since a non-zero-length `light_spot.xyz` would otherwise
+                // be misread as a spot direction — see `fs_mesh3d`'s light
+                // loop in gpu_shaders.wgsl).
+                let va = cam.to_view_space(*origin_a);
+                let vb = cam.to_view_space(*origin_b);
+                *pos_slot = [va[0], va[1], va[2], -3.0];
+                *color_slot = [color[0], color[1], color[2], *intensity];
+                *spot_slot = [vb[0], vb[1], vb[2], 0.0];
+            }
         }
     }
     for p in positions {
@@ -5836,6 +5854,46 @@ mod tests {
         let len2 = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
         assert!((len2 - 1.0).abs() < 1e-4, "direction must be unit-length: {dir:?}");
         assert_eq!(read_f32(3), -1.0, "w must carry the directional sentinel");
+    }
+
+    /// A tube light must flag itself via `light_pos[0].w == -3.0` (the
+    /// sentinel `fs_mesh3d`'s light loop branches on), with endpoint A in
+    /// `light_pos[0].xyz` and endpoint B in `light_spot[0].xyz` — not a
+    /// direction, so its magnitude should reflect the real endpoint spacing,
+    /// not be unit-length like a spot's.
+    #[test]
+    fn mesh3d_lighting_bytes_encodes_tube_sentinel_and_endpoints() {
+        let cam_scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"}, "general": {"orthogonalprojection": null}}"#,
+        )
+        .unwrap();
+        let cam = crate::engine::camera3d::PerspectiveCamera::from_scene(&cam_scene, 1.0).unwrap();
+
+        let scene: crate::engine::scene::Scene = serde_json::from_str(
+            r#"{"camera": {"eye": "0 0 10", "center": "0 0 0"},
+                "general": {"orthogonalprojection": null},
+                "objects": [
+                    {"id": 1, "light": "ltube", "origin": "0 0 0",
+                     "controlpoint": "0 0 -4", "intensity": 0.9, "color": "1 1 1"}
+                ]}"#,
+        )
+        .unwrap();
+        let bytes = mesh3d_lighting_bytes(&scene, &cam, &[], &[]);
+
+        let flags_x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(flags_x, 1.0, "a tube-only scene must still engage the lit branch");
+
+        let pos0_offset = 16 * 5;
+        let spot0_offset = 16 * 5 + 16 * MESH3D_MAX_LIGHTS * 2;
+        let read_f32 = |offset: usize, i: usize| {
+            f32::from_le_bytes(bytes[offset + i * 4..offset + i * 4 + 4].try_into().unwrap())
+        };
+        assert_eq!(read_f32(pos0_offset, 3), -3.0, "w must carry the tube sentinel");
+        let endpoint_b = [read_f32(spot0_offset, 0), read_f32(spot0_offset, 1), read_f32(spot0_offset, 2)];
+        let len2 = endpoint_b[0] * endpoint_b[0]
+            + endpoint_b[1] * endpoint_b[1]
+            + endpoint_b[2] * endpoint_b[2];
+        assert!(len2 > 1.0, "endpoint B should be a real view-space position, not a unit vector: {endpoint_b:?}");
     }
 
     /// WGSL rounds every uniform-address-space struct up to a 16-byte
