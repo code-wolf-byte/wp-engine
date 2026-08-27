@@ -693,6 +693,11 @@ impl SeatHandler for WallpaperState {
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
 }
 
+/// Linux evdev button codes (`linux/input-event-codes.h`) — what
+/// `PointerEventKind::Press`/`Release`'s raw `button` field actually carries.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+
 impl PointerHandler for WallpaperState {
     fn pointer_frame(
         &mut self,
@@ -704,13 +709,17 @@ impl PointerHandler for WallpaperState {
         for event in events {
             // Leave keeps the last position rather than snapping back to
             // centre — the cursor moving onto a window shouldn't yank the
-            // parallax. Presses/axis aren't wired to anything yet.
-            if !matches!(
-                event.kind,
-                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
-            ) {
-                continue;
-            }
+            // parallax. Axis (scroll) isn't wired to anything — matches the
+            // C++ reference's own `CWeb::updateMouse`, which forwards move
+            // and left/right click only (its own `// TODO: ANY OTHER MOUSE
+            // EVENTS TO SEND?` confirms that's the real engine's actual
+            // scope, not an approximation here).
+            let (button, pressed) = match event.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => (None, false),
+                PointerEventKind::Press { button, .. } => (Some(button), true),
+                PointerEventKind::Release { button, .. } => (Some(button), false),
+                _ => continue,
+            };
             let Some(surface) = self
                 .surfaces
                 .iter()
@@ -724,14 +733,47 @@ impl PointerHandler for WallpaperState {
 
             let norm = pointer_norm(event.position, surface.width, surface.height);
 
-            // ponytail: only tracks while the cursor is over our own layer
-            // surface. The reference additionally queries Hyprland's IPC socket
-            // for a global cursor when another window has it; add that (or the
-            // equivalent per-compositor call) if parallax-under-windows matters.
-            if let ContentRenderer::Scene(scene) = &mut self.renderer {
-                scene.set_mouse(norm);
+            match &mut self.renderer {
+                // ponytail: only tracks while the cursor is over our own
+                // layer surface. The reference additionally queries
+                // Hyprland's IPC socket for a global cursor when another
+                // window has it; add that (or the equivalent per-compositor
+                // call) if parallax-under-windows matters.
+                ContentRenderer::Scene(scene) => scene.set_mouse(norm),
+                ContentRenderer::Frames(fs) => {
+                    let Some(tx) = fs.web_input() else { continue };
+                    let event = match button {
+                        None => crate::render::web::WebInputEvent::MouseMove {
+                            x_norm: norm[0],
+                            y_norm: norm[1],
+                        },
+                        Some(code) => {
+                            let Some(button) = web_mouse_button(code) else {
+                                continue;
+                            };
+                            crate::render::web::WebInputEvent::MouseButton {
+                                x_norm: norm[0],
+                                y_norm: norm[1],
+                                button,
+                                pressed,
+                            }
+                        }
+                    };
+                    let _ = tx.try_send(event);
+                }
             }
         }
+    }
+}
+
+/// Linux evdev button code → the two buttons `WebInputEvent` (and the C++
+/// reference) actually forward — `None` for anything else (middle click,
+/// side buttons), silently dropped rather than guessed at.
+fn web_mouse_button(code: u32) -> Option<crate::render::web::WebMouseButton> {
+    match code {
+        BTN_LEFT => Some(crate::render::web::WebMouseButton::Left),
+        BTN_RIGHT => Some(crate::render::web::WebMouseButton::Right),
+        _ => None,
     }
 }
 
@@ -769,7 +811,7 @@ delegate_registry!(WallpaperState);
 
 #[cfg(test)]
 mod tests {
-    use super::pointer_norm;
+    use super::{pointer_norm, web_mouse_button, BTN_LEFT, BTN_RIGHT};
 
     #[test]
     fn pointer_norm_is_top_origin_and_clamped() {
@@ -785,5 +827,19 @@ mod tests {
 
         // Compositors can report positions outside the surface during drags.
         assert_eq!(pointer_norm((-40.0, 5000.0), 1920, 1080), [0.0, 1.0]);
+    }
+
+    /// Only left/right forward to CEF — matches the C++ reference's own
+    /// `CWeb::updateMouse` scope exactly (see `WebInputEvent`'s doc comment).
+    /// Middle click and anything else (side buttons) must map to `None`
+    /// rather than a guessed-at mapping.
+    #[test]
+    fn web_mouse_button_maps_left_and_right_only() {
+        use crate::render::web::WebMouseButton;
+        assert_eq!(web_mouse_button(BTN_LEFT), Some(WebMouseButton::Left));
+        assert_eq!(web_mouse_button(BTN_RIGHT), Some(WebMouseButton::Right));
+        const BTN_MIDDLE: u32 = 0x112;
+        assert_eq!(web_mouse_button(BTN_MIDDLE), None);
+        assert_eq!(web_mouse_button(0), None);
     }
 }

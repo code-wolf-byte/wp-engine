@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use image::RgbaImage;
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
@@ -19,6 +19,11 @@ pub enum FrameSource {
         current: Arc<RgbaImage>,
         /// Receive end of the bounded channel from the decoder thread.
         rx: Receiver<Arc<RgbaImage>>,
+        /// `Some` only for a web wallpaper — lets the platform layer forward
+        /// mouse input into the embedded page (see `render::web::WebInputEvent`).
+        /// `None` for real video and CPU-scene-fallback, which share this
+        /// same variant but have no page to receive input.
+        web_input: Option<SyncSender<super::web::WebInputEvent>>,
     },
 }
 
@@ -68,17 +73,18 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("scene renderer exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx })
+                Ok(FrameSource::Video { current: first, rx, web_input: None })
             }
             // Web wallpapers reuse the `Video` variant rather than adding one:
             // it already means "a stream of frames plus the latest", which is
             // exactly what CEF's off-screen painting produces. Scene fallback
             // rendering shares it for the same reason.
             WallpaperContent::Web { html } => {
-                let (first, rx) = super::web::start_web_stream(&html)?;
+                let (first, rx, input_tx) = super::web::start_web_stream(&html)?;
                 Ok(FrameSource::Video {
                     current: Arc::new(first),
                     rx,
+                    web_input: Some(input_tx),
                 })
             }
             WallpaperContent::Video { path } => {
@@ -96,8 +102,18 @@ impl FrameSource {
                     .recv()
                     .map_err(|_| anyhow!("video decoder exited before producing any frames"))?;
 
-                Ok(FrameSource::Video { current: first, rx })
+                Ok(FrameSource::Video { current: first, rx, web_input: None })
             }
+        }
+    }
+
+    /// The channel to push mouse input into, for a web wallpaper — `None`
+    /// for every other content type (including real video and CPU-scene
+    /// fallback, which share `Video`'s shape but have no page to receive it).
+    pub fn web_input(&self) -> Option<&SyncSender<super::web::WebInputEvent>> {
+        match self {
+            FrameSource::Video { web_input, .. } => web_input.as_ref(),
+            FrameSource::Static(_) => None,
         }
     }
 
@@ -120,7 +136,7 @@ impl FrameSource {
     pub fn try_advance(&mut self) -> bool {
         match self {
             FrameSource::Static(_) => false,
-            FrameSource::Video { current, rx } => {
+            FrameSource::Video { current, rx, .. } => {
                 if let Ok(frame) = rx.try_recv() {
                     *current = frame;
                     true

@@ -23,7 +23,7 @@ use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, Gcontext, ImageFormat,
-    Pixmap, PropMode, Window,
+    KeyButMask, Pixmap, PropMode, Window,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -286,6 +286,14 @@ fn wallpaper_loop(
     let frame_budget = Duration::from_secs_f32(1.0 / TARGET_FPS);
     let animated = renderer.is_animated();
 
+    // Edge-detected against each frame's polled button mask below — X11 has
+    // no press/release *event* path here (this backend polls, it doesn't
+    // subscribe), so a state change is the only way to tell "just clicked"
+    // from "held from last frame" apart, matching the C++ reference's own
+    // `CWeb::updateMouse` (`if leftClick != this->m_leftClick`).
+    let mut left_down = false;
+    let mut right_down = false;
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -344,13 +352,55 @@ fn wallpaper_loop(
         // Global cursor position drives parallax. X11 hands us this regardless
         // of which window has focus, so unlike the Wayland backend there is no
         // "cursor left our surface" blind spot.
-        if let ContentRenderer::Scene(scene) = &mut renderer {
-            if let Ok(pointer) = conn.query_pointer(root)?.reply() {
-                let norm = [
-                    (pointer.root_x as f32 / root_w.max(1) as f32).clamp(0.0, 1.0),
-                    (pointer.root_y as f32 / root_h.max(1) as f32).clamp(0.0, 1.0),
-                ];
-                scene.set_mouse(norm);
+        match &mut renderer {
+            ContentRenderer::Scene(scene) => {
+                if let Ok(pointer) = conn.query_pointer(root)?.reply() {
+                    let norm = [
+                        (pointer.root_x as f32 / root_w.max(1) as f32).clamp(0.0, 1.0),
+                        (pointer.root_y as f32 / root_h.max(1) as f32).clamp(0.0, 1.0),
+                    ];
+                    scene.set_mouse(norm);
+                }
+            }
+            ContentRenderer::Frames(fs) => {
+                // Polled, not event-driven (see `left_down`/`right_down`'s
+                // own doc comment) — mirrors the C++ reference's own
+                // per-frame `CWeb::updateMouse` poll, not just Wayland's
+                // event model adapted here.
+                if let Some(tx) = fs.web_input() {
+                    if let Ok(pointer) = conn.query_pointer(root)?.reply() {
+                        let norm = [
+                            (pointer.root_x as f32 / root_w.max(1) as f32).clamp(0.0, 1.0),
+                            (pointer.root_y as f32 / root_h.max(1) as f32).clamp(0.0, 1.0),
+                        ];
+                        let _ = tx.try_send(crate::render::web::WebInputEvent::MouseMove {
+                            x_norm: norm[0],
+                            y_norm: norm[1],
+                        });
+
+                        let mask: u16 = pointer.mask.into();
+                        let left_now = mask & u16::from(KeyButMask::BUTTON1) != 0;
+                        let right_now = mask & u16::from(KeyButMask::BUTTON3) != 0;
+                        if left_now != left_down {
+                            left_down = left_now;
+                            let _ = tx.try_send(crate::render::web::WebInputEvent::MouseButton {
+                                x_norm: norm[0],
+                                y_norm: norm[1],
+                                button: crate::render::web::WebMouseButton::Left,
+                                pressed: left_now,
+                            });
+                        }
+                        if right_now != right_down {
+                            right_down = right_now;
+                            let _ = tx.try_send(crate::render::web::WebInputEvent::MouseButton {
+                                x_norm: norm[0],
+                                y_norm: norm[1],
+                                button: crate::render::web::WebMouseButton::Right,
+                                pressed: right_now,
+                            });
+                        }
+                    }
+                }
             }
         }
 

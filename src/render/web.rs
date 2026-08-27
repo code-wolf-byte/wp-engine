@@ -15,7 +15,7 @@
 use anyhow::Result;
 use image::RgbaImage;
 use std::path::Path;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
 /// Off-screen render size for web wallpapers.
@@ -28,18 +28,41 @@ use std::sync::Arc;
 pub const WEB_WIDTH: u32 = 1920;
 pub const WEB_HEIGHT: u32 = 1080;
 
-/// Start rendering `html` and return its first frame plus a stream of the rest.
+/// Start rendering `html` and return its first frame, a stream of the rest,
+/// and a sender the caller can push mouse input into (see [`WebInputEvent`]).
 ///
 /// Mirrors `render::ffmpeg::video_decode_loop`'s contract: the receiver yields
 /// frames until the sender is dropped, and blocking for the first frame means
 /// callers never present a blank surface.
-pub fn start_web_stream(html: &Path) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>)> {
+pub fn start_web_stream(
+    html: &Path,
+) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>, SyncSender<WebInputEvent>)> {
     imp::start_web_stream(html)
 }
 
 /// `true` when this binary can actually render web wallpapers.
 pub fn is_supported() -> bool {
     cfg!(feature = "web")
+}
+
+/// A mouse input event to forward into the embedded page — mirrors exactly
+/// what the C++ reference itself forwards (`CWeb::updateMouse`): move plus
+/// left/right click. Nothing else (scroll, middle click, keyboard) is
+/// forwarded there either — its own `// TODO: ANY OTHER MOUSE EVENTS TO
+/// SEND?` confirms that's the real engine's actual current scope, not an
+/// approximation. Coordinates are normalized `[0,1]²` (top-left origin,
+/// matching every other consumer of the platform layer's own pointer
+/// tracking) so callers never need to know CEF's fixed pixel canvas size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WebInputEvent {
+    MouseMove { x_norm: f32, y_norm: f32 },
+    MouseButton { x_norm: f32, y_norm: f32, button: WebMouseButton, pressed: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebMouseButton {
+    Left,
+    Right,
 }
 
 /// Handle a CEF subprocess launch, if this process is one.
@@ -64,7 +87,9 @@ mod imp {
     use super::*;
     use anyhow::anyhow;
 
-    pub fn start_web_stream(html: &Path) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>)> {
+    pub fn start_web_stream(
+        html: &Path,
+    ) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>, SyncSender<WebInputEvent>)> {
         Err(anyhow!(
             "cannot render web wallpaper {}: this build has no web support.\n\
              Rebuild with `cargo build --features web` (downloads the CEF/Chromium \
@@ -106,6 +131,10 @@ mod imp {
         /// then do we open a capture device — a page that ignores audio has no
         /// business making us grab the desktop's output stream.
         wants_audio: bool,
+        /// Mouse events the platform layer pushes in — drained once per
+        /// message-loop tick and forwarded to CEF's `BrowserHost`. See
+        /// `WebInputEvent`.
+        input_rx: Receiver<WebInputEvent>,
     }
 
     /// The Wallpaper Engine browser API, as much of it as this corpus uses.
@@ -264,8 +293,10 @@ mod imp {
             return;
         }
 
-        // Browsers are kept alive here; dropping one closes it.
-        let mut open: Vec<Browser> = Vec::new();
+        // Browsers are kept alive here; dropping one closes it. Paired with
+        // its own input receiver since each `start_web_stream` call creates a
+        // fresh channel (see `OpenRequest::input_rx`).
+        let mut open: Vec<(Browser, Receiver<WebInputEvent>)> = Vec::new();
         let mut properties = String::new();
         let mut audio: Option<crate::engine::audio::AudioCapture> = None;
         let mut last_audio_push = Instant::now();
@@ -277,11 +308,13 @@ mod imp {
                     open.clear();
                     audio = None;
                     properties = req.properties.clone();
-                    match create_browser(&req) {
-                        Some(browser) => open.push(browser),
+                    let wants_audio = req.wants_audio;
+                    let browser = create_browser(&req);
+                    match browser {
+                        Some(browser) => open.push((browser, req.input_rx)),
                         None => tracing::error!(target: "web", "failed to create CEF browser"),
                     }
-                    if req.wants_audio {
+                    if wants_audio {
                         audio = crate::engine::audio::AudioCapture::start();
                         if audio.is_none() {
                             tracing::warn!(
@@ -296,11 +329,12 @@ mod imp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
 
-            // Properties are re-sent every tick rather than once: the page may
-            // not have assigned its listener yet, and the injected setter
-            // re-delivers on assignment anyway, so this is cheap insurance
-            // against a lost first delivery. `__wpProps` is idempotent.
-            if let Some(browser) = open.first() {
+            if let Some((browser, input_rx)) = open.first() {
+                // Properties are re-sent every tick rather than once: the page
+                // may not have assigned its listener yet, and the injected
+                // setter re-delivers on assignment anyway, so this is cheap
+                // insurance against a lost first delivery. `__wpProps` is
+                // idempotent.
                 if !properties.is_empty() {
                     eval_in_page(
                         browser,
@@ -316,6 +350,13 @@ mod imp {
                         eval_in_page(browser, &audio_push_script(&capture.spectrum()));
                     }
                 }
+
+                // Drain every pending event rather than just the latest: a
+                // dropped click is a real bug in a way a dropped mouse-move
+                // sample never is.
+                while let Ok(event) = input_rx.try_recv() {
+                    forward_input_event(browser, event);
+                }
             }
 
             // Chromium paints from inside this call — without it there are no
@@ -328,6 +369,40 @@ mod imp {
     fn eval_in_page(browser: &Browser, script: &str) {
         if let Some(frame) = browser.main_frame() {
             frame.execute_java_script(Some(&script.into()), None, 0);
+        }
+    }
+
+    /// Forward one mouse event to CEF — mirrors `CWeb::updateMouse` exactly
+    /// (`SendMouseMoveEvent`/`SendMouseClickEvent`, no other event types; see
+    /// `WebInputEvent`'s own doc comment). Normalized `[0,1]²` coordinates
+    /// convert to CEF's fixed `WEB_WIDTH`×`WEB_HEIGHT` pixel canvas here, so
+    /// callers only ever deal in the same normalized space every other
+    /// pointer consumer in this codebase already uses.
+    fn forward_input_event(browser: &Browser, event: WebInputEvent) {
+        let Some(host) = browser.host() else {
+            return;
+        };
+        let to_px = |x_norm: f32, y_norm: f32| MouseEvent {
+            x: (x_norm.clamp(0.0, 1.0) * WEB_WIDTH as f32) as i32,
+            y: (y_norm.clamp(0.0, 1.0) * WEB_HEIGHT as f32) as i32,
+            modifiers: 0,
+        };
+        match event {
+            WebInputEvent::MouseMove { x_norm, y_norm } => {
+                host.send_mouse_move_event(Some(&to_px(x_norm, y_norm)), 0);
+            }
+            WebInputEvent::MouseButton { x_norm, y_norm, button, pressed } => {
+                let type_ = match button {
+                    WebMouseButton::Left => MouseButtonType::LEFT,
+                    WebMouseButton::Right => MouseButtonType::RIGHT,
+                };
+                host.send_mouse_click_event(
+                    Some(&to_px(x_norm, y_norm)),
+                    type_,
+                    (!pressed) as i32,
+                    1,
+                );
+            }
         }
     }
 
@@ -529,7 +604,9 @@ mod imp {
         }
     }
 
-    pub fn start_web_stream(html: &Path) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>)> {
+    pub fn start_web_stream(
+        html: &Path,
+    ) -> Result<(RgbaImage, Receiver<Arc<RgbaImage>>, SyncSender<WebInputEvent>)> {
         let html = html
             .canonicalize()
             .with_context(|| format!("resolving web wallpaper path {}", html.display()))?;
@@ -537,12 +614,18 @@ mod imp {
 
         let dir = html.parent().unwrap_or(&html).to_path_buf();
         let (frames, rx) = sync_channel::<Arc<RgbaImage>>(2);
+        // Bounded, but generously so relative to `cef_main`'s ~4ms poll —
+        // this should never realistically fill. `try_send` on the platform
+        // side means a full channel drops rather than blocking the render
+        // loop, same trade `frames` itself already makes.
+        let (input_tx, input_rx) = sync_channel::<WebInputEvent>(64);
         cef_thread()
             .send(OpenRequest {
                 url,
                 frames,
                 properties: user_properties_json(&dir),
                 wants_audio: uses_audio_listener(&dir),
+                input_rx,
             })
             .map_err(|_| anyhow!("the CEF thread is not running"))?;
 
@@ -567,6 +650,7 @@ mod imp {
         Ok((
             Arc::try_unwrap(first).unwrap_or_else(|arc| (*arc).clone()),
             rx,
+            input_tx,
         ))
     }
 }
