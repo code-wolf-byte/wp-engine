@@ -131,6 +131,10 @@ mod imp {
         /// then do we open a capture device — a page that ignores audio has no
         /// business making us grab the desktop's output stream.
         wants_audio: bool,
+        /// Whether this wallpaper calls `wallpaperMediaIntegration.listen`.
+        /// Same reasoning as `wants_audio`: only then do we start the D-Bus
+        /// MPRIS watcher (`engine::media`).
+        wants_media: bool,
         /// Mouse events the platform layer pushes in — drained once per
         /// message-loop tick and forwarded to CEF's `BrowserHost`. See
         /// `WebInputEvent`.
@@ -148,6 +152,7 @@ mod imp {
 (function () {
   if (window.__wpEngineBridge) return;
   var pendingProps = null, propListener = null, audioCb = null;
+  var mediaListener = null, pendingMedia = null;
 
   Object.defineProperty(window, 'wallpaperPropertyListener', {
     configurable: true,
@@ -166,6 +171,41 @@ mod imp {
   // page keeps whatever default it started with.
   window.wallpaperRequestRandomFileForProperty = function (name, cb) {};
 
+  // Real shape confirmed from the vendored C++ reference's ScriptEngine.cpp
+  // (`notifyMediaUpdate`) — WE calls all four callbacks a listener defines,
+  // every time *any* of them changes, not just the one that actually did.
+  // `primaryColor`/`secondaryColor`/`tertiaryColor`/`highContrastColor` are
+  // fixed defaults there too (its own `// TODO: PROCESS THESE COLORS
+  // INSTEAD OF HARDCODING THEM`) — matched here rather than attempting real
+  // album-art color extraction the reference itself doesn't have either.
+  window.wallpaperMediaIntegration = {
+    listen: function (cb) {
+      mediaListener = cb;
+      if (pendingMedia) { deliverMedia(pendingMedia); }
+    }
+  };
+  function deliverMedia(m) {
+    if (!mediaListener) { return; }
+    var calls = [
+      ['mediaPropertiesChanged', { title: m.title, artist: m.artist, albumTitle: m.album }],
+      ['mediaPlaybackChanged', { state: m.playbackState }],
+      ['mediaTimelineChanged', { position: m.position, duration: m.duration }],
+      ['mediaThumbnailChanged', {
+        hasThumbnail: !!m.artUrl,
+        primaryColor: { x: 0.12, y: 0.12, z: 0.12 },
+        secondaryColor: { x: 0.0, y: 0.0, z: 0.0 },
+        tertiaryColor: { x: 0.25, y: 0.25, z: 0.25 },
+        highContrastColor: { x: 1.0, y: 1.0, z: 1.0 }
+      }]
+    ];
+    for (var i = 0; i < calls.length; i++) {
+      var fn = mediaListener[calls[i][0]];
+      if (typeof fn === 'function') {
+        try { fn(calls[i][1]); } catch (e) { console.error(e); }
+      }
+    }
+  }
+
   window.__wpProps = function (p) {
     pendingProps = p;
     if (propListener && typeof propListener.applyUserProperties === 'function') {
@@ -174,6 +214,10 @@ mod imp {
   };
   window.__wpAudio = function (a) {
     if (audioCb) { try { audioCb(a); } catch (e) { console.error(e); } }
+  };
+  window.__wpMedia = function (m) {
+    pendingMedia = m;
+    deliverMedia(m);
   };
   window.__wpEngineBridge = true;
 })();
@@ -300,6 +344,9 @@ mod imp {
         let mut properties = String::new();
         let mut audio: Option<crate::engine::audio::AudioCapture> = None;
         let mut last_audio_push = Instant::now();
+        // MPRIS is a freedesktop.org/Linux-only surface — see `engine::media`.
+        #[cfg(target_os = "linux")]
+        let mut media: Option<crate::engine::media::MediaWatcher> = None;
 
         loop {
             match rx.try_recv() {
@@ -307,8 +354,14 @@ mod imp {
                     // A new wallpaper replaces the previous one.
                     open.clear();
                     audio = None;
+                    #[cfg(target_os = "linux")]
+                    {
+                        media = None;
+                    }
                     properties = req.properties.clone();
                     let wants_audio = req.wants_audio;
+                    #[cfg(target_os = "linux")]
+                    let wants_media = req.wants_media;
                     let browser = create_browser(&req);
                     match browser {
                         Some(browser) => open.push((browser, req.input_rx)),
@@ -321,6 +374,17 @@ mod imp {
                                 target: "web",
                                 "page uses wallpaperRegisterAudioListener but audio capture \
                                  could not start; the visualiser will sit at silence"
+                            );
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    if wants_media {
+                        media = crate::engine::media::MediaWatcher::start();
+                        if media.is_none() {
+                            tracing::warn!(
+                                target: "web",
+                                "page uses wallpaperMediaIntegration but the D-Bus session bus \
+                                 could not be reached; media info will never update"
                             );
                         }
                     }
@@ -348,6 +412,16 @@ mod imp {
                     if last_audio_push.elapsed() >= AUDIO_PUSH_INTERVAL {
                         last_audio_push = Instant::now();
                         eval_in_page(browser, &audio_push_script(&capture.spectrum()));
+                    }
+                }
+
+                // `try_recv` already collapses to "changed since last call"
+                // (see its own doc comment) — no extra interval gate needed
+                // the way the audio spectrum's continuous stream needs one.
+                #[cfg(target_os = "linux")]
+                if let Some(watcher) = &media {
+                    if let Some(info) = watcher.try_recv() {
+                        eval_in_page(browser, &media_push_script(&info));
                     }
                 }
 
@@ -431,6 +505,33 @@ mod imp {
         s
     }
 
+    /// Build the `__wpMedia` call for one `MediaInfo` snapshot — the JS
+    /// bridge (`BOOTSTRAP_JS`'s `deliverMedia`) fans this single object out
+    /// into the four real `mediaPropertiesChanged`/`mediaPlaybackChanged`/
+    /// `mediaTimelineChanged`/`mediaThumbnailChanged` callbacks itself, so
+    /// only one payload needs building here. `position`/`duration` pass
+    /// through in the same raw microseconds `MediaInfo` itself carries —
+    /// see its own doc comment for why.
+    #[cfg(target_os = "linux")]
+    fn media_push_script(info: &crate::engine::media::MediaInfo) -> String {
+        let json_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+        let art_url = info
+            .art_url
+            .as_deref()
+            .map(json_str)
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            "window.__wpMedia&&window.__wpMedia({{title:{title},artist:{artist},album:{album},\
+             playbackState:{state},position:{pos},duration:{dur},artUrl:{art_url}}});",
+            title = json_str(&info.title),
+            artist = json_str(&info.artist),
+            album = json_str(&info.album),
+            state = info.playback_state as i32,
+            pos = info.position_us,
+            dur = info.duration_us,
+        )
+    }
+
     fn create_browser(req: &OpenRequest) -> Option<Browser> {
         let render_handler = WallpaperRenderHandler::new(req.frames.clone());
         let mut client = WallpaperClient::new(render_handler);
@@ -478,25 +579,25 @@ mod imp {
         }
     }
 
-    /// Does this wallpaper call `wallpaperRegisterAudioListener`?
+    /// Does this wallpaper's bundle reference `needle` anywhere in its
+    /// .html/.js files? Grepping is cruder than asking the page, but asking
+    /// means an async round-trip into the render process for something the
+    /// answer needs to gate a side effect *before* the browser even exists
+    /// (opening a capture device, starting the D-Bus watcher) — see
+    /// `uses_audio_listener`/`uses_media_listener`.
     ///
-    /// Grepping the bundle is cruder than asking the page, but asking means an
-    /// async round-trip into the render process, and the answer decides whether
-    /// we open a desktop-audio capture device at all — a side effect worth
-    /// avoiding for the pages that never use it.
-    ///
-    /// ponytail: scans .html/.js up to 2 levels deep. A wallpaper hiding the
-    /// call in a .json blob or deeper tree just gets a silent spectrum; widen
-    /// the walk if one turns up.
-    fn uses_audio_listener(dir: &Path) -> bool {
-        fn scan(dir: &Path, depth: usize) -> bool {
+    /// ponytail: scans up to 2 levels deep. A wallpaper hiding the call in a
+    /// .json blob or deeper tree just gets silence; widen the walk if one
+    /// turns up.
+    fn scans_bundle_for(dir: &Path, needle: &[u8]) -> bool {
+        fn scan(dir: &Path, depth: usize, needle: &[u8]) -> bool {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return false;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    if depth > 0 && scan(&path, depth - 1) {
+                    if depth > 0 && scan(&path, depth - 1, needle) {
                         return true;
                     }
                     continue;
@@ -506,16 +607,29 @@ mod imp {
                     Some("html" | "htm" | "js")
                 );
                 if is_script
-                    && std::fs::read(&path).is_ok_and(|bytes| {
-                        memmem_contains(&bytes, b"wallpaperRegisterAudioListener")
-                    })
+                    && std::fs::read(&path).is_ok_and(|bytes| memmem_contains(&bytes, needle))
                 {
                     return true;
                 }
             }
             false
         }
-        scan(dir, 2)
+        scan(dir, 2, needle)
+    }
+
+    /// Does this wallpaper call `wallpaperRegisterAudioListener`? The answer
+    /// decides whether we open a desktop-audio capture device at all — a
+    /// side effect worth avoiding for the pages that never use it.
+    fn uses_audio_listener(dir: &Path) -> bool {
+        scans_bundle_for(dir, b"wallpaperRegisterAudioListener")
+    }
+
+    /// Does this wallpaper call `wallpaperMediaIntegration.listen`? The
+    /// answer decides whether we start the D-Bus MPRIS watcher
+    /// (`engine::media`) at all — same reasoning as `uses_audio_listener`.
+    #[cfg(target_os = "linux")]
+    fn uses_media_listener(dir: &Path) -> bool {
+        scans_bundle_for(dir, b"wallpaperMediaIntegration")
     }
 
     /// Substring search over raw bytes — these bundles are minified and not
@@ -625,6 +739,10 @@ mod imp {
                 frames,
                 properties: user_properties_json(&dir),
                 wants_audio: uses_audio_listener(&dir),
+                #[cfg(target_os = "linux")]
+                wants_media: uses_media_listener(&dir),
+                #[cfg(not(target_os = "linux"))]
+                wants_media: false,
                 input_rx,
             })
             .map_err(|_| anyhow!("the CEF thread is not running"))?;

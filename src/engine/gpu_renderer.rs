@@ -1790,6 +1790,15 @@ pub struct GpuSceneInstance {
     /// Live playback streams for `sound` objects; kept alive for the scene's
     /// lifetime (dropping stops the audio).
     _sounds: Vec<crate::engine::audio::SoundPlayback>,
+    /// MPRIS "what's playing" watcher (`engine::media`) — Linux-only (see
+    /// its own module doc). Started unconditionally rather than gated on
+    /// whether any script actually reads `media.*` (matching
+    /// `engine.runtime`'s own always-on treatment): the D-Bus connection is
+    /// a cheap background poll, and unlike the CEF bridge's `wants_media`
+    /// scan there's no equivalent "does this bundle reference it" signal to
+    /// scan for across independent per-property scripts.
+    #[cfg(target_os = "linux")]
+    media: Option<crate::engine::media::MediaWatcher>,
     /// True for genuine 3D scenes (`Scene::is_perspective`): layer rects were
     /// projected through a perspective camera and `render()` sorts image
     /// layers back-to-front by `SceneLayerGpu::depth` instead of scene order.
@@ -2759,6 +2768,8 @@ impl GpuSceneInstance {
             script_ctx: crate::engine::script::ScriptContext::new(),
             audio_capture,
             _sounds: sounds,
+            #[cfg(target_os = "linux")]
+            media: crate::engine::media::MediaWatcher::start(),
             perspective: camera3d.is_some(),
             mesh3d,
             mesh3d_depth,
@@ -3420,12 +3431,32 @@ impl GpuSceneInstance {
                     scale: [xform.s[0] as f32, xform.s[1] as f32, xform.s[2] as f32],
                 })
                 .collect();
+            #[cfg(target_os = "linux")]
+            let media_update = self.media.as_ref().and_then(|w| w.try_recv());
             let ctx = &mut self.script_ctx;
             // `delta`, not `time - self.last_time`: last_time was already
             // advanced to `time` above, so that expression is always exactly 0
             // and every `engine.frametime` script silently multiplied by zero.
             ctx.set_time(time, time_of_day, delta);
             ctx.set_layers(&layer_snapshots);
+            #[cfg(target_os = "linux")]
+            if let Some(info) = media_update {
+                use crate::engine::media::PlaybackState;
+                ctx.set_media(
+                    info.available,
+                    match info.playback_state {
+                        PlaybackState::Stopped => 0,
+                        PlaybackState::Playing => 1,
+                        PlaybackState::Paused => 2,
+                    },
+                    &info.title,
+                    &info.artist,
+                    &info.album,
+                    info.position_us,
+                    info.duration_us,
+                    info.art_url.as_deref(),
+                );
+            }
             for layer in &mut self.layers {
                 // Refreshes `thisLayer` so this object's own scripts can use
                 // the object-attachment API (`lookAt`, `setParent`,

@@ -338,7 +338,8 @@ impl ScriptContext {
              Vec3.prototype.subtract = function(o) { return new Vec3(this.x - o.x, this.y - o.y, this.z - o.z); };\n\
              Vec3.prototype.multiply = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x * (s ? o : o.x), this.y * (s ? o : o.y), this.z * (s ? o : o.z)); };\n\
              Vec3.prototype.divide = function(o) { var s = (typeof o === 'number'); return new Vec3(this.x / (s ? o : o.x), this.y / (s ? o : o.y), this.z / (s ? o : o.z)); };\n\
-             var input = { cursorWorldPosition: new Vec3(0,0,0), cursorPosition: new Vec3(0,0,0) };",
+             var input = { cursorWorldPosition: new Vec3(0,0,0), cursorPosition: new Vec3(0,0,0) };\n\
+             var media = { available: false, playbackState: 0, title: '', artist: '', album: '', position: 0, duration: 0, artUrl: null };",
         ));
         // The object-attachment scripting API (`lookAt`, `setParent`,
         // `getAttachmentX`, `getTransformMatrix`, `disablepropagation` —
@@ -359,6 +360,49 @@ impl ScriptContext {
             js_num(runtime),
             js_num(time_of_day),
             js_num(frametime),
+        );
+        let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
+    }
+
+    /// Refresh the `media` global (currently-playing track info — see
+    /// `engine::media`) for this frame.
+    ///
+    /// The real engine pushes media changes as events, calling
+    /// `mediaPropertiesChanged`/`mediaPlaybackChanged`/`mediaTimelineChanged`/
+    /// `mediaThumbnailChanged` as *named exports* on every loaded script
+    /// module (confirmed from the vendored C++ reference's
+    /// `ScriptEngine::notifyMediaUpdate`) — this codebase's SceneScript
+    /// engine has no equivalent "loaded modules with named exports" concept
+    /// to broadcast to (see `ScriptContext`'s own module doc: it evaluates
+    /// one property's `update(value)` at a time). Exposing `media` as a
+    /// plain read-model global instead — queryable from any property
+    /// script's own body — is an honest adaptation to how this engine's
+    /// scripts actually run, not an attempt at the reference's exact
+    /// push-callback dispatch shape. Album-art color fields
+    /// (`primaryColor` etc.) aren't included here at all: the reference's
+    /// own values for those are hardcoded defaults too (its own `// TODO:
+    /// PROCESS THESE COLORS INSTEAD OF HARDCODING THEM`), so there's
+    /// nothing real to expose yet.
+    pub fn set_media(
+        &mut self,
+        available: bool,
+        playback_state: i32,
+        title: &str,
+        artist: &str,
+        album: &str,
+        position_us: i64,
+        duration_us: i64,
+        art_url: Option<&str>,
+    ) {
+        let art_url_js = art_url.map(js_str).unwrap_or_else(|| "null".to_string());
+        let src = format!(
+            "media.available = {available}; media.playbackState = {playback_state}; \
+             media.title = {title}; media.artist = {artist}; media.album = {album}; \
+             media.position = {position_us}; media.duration = {duration_us}; \
+             media.artUrl = {art_url_js};",
+            title = js_str(title),
+            artist = js_str(artist),
+            album = js_str(album),
         );
         let _ = self.context.eval(Source::from_bytes(src.as_bytes()));
     }
@@ -912,5 +956,51 @@ export function update(value) {
         // A fresh object (no call to disablepropagation) starts clean again.
         ctx.set_current_object(None, None, [0.0; 3], [0.0; 3], [1.0; 3], [0.0, 0.0]);
         assert!(!ctx.take_propagation_disabled());
+    }
+
+    // --- media (engine::media, see set_media's own doc comment) ---
+
+    #[test]
+    fn media_global_starts_unavailable() {
+        let mut ctx = ScriptContext::new();
+        let script = "export function update(value) { return media.available ? 1 : 0; }";
+        assert_eq!(ctx.eval_update(script, 0.0), Some(0.0));
+    }
+
+    #[test]
+    fn set_media_updates_the_global_a_script_can_read() {
+        let mut ctx = ScriptContext::new();
+        ctx.set_media(true, 1, "Song Title", "The Artist", "An Album", 30_000_000, 180_000_000, None);
+
+        let script = "export function update(value) { return media.available ? 1 : 0; }";
+        assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
+
+        let script = "export function update(value) { return media.playbackState; }";
+        assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
+
+        let script = "export function update(value) { return media.position / 1000000; }";
+        assert_eq!(ctx.eval_update(script, 0.0), Some(30.0));
+
+        let script = "export function update(value) { return media.artUrl === null ? 1 : 0; }";
+        assert_eq!(ctx.eval_update(script, 0.0), Some(1.0));
+    }
+
+    #[test]
+    fn set_media_escapes_string_fields_safely() {
+        let mut ctx = ScriptContext::new();
+        // A title containing a quote and a backslash must not break out of
+        // the JS string literal `set_media` builds.
+        ctx.set_media(true, 0, "Quote\" \\ Test", "", "", 0, 0, Some("http://example.com/art.jpg"));
+
+        let script = "export function update(value) { return media.title; }";
+        assert_eq!(
+            ctx.eval_update_string(script, "", None).as_deref(),
+            Some("Quote\" \\ Test")
+        );
+        let script = "export function update(value) { return media.artUrl; }";
+        assert_eq!(
+            ctx.eval_update_string(script, "", None).as_deref(),
+            Some("http://example.com/art.jpg")
+        );
     }
 }

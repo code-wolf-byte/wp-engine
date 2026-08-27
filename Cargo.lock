@@ -6043,6 +6043,7 @@ dependencies = [
  "wgpu",
  "winit",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

@@ -17,6 +17,8 @@ pub mod gpu_renderer;
 pub mod graph;
 pub mod lighting;
 pub mod material;
+#[cfg(target_os = "linux")]
+pub mod media;
 pub mod mesh3d;
 pub mod model;
 pub mod noise;
